@@ -34,7 +34,9 @@
 //   BindVertexBuffer allocation_index, offset
 //   BindIndexBuffer  allocation_index, index_type (0: 16 bit, 1: 32 bit), offset
 //   PushConstants    byte_count (a multiple of 16, at most the adapter's max_push_constant_bytes: 128 for most, 4096 for the CPU renderer and virgl), then the bytes padded to a whole word
-//   BindTexture      unit, allocation_index, filter, address_u, address_v (address_word() of DxgTypes.hpp: the mode, and the border colour in address_u), mip_filter, lod_bias, min_lod, max_lod (floats)
+//   BindTexture      unit, allocation_index, filter (filter_word() of DxgTypes.hpp: the filter, a magnification filter of its own - kFeature2SeparateFilters -, the minimum or maximum
+//                    reduction - kFeature2SamplerReductions -, coordinates in texels - kFeature2UnnormalizedCoordinates), address_u, address_v (address_word() of DxgTypes.hpp: the
+//                    mode, and the border colour in address_u), mip_filter, lod_bias, min_lod, max_lod (floats)
 //                    [, view: texture_view_word() of DxgTypes.hpp - the comparison of SampleCmp / GatherCmp, and the stencil plane of a D24S8 depth buffer (kFeature2DepthTextures:
 //                    a kAllocDepthStencil | kAllocTexture allocation)]
 //                    [, base_level, level_count, first_layer, layer_count]   (after the view word - the 11th to 14th words -: a view, the adapter's kFeature2MipmappedLayers: the unit shows
@@ -49,6 +51,7 @@
 //   SetScissor       x, y, width, height (x and y signed) [, the same for rectangles 1 ..]
 //   Draw             vertex_count, first_vertex
 //   DrawIndexed      index_count, first_index, vertex_offset (signed)
+//   SetTopology      topology (Topology, below) [, strip cut (StripCut: the index that ends a strip or fan; without the word the index buffer's largest index)]
 //   CopyRegion       dst_index, dst_x, dst_y, src_index, src_x, src_y, width, height   (colour images of one format, or of two whose pixels - or blocks - are as many bytes; also staging memory)
 //                    [, dst_level, dst_layer, src_level, src_layer, layer_count]   (between subresources: the rectangle of layer_count layers - a volume's slices - from those of the
 //                    levels; levels other than 0 of a layered image, and block-compressed images - whole blocks, as CopyBufferImage -, need the adapter's kFeature2MipmappedLayers)
@@ -89,7 +92,8 @@
 //                    (any kind: `layer` is the array slice or volume depth, 0 for a 2D image) and rows of the buffer, `row_pitch` bytes apart from `buffer_offset` on (at least width * the bytes of a pixel); a multisampled or depth image is refused)
 //                    [, narrow]   (a NarrowLayout: the buffer's pixels are narrower than the image's - one or two 8-bit channels of an A8B8G8R8 / X8B8G8R8 image, or one or two 16-bit channels of an
 //                    A16B16G16R16 one: copied into the image they become (r, g or 0, 0, maximum), out of it the first channels are taken. What a runtime keeps R8 / R8G8 / R16 / R16G16 textures and
-//                    the planes of NV12 / P010 in, as the kernel has no narrower formats)
+//                    the planes of NV12 / P010 in, as the kernel has no narrower formats; or NarrowLayout::R1 - a bit a pixel, rows of (width + 7) / 8 bytes - of an R8Unorm, A8B8G8R8 or
+//                    X8B8G8R8 image: Direct3D's R1_UNORM)
 //                    (a depth buffer of one sample takes one of the depth layouts instead - and needs one -, the adapter's kFeature2DepthCopies: the buffer holds its depth as 32-bit floats,
 //                    16-bit or 24-bit normalised integers (the 24 bits in the low bits of a word whose high byte is 0, and is not read), or the stencil of a D24S8 buffer as bytes; copied
 //                    into the buffer a depth is rounded to the nearest code, into the image a code becomes the float it stands for)
@@ -242,12 +246,27 @@ inline Topology patch_list(uint32_t control_points) { return static_cast<Topolog
 inline bool is_patch_list(Topology t) { return static_cast<uint32_t>(t) > kPatchListBase && static_cast<uint32_t>(t) < 0x100; }
 inline bool is_adjacency(Topology t) { return t == Topology::LineListAdjacency || t == Topology::TriangleListAdjacency; }
 inline uint32_t patch_points(Topology t) { return static_cast<uint32_t>(t) - kPatchListBase; }
+// SetTopology's optional second word: which index ends a strip (Direct3D 12's D3D12_INDEX_BUFFER_STRIP_CUT_VALUE, the pipeline's IBStripCutValue or the command list's
+// IASetIndexBufferStripCutValue): none (0xFFFF and 0xFFFFFFFF are vertices like any other), 0xFFFF, 0xFFFFFFFF, or - the default, without the word - the largest index of the
+// index buffer's size (Direct3D 10 and 11). Strips and fans are cut (a fan begins again at the next index); the lists and patches take every index as a vertex.
+enum class StripCut : uint32_t { None = 0, Cut16 = 1, Cut32 = 2, IndexMax = 3 };
+// Whether index `raw` of an index buffer of `index_bytes` ends a strip.
+constexpr bool is_strip_cut(StripCut cut, uint32_t index_bytes, uint32_t raw) {
+  switch (cut) {
+    case StripCut::None: return false;
+    case StripCut::Cut16: return raw == 0xFFFFu;
+    case StripCut::Cut32: return raw == 0xFFFFFFFFu;
+    default: return raw == (index_bytes == 4 ? 0xFFFFFFFFu : 0xFFFFu);
+  }
+}
 
 constexpr uint32_t kNoAllocation = 0xFFFFFFFFu;
 // CopyBufferImage's last word: how a buffer's pixels are narrower than the image's - or, of a depth buffer, which plane the buffer holds and how (DepthFloat32 .. Stencil8).
-enum class NarrowLayout : uint32_t { None = 0, R8 = 1, R8G8 = 2, R16 = 3, R16G16 = 4, DepthFloat32 = 5, DepthUnorm16 = 6, DepthUnorm24 = 7, Stencil8 = 8 };
+// R1: a bit a pixel, the first pixel of a row in the most significant bit of its first byte (Direct3D's R1_UNORM), of an R8Unorm image or an A8B8G8R8 / X8B8G8R8 one: copied into the
+// image a pixel becomes 0 or the maximum in red (the widened one's alpha the maximum), out of it a red of at least half is a 1.
+enum class NarrowLayout : uint32_t { None = 0, R8 = 1, R8G8 = 2, R16 = 3, R16G16 = 4, DepthFloat32 = 5, DepthUnorm16 = 6, DepthUnorm24 = 7, Stencil8 = 8, R1 = 9 };
 constexpr bool is_depth_layout(NarrowLayout n) { return n == NarrowLayout::DepthFloat32 || n == NarrowLayout::DepthUnorm16 || n == NarrowLayout::DepthUnorm24 || n == NarrowLayout::Stencil8; }
-constexpr uint32_t narrow_pixel_bytes(NarrowLayout n) {
+constexpr uint32_t narrow_pixel_bytes(NarrowLayout n) {   // (R1: 0, a bit a pixel)
   return n == NarrowLayout::R8 || n == NarrowLayout::Stencil8 ? 1 : n == NarrowLayout::R8G8 || n == NarrowLayout::R16 || n == NarrowLayout::DepthUnorm16 ? 2
          : n == NarrowLayout::R16G16 || n == NarrowLayout::DepthFloat32 || n == NarrowLayout::DepthUnorm24 ? 4 : 0;
 }
@@ -317,20 +336,20 @@ class CommandWriter {
       bind_texture_view(unit, allocation, s, 0, 0, 0, 0);   // (the sampler's extra words come after the view's: all of the image)
       return;
     }
-    packet(Op::BindTexture, {unit, allocation, static_cast<uint32_t>(s.filter), address_word(s.address_u, s.border), address_word(s.address_v), static_cast<uint32_t>(s.mip_filter),
+    packet(Op::BindTexture, {unit, allocation, filter_word(s), address_word(s.address_u, s.border), address_word(s.address_v), static_cast<uint32_t>(s.mip_filter),
                              float_bits(s.lod_bias), float_bits(s.min_lod), float_bits(s.max_lod), texture_view_word(s)});
   }
   // The same through a view (kFeature2MipmappedLayers): levels base_level .., layers first_layer .. (counts of 0: to the last). With the sampler's anisotropy or border colour of
   // its own (kFeature2SamplerState) the six words of those follow.
   void bind_texture_view(uint32_t unit, uint32_t allocation, const graphics::SamplerDesc& s, uint32_t base_level, uint32_t level_count, uint32_t first_layer, uint32_t layer_count) {
     if (sampler_extras(s)) {
-      packet(Op::BindTexture, {unit, allocation, static_cast<uint32_t>(s.filter), address_word(s.address_u, s.border), address_word(s.address_v), static_cast<uint32_t>(s.mip_filter),
+      packet(Op::BindTexture, {unit, allocation, filter_word(s), address_word(s.address_u, s.border), address_word(s.address_v), static_cast<uint32_t>(s.mip_filter),
                                float_bits(s.lod_bias), float_bits(s.min_lod), float_bits(s.max_lod), texture_view_word(s), base_level, level_count, first_layer, layer_count,
                                s.max_anisotropy, s.custom_border ? 1u : 0u, float_bits(s.border_rgba[0]), float_bits(s.border_rgba[1]), float_bits(s.border_rgba[2]),
                                float_bits(s.border_rgba[3])});
       return;
     }
-    packet(Op::BindTexture, {unit, allocation, static_cast<uint32_t>(s.filter), address_word(s.address_u, s.border), address_word(s.address_v), static_cast<uint32_t>(s.mip_filter),
+    packet(Op::BindTexture, {unit, allocation, filter_word(s), address_word(s.address_u, s.border), address_word(s.address_v), static_cast<uint32_t>(s.mip_filter),
                              float_bits(s.lod_bias), float_bits(s.min_lod), float_bits(s.max_lod), texture_view_word(s), base_level, level_count, first_layer, layer_count});
   }
   static constexpr bool sampler_extras(const graphics::SamplerDesc& s) { return s.max_anisotropy > 1 || s.custom_border; }
@@ -350,6 +369,7 @@ class CommandWriter {
       for (uint32_t w : {static_cast<uint32_t>(r.x), static_cast<uint32_t>(r.y), r.width, r.height}) ok_ &= bytes_.put32(w);
   }
   void set_topology(Topology topology) { packet(Op::SetTopology, {static_cast<uint32_t>(topology)}); }
+  void set_topology(Topology topology, StripCut cut) { packet(Op::SetTopology, {static_cast<uint32_t>(topology), static_cast<uint32_t>(cut)}); }
   void draw(uint32_t vertex_count, uint32_t first_vertex = 0) { packet(Op::Draw, {vertex_count, first_vertex}); }
   // Several instances (the adapter's kFeatureInstancing): the draw is made instance_count times, numbered from first_instance; per-instance attributes step with them.
   void draw_instanced(uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex = 0, uint32_t first_instance = 0) { packet(Op::DrawInstanced, {vertex_count, first_vertex, instance_count, first_instance}); }

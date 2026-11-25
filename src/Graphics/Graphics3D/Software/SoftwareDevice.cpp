@@ -481,7 +481,7 @@ class TextureSet final : public ITextureSet {
   // Whether any bound unit reads mip levels or filters anisotropically: only then does a pixel need its quad's derivatives.
   bool uses_lod() const {
     for (uint32_t unit = 0; unit < kMaxTextureUnits; ++unit)
-      if (bound_[unit].image && ((bound_[unit].levels > 1 && samplers_[unit].mip_filter != MipFilter::None) || anisotropic(samplers_[unit]))) return true;
+      if (bound_[unit].image && ((bound_[unit].levels > 1 && samplers_[unit].mip_filter != MipFilter::None) || anisotropic(samplers_[unit]) || filters_differ(samplers_[unit]))) return true;
     return false;
   }
   // For the derivative passes: the next lookups record their first coordinates per unit and answer black.
@@ -658,6 +658,7 @@ class TextureSet final : public ITextureSet {
     }
     float lambda = level_zero ? 0.0f : lambda_[unit];
     if (lambda < min_lod_clamp_) lambda = min_lod_clamp_;   // (a lookup's own clamp: SampleCmp with a clamp)
+    sampler = at_lod(sampler, lambda);
     return filtered(*b, sampler, lambda, [&](uint32_t level) {
       const float value = compare_level(view_plane(*b, level, layer), sampler, u, v, reference);
       return Vec4{value, value, value, value};
@@ -681,13 +682,15 @@ class TextureSet final : public ITextureSet {
   Vec4 anisotropic_lookup(uint32_t unit, const Bound& b, float u, float v, float w, float cube = 0.0f) const {
     const uint32_t n = aniso_count_[unit];
     if (n <= 1) return lookup(b, samplers_[unit], u, v, w, cube, lambda_[unit]);
+    const SamplerReduction reduction = samplers_[unit].reduction;
     Vec4 sum{0, 0, 0, 0};
     const float* step = aniso_step_[unit];
     for (uint32_t k = 0; k < n; ++k) {
       const float t = (static_cast<float>(k) + 0.5f) / static_cast<float>(n) - 0.5f;
-      sum = sum + lookup(b, samplers_[unit], u + step[0] * t, v + step[1] * t, w + step[2] * t, cube, lambda_[unit]);
+      const Vec4 one = lookup(b, samplers_[unit], u + step[0] * t, v + step[1] * t, w + step[2] * t, cube, lambda_[unit]);
+      sum = reduction == SamplerReduction::Weighted ? sum + one : k == 0 ? one : reduce(sum, one, reduction);   // (a minimum or maximum: of every lookup)
     }
-    return sum * (1.0f / static_cast<float>(n));
+    return reduction == SamplerReduction::Weighted ? sum * (1.0f / static_cast<float>(n)) : sum;
   }
   Vec4 record(uint32_t unit, float a, float b, float c) const {
     if (!recorded_[unit]) {
@@ -764,13 +767,40 @@ class TextureSet final : public ITextureSet {
     }
     const uint32_t l0 = static_cast<uint32_t>(lambda), l1 = l0 + 1 < levels ? l0 + 1 : levels - 1;
     const float fraction = lambda - static_cast<float>(l0);
-    return at(l0) * (1.0f - fraction) + at(l1) * fraction;
+    if (sampler.reduction != SamplerReduction::Weighted && !(fraction > 0.0f)) return at(l0);   // (a level of weight 0 is not read by a minimum or maximum)
+    return mix_reduced(at(l0), at(l1), fraction, sampler.reduction);
   }
+  // Two values blended by `t` (the weight of b), or - a minimum or maximum reduction - the least or greatest of those whose weight is above 0, channel by channel.
+  static Vec4 reduce(const Vec4& a, const Vec4& b, SamplerReduction r) {
+    auto pick = [r](float x, float y) { return r == SamplerReduction::Minimum ? (y < x ? y : x) : (y > x ? y : x); };
+    return {pick(a.x, b.x), pick(a.y, b.y), pick(a.z, b.z), pick(a.w, b.w)};
+  }
+  static Vec4 mix_reduced(const Vec4& a, const Vec4& b, float t, SamplerReduction r) {
+    if (r == SamplerReduction::Weighted) return a * (1.0f - t) + b * t;
+    if (!(t > 0.0f)) return a;
+    if (!(t < 1.0f)) return b;
+    return reduce(a, b, r);
+  }
+  // The sampler as a lookup at level of detail `lambda` filters: its minification filter where lambda is above 0, its magnification filter elsewhere.
+  static SamplerDesc at_lod(const SamplerDesc& given, float lambda) {
+    SamplerDesc s = given;
+    if (s.separate_mag && !(lambda > 0.0f)) s.filter = s.mag_filter;
+    s.separate_mag = false;
+    return s;
+  }
+  static bool filters_differ(const SamplerDesc& s) { return s.separate_mag && s.mag_filter != s.filter && !s.unnormalized; }
   // A lookup in the view at a level of detail: (u, v) of a 2D image, and w the layer of an array, the depth of a volume, or with (u, v) the direction of a cube (whose number in a
   // cube array is `cube`).
   Vec4 lookup(const Bound& b, const SamplerDesc& given, float u, float v, float w, float cube, float lambda) const {
-    SamplerDesc sampler = given;
     if (lambda < min_lod_clamp_) lambda = min_lod_clamp_;   // (a lookup's own clamp: Direct3D's SampleClamp)
+    if (given.unnormalized && (b.kind == TextureKind::Texture2D || b.kind == TextureKind::Texture2DArray)) {
+      // (coordinates in texels of the view's first level, which every lookup reads)
+      const Extent2D e = b.image->level_extent(b.base_level);
+      u = unit_coordinate(u) / static_cast<float>(e.width ? e.width : 1);
+      v = unit_coordinate(v) / static_cast<float>(e.height ? e.height : 1);
+      lambda = 0.0f;
+    }
+    SamplerDesc sampler = at_lod(given, lambda);
     w = unit_coordinate(w);
     switch (b.kind) {
       case TextureKind::TextureCube: case TextureKind::TextureCubeArray: {
@@ -803,7 +833,7 @@ class TextureSet final : public ITextureSet {
           const int64_t z0 = floor_to(fz);
           const float tz = fz - static_cast<float>(z0);
           const Vec4 a = sample_level(view_plane(b, level, clamp_layer(z0)), sampler, u, v), c = sample_level(view_plane(b, level, clamp_layer(z0 + 1)), sampler, u, v);
-          return a * (1.0f - tz) + c * tz;
+          return mix_reduced(a, c, tz, sampler.reduction);
         });
       default:
         return filtered(b, sampler, lambda, [&](uint32_t level) { return sample_level(view_plane(b, level, 0), sampler, u, v); });
@@ -859,8 +889,9 @@ class TextureSet final : public ITextureSet {
     const Vec4 none{0, 0, 0, 0};
     const Vec4 a = texel_or_border(texels, sampler, xs[0], ys[0]), b = tx != 0 ? texel_or_border(texels, sampler, xs[1], ys[0]) : none,
                c = ty != 0 ? texel_or_border(texels, sampler, xs[0], ys[1]) : none, d = tx != 0 && ty != 0 ? texel_or_border(texels, sampler, xs[1], ys[1]) : none;
-    const Vec4 top = a * (1 - tx) + b * tx, bottom = c * (1 - tx) + d * tx;
-    return top * (1 - ty) + bottom * ty;
+    // (a minimum or maximum: of the texels whose bilinear weight is above 0 - mix_reduced takes no part of weight 0, so the unread ones do not count)
+    const Vec4 top = mix_reduced(a, b, tx, sampler.reduction), bottom = mix_reduced(c, d, tx, sampler.reduction);
+    return mix_reduced(top, bottom, ty, sampler.reduction);
   }
   // (index() gives -1 for a texel outside an image whose sampler has a border there)
   static bool anisotropic(const SamplerDesc& s) { return s.max_anisotropy > 1 && s.filter == Filter::Linear; }
@@ -1443,26 +1474,32 @@ inline bool owns_edge(float dx, float dy) { return dy < 0 || (dy == 0 && dx > 0)
 
 void raster_line(const DrawState& s, const ScreenVertex& v0, const ScreenVertex& v1, float bias, bool front);
 
+// Half of a quadrilateral line (LineMode::QuadrilateralWide / Narrow) given to raster_triangle: no culling, filled whatever the fill mode, not conservative, of the line's facing and depth bias.
+struct LineQuad {
+  float bias;
+  bool front;
+};
+
 // `outline` says which edges of the triangle are edges of the primitive (bit 0 a-b, bit 1 b-c, bit 2 c-a): what a wireframe fill draws.
-void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& c, uint8_t outline) {
+void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& c, uint8_t outline, const LineQuad* line = nullptr) {
   const GraphicsPipelineDesc& pd = s.pipeline->desc();
   float area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);  // y down: > 0 is clockwise on screen
   if (area == 0) return;
   const bool clockwise = area > 0;
-  const bool front = (pd.front_face == FrontFace::Clockwise) == clockwise;
-  if (pd.cull_mode == CullMode::Back && !front) return;
-  if (pd.cull_mode == CullMode::Front && front) return;
+  const bool front = line ? line->front : (pd.front_face == FrontFace::Clockwise) == clockwise;
+  if (!line && pd.cull_mode == CullMode::Back && !front) return;
+  if (!line && pd.cull_mode == CullMode::Front && front) return;
 
   // The depth bias of the triangle: from the slope of its plane of window depths and its largest depth.
-  float bias = 0.0f;
-  if (pd.depth_bias.enabled()) {
+  float bias = line ? line->bias : 0.0f;
+  if (!line && pd.depth_bias.enabled()) {
     const float dzdx = ((b.z - a.z) * (c.y - a.y) - (c.z - a.z) * (b.y - a.y)) / area, dzdy = ((c.z - a.z) * (b.x - a.x) - (b.z - a.z) * (c.x - a.x)) / area;
     const float sx = dzdx < 0 ? -dzdx : dzdx, sy = dzdy < 0 ? -dzdy : dzdy;
     float max_z = a.z > b.z ? a.z : b.z;
     if (c.z > max_z) max_z = c.z;
     bias = depth_bias_value(pd.depth_bias, sx > sy ? sx : sy, max_z);
   }
-  if (pd.fill_mode == FillMode::Wireframe) {
+  if (!line && pd.fill_mode == FillMode::Wireframe) {
     if (outline & 1) raster_line(s, a, b, bias, front);
     if (outline & 2) raster_line(s, b, c, bias, front);
     if (outline & 4) raster_line(s, c, a, bias, front);
@@ -1527,7 +1564,7 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
   const bool lod_pass = s.pipeline->samples_textures() && s.textures.uses_lod();
   // Conservative rasterization: a pixel is covered when its square and the triangle overlap. By the separating axis theorem that is when the square meets the triangle's bounding box
   // and no edge has the whole square outside: an edge value is linear, so its largest over the square is the value at the centre plus half the sum of its gradient's magnitudes.
-  const bool conservative = pd.conservative;
+  const bool conservative = pd.conservative && !line;
   auto magnitude = [](float v) { return v < 0 ? -v : v; };
   const float reach0 = 0.5f * (magnitude(e0dx) + magnitude(e0dy)), reach1 = 0.5f * (magnitude(e1dx) + magnitude(e1dy)), reach2 = 0.5f * (magnitude(e2dx) + magnitude(e2dy));
   const uint32_t target_width = s.extent.width;
@@ -1793,7 +1830,8 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
 }
 
 // A screen-space point or line fragment: the same shader, depth, stencil and blend as a triangle's, from varyings interpolated perspective-correct along the line.
-void fragment_at(const DrawState& s, int32_t x, int32_t y, float z, float inv_w, const Vec4* varying, bool front = true, const Vec4& bary = {1, 0, 0, 0}, const Vec4& bary_lin = {1, 0, 0, 0}) {
+void fragment_at(const DrawState& s, int32_t x, int32_t y, float z, float inv_w, const Vec4* varying, bool front = true, const Vec4& bary = {1, 0, 0, 0}, const Vec4& bary_lin = {1, 0, 0, 0},
+                 float coverage = 1.0f) {
   const GraphicsPipelineDesc& pd = s.pipeline->desc();
   {
     const float lo = s.viewport.min_depth < s.viewport.max_depth ? s.viewport.min_depth : s.viewport.max_depth, hi = s.viewport.min_depth < s.viewport.max_depth ? s.viewport.max_depth : s.viewport.min_depth;
@@ -1827,6 +1865,7 @@ void fragment_at(const DrawState& s, int32_t x, int32_t y, float z, float inv_w,
   for (uint32_t k = 0; k < 3; ++k) context.vertex_varyings[k] = s.primitive_varyings[k];
   Vec4 color[kMaxColorTargets];
   if (!run_fragment_shader(s, varying, context, color)) return;
+  color[0].w *= coverage;   // (an alpha-antialiased line's part of the pixel, into the first target's alpha before blending)
   for (uint32_t k = 0; k < sample_count; ++k)
     if (covered >> k & 1) write_fragment(s, x, y, z, (depth_pass >> k & 1) != 0, color, k, front);
 }
@@ -1910,11 +1949,77 @@ void draw_line(const DrawState& s, const ClipVertex& a, const ClipVertex& b) {
   raster_line(s, sp, sq, 0.0f, true);
 }
 
+// A quadrilateral line (LineMode::QuadrilateralWide, Narrow): the rectangle `width` pixels wide whose middle line runs from v0 to v1, as two triangles (the samples, or the pixel centres,
+// it covers; its corners take the attributes of their end).
+void raster_quad_line(const DrawState& s, const ScreenVertex& v0, const ScreenVertex& v1, float width, float bias, bool front) {
+  const float dx = v1.x - v0.x, dy = v1.y - v0.y;
+  const float length = __builtin_sqrtf(dx * dx + dy * dy);
+  if (!(length > 0.0f)) return;   // (no area)
+  const float nx = -dy / length * (width * 0.5f), ny = dx / length * (width * 0.5f);
+  ScreenVertex a0 = v0, a1 = v0, b0 = v1, b1 = v1;
+  a0.x += nx, a0.y += ny, a1.x -= nx, a1.y -= ny;
+  b0.x += nx, b0.y += ny, b1.x -= nx, b1.y -= ny;
+  const LineQuad line{bias, front};
+  raster_triangle(s, a0, a1, b1, 0, &line);
+  raster_triangle(s, a0, b1, b0, 0, &line);
+}
+
+// An alpha-antialiased line (LineMode::AlphaAntialiased): the rectangle one pixel wide between v0 and v1 (its ends at the two points, not lengthened). Every pixel it touches is shaded
+// once, at its centre with the attributes of the nearest point of the line, and the first target's alpha is multiplied by the part of the pixel the rectangle covers (measured on
+// 8 x 8 points of the pixel).
+void raster_smooth_line(const DrawState& s, const ScreenVertex& v0, const ScreenVertex& v1, float bias, bool front) {
+  const uint32_t varyings = s.pipeline->desc().varying_count;
+  const float dx = v1.x - v0.x, dy = v1.y - v0.y;
+  const float length = __builtin_sqrtf(dx * dx + dy * dy);
+  if (!(length > 0.0f)) return;
+  const float ux = dx / length, uy = dy / length;   // (along the line; across it: (-uy, ux))
+  // (the pixels around the rectangle, within the scissor rectangle)
+  auto lo = [](float a, float b) { return a < b ? a : b; };
+  auto hi = [](float a, float b) { return a > b ? a : b; };
+  const float fx0 = lo(v0.x, v1.x) - 1.0f, fx1 = hi(v0.x, v1.x) + 1.0f, fy0 = lo(v0.y, v1.y) - 1.0f, fy1 = hi(v0.y, v1.y) + 1.0f;
+  const int64_t sx0 = s.scissor.x, sy0 = s.scissor.y, sx1 = sx0 + s.scissor.width, sy1 = sy0 + s.scissor.height;
+  auto clamp_floor = [](float v, int64_t a, int64_t b) {
+    if (!(v > static_cast<float>(a))) return a;
+    if (v >= static_cast<float>(b)) return b;
+    return static_cast<int64_t>(v);
+  };
+  const int64_t x_begin = clamp_floor(fx0, sx0, sx1), x_end = clamp_floor(fx1 + 1.0f, sx0, sx1), y_begin = clamp_floor(fy0, sy0, sy1), y_end = clamp_floor(fy1 + 1.0f, sy0, sy1);
+  constexpr uint32_t kGrid = 8;
+  for (int64_t y = y_begin; y < y_end; ++y) {
+    for (int64_t x = x_begin; x < x_end; ++x) {
+      uint32_t inside = 0;
+      for (uint32_t j = 0; j < kGrid; ++j)
+        for (uint32_t i = 0; i < kGrid; ++i) {
+          const float px = static_cast<float>(x) + (static_cast<float>(i) + 0.5f) / kGrid - v0.x, py = static_cast<float>(y) + (static_cast<float>(j) + 0.5f) / kGrid - v0.y;
+          const float along = px * ux + py * uy, across = -px * uy + py * ux;
+          if (along >= 0.0f && along <= length && across >= -0.5f && across <= 0.5f) ++inside;
+        }
+      if (!inside) continue;
+      const float cx = static_cast<float>(x) + 0.5f - v0.x, cy = static_cast<float>(y) + 0.5f - v0.y;
+      float t = (cx * ux + cy * uy) / length;
+      t = t < 0.0f ? 0.0f : t > 1.0f ? 1.0f : t;
+      const float p0 = (1.0f - t) * v0.inv_w, p1 = t * v1.inv_w;
+      const float norm = 1.0f / (p0 + p1);
+      Vec4 varying[kMaxVaryings];
+      for (uint32_t k = 0; k < varyings; ++k)
+        varying[k] = {(v0.varying[k].x * p0 + v1.varying[k].x * p1) * norm, (v0.varying[k].y * p0 + v1.varying[k].y * p1) * norm, (v0.varying[k].z * p0 + v1.varying[k].z * p1) * norm,
+                      (v0.varying[k].w * p0 + v1.varying[k].w * p1) * norm};
+      const Vec4 bary = {(v0.bary.x * p0 + v1.bary.x * p1) * norm, (v0.bary.y * p0 + v1.bary.y * p1) * norm, (v0.bary.z * p0 + v1.bary.z * p1) * norm, 0};
+      const Vec4 bary_lin = {v0.bary_lin.x * (1.0f - t) + v1.bary_lin.x * t, v0.bary_lin.y * (1.0f - t) + v1.bary_lin.y * t, v0.bary_lin.z * (1.0f - t) + v1.bary_lin.z * t, 0};
+      const float z = v0.z + (v1.z - v0.z) * t;
+      fragment_at(s, static_cast<int32_t>(x), static_cast<int32_t>(y), z + bias, p0 + p1, varying, front, bary, bary_lin, static_cast<float>(inside) / static_cast<float>(kGrid * kGrid));
+    }
+  }
+}
+
 // The pixels of a line between two window-space points, its depth biased by `bias`; `front` is what the fragments are (a wireframe triangle's facing).
 void raster_line(const DrawState& s, const ScreenVertex& v0, const ScreenVertex& v1, float bias, bool front) {
   const uint32_t varyings = s.pipeline->desc().varying_count;
   const float limit = 1e6f;
   if (!(v0.x > -limit && v0.x < limit && v0.y > -limit && v0.y < limit && v1.x > -limit && v1.x < limit && v1.y > -limit && v1.y < limit)) return;
+  const LineMode mode = s.pipeline->desc().line_mode;
+  if (mode == LineMode::QuadrilateralWide || mode == LineMode::QuadrilateralNarrow) return raster_quad_line(s, v0, v1, mode == LineMode::QuadrilateralWide ? 1.4f : 1.0f, bias, front);
+  if (mode == LineMode::AlphaAntialiased) return raster_smooth_line(s, v0, v1, bias, front);
   const float dx = v1.x - v0.x, dy = v1.y - v0.y;
   const float length = (dx < 0 ? -dx : dx) > (dy < 0 ? -dy : dy) ? (dx < 0 ? -dx : dx) : (dy < 0 ? -dy : dy);
   // (the steps are clamped to the target: a line past it costs no more than the target's size)

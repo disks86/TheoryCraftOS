@@ -1095,12 +1095,21 @@ void VidMm::note_gpu_write(Allocation& a) {
 // --- Mirrors --------------------------------------------------------------------------------------------------------------------------------------------------------
 
 namespace {
-// The bytes of one channel of a format a mirror may have or show (0: none): the 8-bit four-channel formats and the 16-bit ones, normalised or integer.
-uint32_t mirror_channel_bytes(Format f) {
+// What a mirror may have or show: the 8-bit four-channel formats and the 16-bit ones, normalised or integer (a narrow image the kernel keeps widened), and the one- and two-channel 8- and
+// 16-bit formats of each kind (a typeless R8 / R8G8 / R16 / R16G16 texture's views of other kinds). A mirror and its sources are of one family - the same channels of the same width,
+// so the same bytes - which mirror_layout gives with the channel count and width (0 family: none).
+struct MirrorLayout {
+  uint32_t family = 0, channels = 0, channel_bytes = 0;
+};
+MirrorLayout mirror_layout(Format f) {
   switch (f) {
-    case Format::A8B8G8R8: case Format::X8B8G8R8: case Format::A8B8G8R8Uint: return 1;
-    case Format::A16B16G16R16: case Format::A16B16G16R16Uint: return 2;
-    default: return 0;
+    case Format::A8B8G8R8: case Format::X8B8G8R8: case Format::A8B8G8R8Uint: return {1, 4, 1};
+    case Format::A16B16G16R16: case Format::A16B16G16R16Uint: return {2, 4, 2};
+    case Format::R8Unorm: case Format::R8Snorm: case Format::R8Uint: case Format::R8Sint: return {3, 1, 1};
+    case Format::R8G8Unorm: case Format::R8G8Snorm: case Format::R8G8Uint: case Format::R8G8Sint: return {4, 2, 1};
+    case Format::R16Unorm: case Format::R16Snorm: case Format::R16Uint: case Format::R16Sint: case Format::R16Float: return {5, 1, 2};
+    case Format::R16G16Unorm: case Format::R16G16Snorm: case Format::R16G16Uint: case Format::R16G16Sint: case Format::R16G16Float: return {6, 2, 2};
+    default: return {};
   }
 }
 // The channel value of "one" in an integer image (the alpha Direct3D gives a view whose format has none) written into a pixel's alpha.
@@ -1119,13 +1128,16 @@ NtStatus VidMm::set_mirror(Allocation& mirror, ArrayView<const SharedPointer<All
     return status::kSuccess;
   }
   const AllocationDesc& m = mirror.desc_;
-  const uint32_t channel = mirror_channel_bytes(m.format);
-  // (a mirror of several sources is an array, each layer a source, or a volume, each slice a source - a subresource of one: a volume's slices at a level, which an unordered
-  // access view of a narrow volume writes; its level 0's slices are one after the other as an array's layers are)
+  const MirrorLayout layout = mirror_layout(m.format);
+  // (a mirror of several sources is an array, each layer a source, or a volume of one level, each slice a source - a subresource of one: a volume's slices at a level, which an
+  // unordered access view of a narrow volume writes; its slices are one after the other as an array's layers are)
   const bool volume = m.kind == graphics::TextureKind::Texture3D;
   const bool array = m.kind == graphics::TextureKind::Texture2DArray || volume;
-  if (!mirror.is_image() || mirror.is_mirror() || mirror.placed() || mirror.reserved_ || !(m.flags & kAllocTexture) || m.mip_levels != 1 || m.samples != 1 || channel == 0 ||
-      (!array && m.kind != graphics::TextureKind::Texture2D) || sources.size() != (array ? m.layers : 1u) || (volume && subresources.empty()))
+  // (the mirror's subresources in order, levels first: source i is layer i % layers of level i / layers; a mirror of several levels needs subresources of its sources)
+  const uint64_t layers = array ? m.layers : 1u;
+  if (!mirror.is_image() || mirror.is_mirror() || mirror.placed() || mirror.reserved_ || !(m.flags & kAllocTexture) || m.mip_levels < 1 || (volume && m.mip_levels != 1) ||
+      m.samples != 1 || layout.family == 0 || (!array && m.kind != graphics::TextureKind::Texture2D) || sources.size() != layers * m.mip_levels ||
+      ((m.mip_levels > 1 || volume) && subresources.empty()))
     return status::kInvalidParameter;
   // (a mirror that writes back is a render target or a storage image - an array of them gives each layer to its source; one channel at least goes back)
   if ((mode & kMirrorWriteBack) && (!(m.flags & (kAllocRenderTarget | kAllocStorageImage)) || channels == 0)) return status::kInvalidParameter;
@@ -1136,8 +1148,10 @@ NtStatus VidMm::set_mirror(Allocation& mirror, ArrayView<const SharedPointer<All
     if (!source || &source->manager() != this || source.get() == &mirror || !source->is_image() || source->is_mirror()) return status::kInvalidParameter;
     const AllocationDesc& d = source->desc_;
     const uint32_t level = subresources.empty() ? 0 : subresources[i] & 0xFFFF, layer = subresources.empty() ? 0 : subresources[i] >> 16;
+    const uint32_t mirror_level = static_cast<uint32_t>(i / layers);
     if (subresources.empty() ? (d.kind != graphics::TextureKind::Texture2D || d.mip_levels != 1) : (level >= d.mip_levels || layer >= source->level_layers(level))) return status::kInvalidParameter;
-    if (d.samples != 1 || graphics::mip_extent(d.width, level) != m.width || graphics::mip_extent(d.height, level) != m.height || mirror_channel_bytes(d.format) != channel)
+    if (d.samples != 1 || graphics::mip_extent(d.width, level) != graphics::mip_extent(m.width, mirror_level) || graphics::mip_extent(d.height, level) != graphics::mip_extent(m.height, mirror_level) ||
+        mirror_layout(d.format).family != layout.family)
       return status::kInvalidParameter;
   }
   List<Allocation::MirrorSource> made(allocator_);
@@ -1164,13 +1178,22 @@ bool VidMm::mirror_needs_read_back(const Allocation& mirror) const {
   return false;
 }
 
+// The mirror's subresource that source `i` shows (its levels first, each with its layers): where it is in the mirror's memory.
+static bool mirror_subresource(const Allocation& mirror, uint64_t i, uint64_t* offset, uint64_t* bytes) {
+  const graphics::TextureKind kind = mirror.desc().kind;   // (a volume mirror is of one level: its slices as an array's layers)
+  const uint64_t layers = kind == graphics::TextureKind::Texture2DArray || kind == graphics::TextureKind::Texture3D ? mirror.desc().layers : 1u;
+  return mirror.subresource_range(static_cast<uint32_t>(i / layers), static_cast<uint32_t>(i % layers), offset, bytes);
+}
+
 bool VidMm::refresh_mirror(Allocation& mirror, bool may_read_back, bool* stale) {
   if (stale) *stale = false;
-  const uint32_t channel = mirror_channel_bytes(mirror.desc_.format);
-  const uint64_t pixel = 4ull * channel, layer_bytes = uint64_t{mirror.desc_.width} * mirror.desc_.height * pixel;
+  const MirrorLayout layout = mirror_layout(mirror.desc_.format);
+  const uint64_t pixel = uint64_t{layout.channels} * layout.channel_bytes;
   bool copied = false;
   for (uint64_t layer = 0; layer < mirror.mirror_sources_.count(); ++layer) {
     Allocation::MirrorSource& ms = mirror.mirror_sources_[layer];
+    uint64_t mirror_at = 0, layer_bytes = 0;
+    if (!mirror_subresource(mirror, layer, &mirror_at, &layer_bytes)) return false;
     Allocation& source = *ms.source;
     if (ms.seen == source.version_) continue;
     if (source.gpu_newer_) {
@@ -1184,9 +1207,9 @@ bool VidMm::refresh_mirror(Allocation& mirror, bool may_read_back, bool* stale) 
     ConstByteView from;
     uint64_t at = 0, bytes = 0;
     if (!source.subresource_range(ms.level, ms.layer, &at, &bytes) || bytes != layer_bytes) return false;
-    if (!mirror.cpu_.try_subview(layer * layer_bytes, layer_bytes, &to) || !ConstByteView(source.cpu_).try_subview(at, layer_bytes, &from) || !to.copy_from(from)) return false;
-    if (mirror.mirror_mode_ & kMirrorInteger)
-      for (uint64_t at = 0; at < layer_bytes; at += pixel) set_integer_alpha(to.subview(at, pixel), channel);
+    if (!mirror.cpu_.try_subview(mirror_at, layer_bytes, &to) || !ConstByteView(source.cpu_).try_subview(at, layer_bytes, &from) || !to.copy_from(from)) return false;
+    if ((mirror.mirror_mode_ & kMirrorInteger) && layout.channels == 4)   // (a widened image's alpha as the integer view's one; a one- or two-channel image has no alpha)
+      for (uint64_t at = 0; at < layer_bytes; at += pixel) set_integer_alpha(to.subview(at, pixel), layout.channel_bytes);
     ms.seen = source.version_;
     copied = true;
   }
@@ -1196,19 +1219,21 @@ bool VidMm::refresh_mirror(Allocation& mirror, bool may_read_back, bool* stale) 
 
 bool VidMm::write_back_mirror(Allocation& mirror) {
   if (!mirror.writes_back() || mirror.mirror_sources_.count() == 0 || !read_back(mirror)) return false;
-  const uint32_t channel = mirror_channel_bytes(mirror.desc_.format);
-  const uint64_t pixel = 4ull * channel, bytes = uint64_t{mirror.desc_.width} * mirror.desc_.height * pixel;
-  // (each layer to its source: a mirror of one source has one)
+  const MirrorLayout layout = mirror_layout(mirror.desc_.format);
+  const uint32_t channel = layout.channel_bytes;
+  const uint64_t pixel = uint64_t{layout.channels} * channel;
+  // (each subresource to its source: a mirror of one source has one)
   for (uint64_t layer = 0; layer < mirror.mirror_sources_.count(); ++layer) {
     Allocation& source = *mirror.mirror_sources_[layer].source;
     if (!read_back(source)) return false;
     ByteView to;
     ConstByteView from;
-    uint64_t at = 0, sub_bytes = 0;
+    uint64_t at = 0, sub_bytes = 0, mirror_at = 0, bytes = 0;
+    if (!mirror_subresource(mirror, layer, &mirror_at, &bytes)) return false;
     if (!source.subresource_range(mirror.mirror_sources_[layer].level, mirror.mirror_sources_[layer].layer, &at, &sub_bytes) || sub_bytes != bytes) return false;
-    if (!source.cpu_.try_subview(at, bytes, &to) || !ConstByteView(mirror.cpu_).try_subview(layer * bytes, bytes, &from)) return false;
+    if (!source.cpu_.try_subview(at, bytes, &to) || !ConstByteView(mirror.cpu_).try_subview(mirror_at, bytes, &from)) return false;
     for (uint64_t at = 0; at < bytes; at += pixel)
-      for (uint32_t c = 0; c < 4; ++c)
+      for (uint32_t c = 0; c < layout.channels; ++c)
         if ((mirror.mirror_channels_ >> c & 1) && !to.subview(at + c * channel, channel).copy_from(from.subview(at + c * channel, channel))) return false;
     note_cpu_write(source);
     mirror.mirror_sources_[layer].seen = source.version_;   // (the mirror holds what it gave)

@@ -47,6 +47,17 @@ static D3D11_BLEND_DESC default_blend(void) {
 }
 
 /* The Direct3D 12 pipeline state of what the context has bound; NULL when it cannot be made (the draw is then left out). */
+/* The format a render target view draws in, as the pipeline has it: a plane's (its plane's format), the view's own of a typeless R8 / R8G8 / R16 / R16G16 texture (Direct3D 12 draws
+ * into a mirror of the view's kind: R8_UINT, R16_FLOAT ...), else `texture_format`. */
+static DXGI_FORMAT rtv_format(const View *v, DXGI_FORMAT texture_format) {
+  if (v->plane_format) return v->plane_format;
+  const DXGI_FORMAT stored = v->tex->stored;
+  if ((stored == DXGI_FORMAT_R8_TYPELESS || stored == DXGI_FORMAT_R8G8_TYPELESS || stored == DXGI_FORMAT_R16_TYPELESS || stored == DXGI_FORMAT_R16G16_TYPELESS) &&
+      v->desc.rtv.Format != DXGI_FORMAT_UNKNOWN)
+    return v->desc.rtv.Format;
+  return texture_format;
+}
+
 static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
   Pipeline key;
   memset(&key, 0, sizeof key);
@@ -75,7 +86,7 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
   key.has_depth = c->dsv != NULL;
   key.samples = 1;
   for (UINT i = 0; i < c->rtv_count && i < 8; ++i) {
-    key.formats[i] = c->rtv[i]->plane_format ? c->rtv[i]->plane_format : c->rtv[i]->tex->desc.Format;      /* (as the program made it: an R8 target is kept as RGBA8 but masked; a plane's view: its plane) */
+    key.formats[i] = rtv_format(c->rtv[i], c->rtv[i]->tex->desc.Format);      /* (as the program made it: a plane's view: its plane; a typeless narrow texture's view: the view's) */
     if (c->rtv[i]->tex->desc.SampleDesc.Count > 1) key.samples = c->rtv[i]->tex->desc.SampleDesc.Count;
   }
   if (c->dsv) {
@@ -145,6 +156,9 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
   pd.RasterizerState.DepthBiasClamp = key.raster.DepthBiasClamp;
   pd.RasterizerState.SlopeScaledDepthBias = key.raster.SlopeScaledDepthBias;
   pd.RasterizerState.DepthClipEnable = key.raster.DepthClipEnable;
+  /* (the line mode: MultisampleEnable quadrilateral lines, else AntialiasedLineEnable alpha-antialiased ones - Direct3D 12 chooses as Direct3D 11 does) */
+  pd.RasterizerState.MultisampleEnable = key.raster.MultisampleEnable;
+  pd.RasterizerState.AntialiasedLineEnable = key.raster.AntialiasedLineEnable;
   pd.RasterizerState.ConservativeRaster = key.conservative ? D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON : D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
   pd.DepthStencilState.DepthEnable = key.depth.DepthEnable;
   pd.DepthStencilState.DepthWriteMask = (D3D12_DEPTH_WRITE_MASK)key.depth.DepthWriteMask;
@@ -157,7 +171,7 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
   if (c->layout) { pd.InputLayout.pInputElementDescs = c->layout->elements; pd.InputLayout.NumElements = c->layout->count; }
   pd.PrimitiveTopologyType = c->hs ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
   pd.NumRenderTargets = c->rtv_count;
-  for (UINT i = 0; i < c->rtv_count; ++i) pd.RTVFormats[i] = c->rtv[i]->plane_format ? c->rtv[i]->plane_format : c->rtv[i]->tex->stored;
+  for (UINT i = 0; i < c->rtv_count; ++i) pd.RTVFormats[i] = rtv_format(c->rtv[i], c->rtv[i]->tex->stored);
   if (c->dsv) {
     /* (the program's depth format, typeless ones as the depth format they are: what the depth bias's unit is) */
     const DXGI_FORMAT f = c->dsv->tex->desc.Format;
@@ -165,6 +179,8 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
                  : f == DXGI_FORMAT_R32G8X24_TYPELESS ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : f;
   }
   pd.SampleDesc.Count = key.samples;
+  /* (Direct3D 11 ends a strip at the index buffer's largest index, 0xFFFF or 0xFFFFFFFF by its format: the list's strip cut, set with the index buffer at each indexed draw) */
+  pd.Flags |= D3D12_PIPELINE_STATE_FLAG_DYNAMIC_INDEX_BUFFER_STRIP_CUT;
   ID3D12PipelineState *state = NULL;
   /* (the pixel shader's constant buffers come after the vertex shader's, then the geometry, hull and domain shaders' in that order: as draw_prepare lays them out) */
   const Shader *gs = c->gs && !c->gs->so_only ? c->gs : NULL;
@@ -465,7 +481,7 @@ static BOOL srv_desc12(const View *v, D3D12_SHADER_RESOURCE_VIEW_DESC *r) {
   if (first_level >= t->kmips) return FALSE;
   if (levels > t->kmips - first_level) levels = t->kmips - first_level;
   memset(r, 0, sizeof *r);
-  r->Format = t->stored;
+  r->Format = view_format12(t, v->desc.srv.Format);
   r->Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
   switch (v->desc.srv.ViewDimension) {
     case D3D11_SRV_DIMENSION_TEXTURE1D: case D3D11_SRV_DIMENSION_TEXTURE2D:
@@ -864,6 +880,8 @@ static BOOL draw_prepare(Ctx *c, BOOL indexed) {
     D3D12_INDEX_BUFFER_VIEW view = {ID3D12Resource_GetGPUVirtualAddress(c->ib->res) + offset, c->ib->desc.ByteWidth - offset,
                                     c->ib_format == DXGI_FORMAT_R32_UINT ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT};
     ID3D12GraphicsCommandList_IASetIndexBuffer(list, &view);
+    ID3D12GraphicsCommandList9_IASetIndexBufferStripCutValue((ID3D12GraphicsCommandList9 *)list, view.Format == DXGI_FORMAT_R32_UINT ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF
+                                                                                                                                       : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF);
     c->ib->used = d->epoch;
   }
 

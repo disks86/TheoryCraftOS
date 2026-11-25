@@ -1378,14 +1378,18 @@ class VirglPipeline final : public VirglPipelineBase {
     cmd[n++] = virgl::header(virgl::kCreateObject, virgl::kObjectRasterizer, 9);
     cmd[n++] = rasterizer_;
     const uint32_t fill = desc.fill_mode == FillMode::Wireframe ? virgl::kPolygonLine : virgl::kPolygonFill;
+    // (kFeature2LineModes: alpha-antialiased lines are the host's smooth lines - GL_LINE_SMOOTH, whose coverage the host multiplies into the alpha -, quadrilateral lines its
+    // multisampled lines, which GL draws as rectangles of the line width on a multisampled target - on a target of one sample the host draws its own aliased line)
+    const bool quad_lines = desc.line_mode == LineMode::QuadrilateralWide || desc.line_mode == LineMode::QuadrilateralNarrow;
     const bool offset = desc.depth_bias.enabled() && !desc.depth_bias.unorm_bits;   // (a normalised format's bias is the fragment shader's)
     cmd[n++] = (desc.depth_clip ? 1u << 1 : 0u) /*depth clip*/ | (1u << 2) /*clip half z*/ | (desc.stream_output_count && desc.rasterized_stream < 0 ? 1u << 3 : 0u) /*rasterizer discard*/ | (cull << 8) |
                (fill << 10) | (fill << 12) /*fill front, back*/ | (1u << 14) /*scissor*/ | ((front_ccw ? 1u : 0u) << 15) | (offset ? (1u << 18) | (1u << 20) : 0u) /*offset line (a wireframe triangle's), tri*/ |
-               (desc.multisample ? 1u << 25 : 0u) /*multisample*/ | (1u << 29) /*half pixel center*/ | (1u << 30) /*bottom edge rule*/;
+               (desc.multisample || quad_lines ? 1u << 25 : 0u) /*multisample*/ | (desc.line_mode == LineMode::AlphaAntialiased ? 1u << 26 : 0u) /*line smooth*/ |
+               (1u << 29) /*half pixel center*/ | (1u << 30) /*bottom edge rule*/;
     cmd[n++] = float_bits(1.0f);  // point size
     cmd[n++] = 0;                 // sprite coord enable
     cmd[n++] = uint32_t{desc.clip_distances} << 24;   // line stipple, clip planes (the clip distances enabled)
-    cmd[n++] = float_bits(1.0f);  // line width
+    cmd[n++] = float_bits(desc.line_mode == LineMode::QuadrilateralWide ? 1.4f : 1.0f);  // line width (Direct3D's quadrilateral lines: 1.4 or 1.0 pixels)
     cmd[n++] = float_bits(offset ? static_cast<float>(desc.depth_bias.constant) : 0.0f);   // offset units
     cmd[n++] = float_bits(offset ? desc.depth_bias.slope : 0.0f);                                                         // offset scale
     cmd[n++] = float_bits(offset ? desc.depth_bias.clamp : 0.0f);                                                         // offset clamp
@@ -1670,7 +1674,7 @@ VirglDevice::~VirglDevice() {
 namespace {
 SamplerDesc unfiltered_for(SamplerDesc sampler, const VirglImage* texture) {
   if (texture && is_integer_format(texture->format())) {
-    sampler.filter = Filter::Nearest;
+    sampler.filter = sampler.mag_filter = Filter::Nearest;
     if (sampler.mip_filter == MipFilter::Linear) sampler.mip_filter = MipFilter::Nearest;
   }
   return sampler;
@@ -1688,7 +1692,9 @@ uint32_t VirglDevice::sampler_state(const SamplerDesc& sampler) {
   auto within = [](float lod, float low, float high) { return lod != lod ? 0.0f : lod < low ? low : lod > high ? high : lod; };
   const uint32_t anisotropy = sampler.filter == Filter::Linear && sampler.max_anisotropy > 1 ? (sampler.max_anisotropy > kMaxAnisotropy ? kMaxAnisotropy : sampler.max_anisotropy) : 0u;
   SamplerState wanted;
-  wanted.bits = (sampler.filter == Filter::Linear ? 1u : 0u) | (u << 1) | (v << 4) | ((bordered && !sampler.custom_border ? border : 0u) << 7) | (mip << 9) | (anisotropy << 16);
+  const Filter mag = magnification_filter(sampler);   // (kFeature2SeparateFilters: the host's own magnification filter)
+  wanted.bits = (sampler.filter == Filter::Linear ? 1u : 0u) | (u << 1) | (v << 4) | ((bordered && !sampler.custom_border ? border : 0u) << 7) | (mip << 9) | (anisotropy << 16) |
+                ((mag == Filter::Linear ? 1u : 0u) << 24);
   if (sampler.mip_filter != MipFilter::None) {
     wanted.bias = within(sampler.lod_bias, -16.0f, 16.0f);
     wanted.min_lod = within(sampler.min_lod, 0.0f, 16.0f);
@@ -1706,10 +1712,10 @@ uint32_t VirglDevice::sampler_state(const SamplerDesc& sampler) {
   // (a program with more kinds of sampler than the table holds gets one that differs in its levels of detail at most; the states are the device's until it ends)
   if (sampler_state_count_ == kSamplerStates) return similar ? similar : sampler_states_[0].handle;
   const uint32_t handle = new_handle();
-  const uint32_t filter = sampler.filter == Filter::Linear ? virgl::kFilterLinear : virgl::kFilterNearest;
+  const uint32_t filter = sampler.filter == Filter::Linear ? virgl::kFilterLinear : virgl::kFilterNearest, mag_filter = mag == Filter::Linear ? virgl::kFilterLinear : virgl::kFilterNearest;
   // (S0: the wrap modes, filters, seamless cube maps - Direct3D always filters across the edges of a cube -, and the anisotropy in bits 20 - 24; the border colour's bits as they
   // are: the host sets it with glSamplerParameterIuiv, so an integer texture's border is its integers and a float one's its floats)
-  const uint32_t s0 = kWrap[u] | (kWrap[v] << 3) | (virgl::kWrapClampToEdge << 6) /* r: the slices of a volume are clamped */ | (filter << 9) | (kMip[mip] << 11) | (filter << 13) | (1u << 19) |
+  const uint32_t s0 = kWrap[u] | (kWrap[v] << 3) | (virgl::kWrapClampToEdge << 6) /* r: the slices of a volume are clamped */ | (filter << 9) | (kMip[mip] << 11) | (mag_filter << 13) | (1u << 19) |
                       ((anisotropy & 0x1F) << 20);
   const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSamplerState, 9), handle, s0, float_bits(wanted.bias), float_bits(wanted.min_lod),
                           float_bits(sampler.mip_filter != MipFilter::None ? wanted.max_lod : 0.0f), wanted.border[0], wanted.border[1], wanted.border[2], wanted.border[3]};

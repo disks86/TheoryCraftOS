@@ -477,10 +477,12 @@ class Adapter::StreamRunner {
       case Op::Dispatch: return dispatch(p);
       case Op::SetTopology: {
         const uint32_t topology = p.le32();
+        const uint32_t cut = p.ok() && !p.at_end() ? p.le32() : static_cast<uint32_t>(StripCut::IndexMax);   // (the optional strip cut word)
         const bool adjacency = topology == static_cast<uint32_t>(Topology::LineListAdjacency) || topology == static_cast<uint32_t>(Topology::TriangleListAdjacency);
-        if (!exact(p) || (!adjacency && topology > kPatchListBase + graphics::kMaxPatchControlPoints)) return kBad;
+        if (!exact(p) || cut > static_cast<uint32_t>(StripCut::IndexMax) || (!adjacency && topology > kPatchListBase + graphics::kMaxPatchControlPoints)) return kBad;
         if (adjacency ? !(adapter_.caps_.features & graphics::kFeatureGeometryShaders) : (topology > static_cast<uint32_t>(Topology::PointList) && !(adapter_.caps_.features & graphics::kFeatureTessellation))) return kBad;
         topology_ = static_cast<Topology>(topology);
+        strip_cut_ = static_cast<StripCut>(cut);
         return status::kSuccess;
       }
     }
@@ -889,9 +891,13 @@ class Adapter::StreamRunner {
     graphics::BorderColor border, no_border;
     graphics::CompareOp compare = graphics::CompareOp::Never;
     bool stencil = false;
-    if (!exact(p) || unit >= adapter_.caps_.max_texture_units || filter > 1 || !decode_address_word(au, &mode_u, &border) || !decode_address_word(av, &mode_v, &no_border) || mip > 2 ||
-        !decode_texture_view_word(view, &compare, &stencil))
+    graphics::SamplerDesc sampler;
+    if (!exact(p) || unit >= adapter_.caps_.max_texture_units || !decode_filter_word(filter, &sampler) || !decode_address_word(au, &mode_u, &border) || !decode_address_word(av, &mode_v, &no_border) ||
+        mip > 2 || !decode_texture_view_word(view, &compare, &stencil))
       return refuse(__LINE__);
+    // (a filter of magnification of its own, a minimum or maximum, coordinates in texels: the device's kFeature2SeparateFilters, kFeature2SamplerReductions, kFeature2UnnormalizedCoordinates)
+    const uint32_t needs = graphics::sampler_features2(sampler);
+    if ((adapter_.caps_.features2 & needs) != needs) return refuse(__LINE__);
     if (!(adapter_.caps_.features & graphics::kFeatureAddressModes)) mode_u = base_address_mode(mode_u), mode_v = base_address_mode(mode_v);   // (the device has wrap and clamp alone)
     if (!finite_within(bias, 100.0f) || !finite_within(min_lod, 100.0f) || !finite_within(max_lod, 1000.0f)) return refuse(__LINE__);
     Allocation* a = alloc(index);
@@ -912,8 +918,6 @@ class Adapter::StreamRunner {
       texture_bound_[unit] = false;
       return refuse(__LINE__);
     }
-    graphics::SamplerDesc sampler;
-    sampler.filter = static_cast<graphics::Filter>(filter);
     sampler.address_u = mode_u;
     sampler.address_v = mode_v;
     sampler.border = border;
@@ -1187,10 +1191,10 @@ class Adapter::StreamRunner {
       ByteReader in(index_->backing());
       in.skip(index_offset_ + uint64_t{first} * index_bytes_);
       int64_t highest = -1;
-      const uint32_t restart = index_bytes_ == 4 ? 0xFFFFFFFFu : 0xFFFFu;
+      const bool strip = topology_ == Topology::TriangleStrip || topology_ == Topology::LineStrip || topology_ == Topology::TriangleFan;
       for (uint32_t i = 0; i < count; ++i) {
         const uint32_t raw = index_bytes_ == 4 ? in.le32() : in.le16();
-        if (topology_ != Topology::TriangleList && topology_ != Topology::LineList && topology_ != Topology::PointList && !is_patch_list(topology_) && raw == restart) continue;   // (ends a strip: names no vertex)
+        if (strip && is_strip_cut(strip_cut_, index_bytes_, raw)) continue;   // (ends a strip: names no vertex)
         const int64_t v = int64_t{raw} + vertex_offset;
         if (!in.ok() || v < 0) return refuse(__LINE__);
         if (v > highest) highest = v;
@@ -1247,7 +1251,6 @@ class Adapter::StreamRunner {
     constexpr uint64_t kMaxExpandedIndices = 3u << 20;
     const bool fan = topology_ == Topology::TriangleFan;
     const bool lines = topology_ == Topology::LineStrip;
-    const uint32_t restart = index_bytes_ == 4 ? 0xFFFFFFFFu : 0xFFFFu;
     ByteBuffer out(adapter_.allocator_);
     uint32_t run[3];   // the vertices of the strip so far (for a fan: the first, the previous and the current)
     uint32_t seen = 0;
@@ -1260,7 +1263,7 @@ class Adapter::StreamRunner {
       if (indexed) {
         v = index_bytes_ == 4 ? in.le32() : in.le16();
         if (!in.ok()) return kBad;
-        if (v == restart) {
+        if (is_strip_cut(strip_cut_, index_bytes_, v)) {
           seen = 0;
           strip_triangle_ = 0;
           continue;
@@ -1519,7 +1522,7 @@ class Adapter::StreamRunner {
   NtStatus copy_buffer_image(ByteReader& p) {
     const uint32_t direction = p.le32(), ii = p.le32(), level = p.le32(), layer = p.le32(), x = p.le32(), y = p.le32(), w = p.le32(), h = p.le32(), bi = p.le32(), boff = p.le32(), pitch = p.le32();
     const uint32_t narrow_word = p.at_end() ? 0 : p.le32();      // (the optional twelfth word)
-    if (!exact(p) || in_pass_ || direction > 1 || w == 0 || h == 0 || narrow_word > static_cast<uint32_t>(NarrowLayout::Stencil8)) return kBad;
+    if (!exact(p) || in_pass_ || direction > 1 || w == 0 || h == 0 || narrow_word > static_cast<uint32_t>(NarrowLayout::R1)) return kBad;
     const NarrowLayout narrow = static_cast<NarrowLayout>(narrow_word);
     Allocation* image = alloc(ii);
     Allocation* buffer = alloc(bi);
@@ -1537,12 +1540,14 @@ class Adapter::StreamRunner {
     const uint32_t unit = is_compressed(format) ? 4 : 1;
     if (uint64_t{x} + w > level_w || uint64_t{y} + h > level_h || x % unit || y % unit || ((x + w) % unit && x + w != level_w) || ((y + h) % unit && y + h != level_h)) return kBad;
     // (a narrow buffer: of an 8-bit four-channel image, or of A16B16G16R16)
-    if (narrow != NarrowLayout::None) {
+    if (narrow == NarrowLayout::R1) {
+      if (format != Format::R8Unorm && format != Format::A8B8G8R8 && format != Format::X8B8G8R8) return kBad;
+    } else if (narrow != NarrowLayout::None) {
       const bool eight = narrow == NarrowLayout::R8 || narrow == NarrowLayout::R8G8;
       if (eight ? (format != Format::A8B8G8R8 && format != Format::X8B8G8R8) : (format != Format::A16B16G16R16 && format != Format::A16B16G16R16Sint)) return kBad;
     }
     const uint64_t row_bytes = image_row_bytes(format, w), level_row_bytes = image_row_bytes(format, level_w), x_bytes = image_row_bytes(format, x);
-    const uint64_t buffer_row_bytes = narrow == NarrowLayout::None ? row_bytes : uint64_t{w} * narrow_pixel_bytes(narrow);
+    const uint64_t buffer_row_bytes = narrow == NarrowLayout::None ? row_bytes : narrow == NarrowLayout::R1 ? (uint64_t{w} + 7) / 8 : uint64_t{w} * narrow_pixel_bytes(narrow);
     const uint32_t rows = image_rows(format, h), first_row = y / unit;
     if (pitch < buffer_row_bytes) return kBad;
     if (uint64_t{boff} + uint64_t{pitch} * (rows - 1) + buffer_row_bytes > buffer->desc().size) return kBad;
@@ -1561,7 +1566,8 @@ class Adapter::StreamRunner {
         ByteView image_row, buffer_row;
         if (!image->writable_backing().try_subview(image_at, row_bytes, &image_row) || !buffer->writable_backing().try_subview(buffer_at, buffer_row_bytes, &buffer_row))
           return status::kInvalidDeviceState;
-        copy_narrow_row(direction == 0, narrow, w, image_row, buffer_row, format == Format::A16B16G16R16Sint);
+        if (narrow == NarrowLayout::R1) copy_bit_row(direction == 0, w, format == Format::R8Unorm ? 1u : 4u, image_row, buffer_row);
+        else copy_narrow_row(direction == 0, narrow, w, image_row, buffer_row, format == Format::A16B16G16R16Sint);
         continue;
       }
       if (direction == 0) {
@@ -1578,6 +1584,23 @@ class Adapter::StreamRunner {
       mm_.note_cpu_write(*buffer);
     }
     return status::kSuccess;
+  }
+
+  // One row of an R1 copy (NarrowLayout::R1): the buffer's bits, the first pixel's the most significant of the first byte, into the image's red - 0 or 255; an image of four channels
+  // (`image_pixel` 4) gets 0 green and blue and the maximum alpha - or out of it, a red of 128 or more a 1. The bits of the last byte past `width` are left as they are.
+  static void copy_bit_row(bool to_image, uint32_t width, uint32_t image_pixel, ByteView image_row, ByteView buffer_row) {
+    for (uint32_t i = 0; i < width; ++i) {
+      ByteView pixel = image_row.subview(uint64_t{i} * image_pixel, image_pixel);
+      uint8_t& bits = buffer_row[i / 8];
+      const uint8_t mask = static_cast<uint8_t>(0x80u >> (i % 8));
+      if (to_image) {
+        pixel.fill(0);
+        pixel[0] = (bits & mask) ? 0xFF : 0x00;
+        if (image_pixel == 4) pixel[3] = 0xFF;
+      } else {
+        bits = static_cast<uint8_t>(pixel[0] >= 0x80 ? (bits | mask) : (bits & ~mask));
+      }
+    }
   }
 
   // One row of a narrow copy: `to_image` widens the buffer's pixels into the image's (missing channels 0, the last the maximum), else the image's first channels go into the buffer.
@@ -2802,7 +2825,14 @@ class Adapter::StreamRunner {
     uint32_t index = 0;
     if (!a || !index_of(a, &index)) return refuse(__LINE__);   // (the allocation is in the list or the draw is refused)
     ByteBuffer packet(adapter_.allocator_);
-    for (uint32_t w : {unit, index, static_cast<uint32_t>(sampler.filter), address_word(sampler.address_u, sampler.border), address_word(sampler.address_v), static_cast<uint32_t>(sampler.mip_filter),
+    // (a descriptor's filters on a device that has no magnification filter of its own: the one filter, linear where either is - what such a device can come nearest with)
+    graphics::SamplerDesc lowered = sampler;
+    if (lowered.separate_mag && !(adapter_.caps_.features2 & graphics::kFeature2SeparateFilters)) {
+      if (lowered.mag_filter == graphics::Filter::Linear) lowered.filter = graphics::Filter::Linear;
+      lowered.separate_mag = false;
+      lowered.mag_filter = lowered.filter;
+    }
+    for (uint32_t w : {unit, index, filter_word(lowered), address_word(sampler.address_u, sampler.border), address_word(sampler.address_v), static_cast<uint32_t>(sampler.mip_filter),
                        __builtin_bit_cast(uint32_t, sampler.lod_bias), __builtin_bit_cast(uint32_t, sampler.min_lod), __builtin_bit_cast(uint32_t, sampler.max_lod), texture_view_word(sampler)})
       packet.put32(w);
     // (the descriptor's view: its levels and layers, on a device that has views - and all of the image before the sampler's part on one that has not)
@@ -2892,6 +2922,7 @@ class Adapter::StreamRunner {
   uint64_t index_offset_ = 0;
   uint32_t index_bytes_ = 2;
   Topology topology_ = Topology::TriangleList;
+  StripCut strip_cut_ = StripCut::IndexMax;   // which index ends a strip (SetTopology's second word)
   uint32_t device_patch_points_ = 0;
   graphics::PrimitiveTopology device_topology_ = graphics::PrimitiveTopology::TriangleList;   // what the recorded commands have set so far
   uint32_t strip_triangle_ = 0;      // the position of the triangle being made in its strip (for the winding)
@@ -3235,6 +3266,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   if ((d.multisample || d.alpha_to_coverage) && !(caps_.features & graphics::kFeatureMultisample)) return status::kNotSupported;
   if (d.alpha_to_coverage && !d.multisample) return status::kInvalidParameter;
   if (d.conservative && !(caps_.features2 & graphics::kFeature2ConservativeRaster)) return status::kNotSupported;
+  if (d.line_mode != graphics::LineMode::Aliased && !(caps_.features2 & graphics::kFeature2LineModes)) return status::kNotSupported;
   if (hull || domain) {
     if (!hull || !domain || hull->stage() != graphics::ShaderStage::Hull || domain->stage() != graphics::ShaderStage::Domain || hull->tess_output_points() != domain->tess_input_points() || hull->tess_domain() != domain->tess_domain()) return status::kInvalidParameter;
     if (!(caps_.features & graphics::kFeatureTessellation)) return status::kNotSupported;
@@ -3307,6 +3339,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   pd.back_stencil = d.back_stencil;
   pd.logic_op_enable = d.logic_op_enable;
   pd.logic_op = d.logic_op;
+  pd.line_mode = d.line_mode;
 
   SharedPointer<PipelineObject> pipeline = SharedPointer<PipelineObject>::make(allocator_, device_);
   if (!pipeline) return status::kNoMemory;

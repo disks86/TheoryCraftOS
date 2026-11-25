@@ -49,7 +49,7 @@ class VirglDevice final : public IGraphicsDevice {
             kFeature2DepthCopies |
             // (polygon modes, polygon offset, depth clamp, two-sided stencil, logic operations and border colours are GL 3.3 core, anisotropic filtering GL 4.6 / an extension every
             // desktop GL host has; dual-source blending when the host blends one target so)
-            kFeature2RasterizerState | kFeature2LogicOps | kFeature2SamplerState | (gpu_.virgl_max_dual_source_targets() >= 1 ? kFeature2DualSourceBlend : 0u) |
+            kFeature2RasterizerState | kFeature2LogicOps | kFeature2SamplerState | kFeature2SeparateFilters | kFeature2LineModes | (gpu_.virgl_max_dual_source_targets() >= 1 ? kFeature2DualSourceBlend : 0u) |
             // (sixteen viewports, which geometry shaders pick with gl_ViewportIndex; a vertex or evaluation shader's layer and viewport the host does not take from virgl's shaders)
             (gpu_.virgl_has_geometry() && gpu_.virgl_max_viewports() >= kMaxViewports ? kFeature2Viewports : 0u)};
   }

@@ -220,9 +220,11 @@ class VidMm {
   void note_cpu_write(Allocation& a);
   void note_gpu_write(Allocation& a);
 
-  // Mirrors: `mirror` (a texture of one level and sample, 2D or a 2D array, not placed or reserved) shows `sources` - 2D images of one level and sample of its size whose pixels
-  // are as many bytes as its own and of the same channel width (8 or 16 bits): source n is layer n of an array, a 2D mirror has one source. Its contents are the sources'
-  // bytes; kMirrorInteger makes the alpha the integer 1 (the mirror is an integer image showing a normalised one: Direct3D's R8_UINT view of an NV12 plane), kMirrorWriteBack
+  // Mirrors: `mirror` (a texture of one sample, 2D or a 2D array, not placed or reserved) shows `sources` - 2D images of one level and sample of its size whose pixels have the
+  // same channels of the same width as its own (the four-channel 8- and 16-bit formats, normalised or integer, or the one- and two-channel 8- and 16-bit formats of any kind, each
+  // its own family): source n is layer n of an array, a 2D mirror has one source; a mirror of several levels (with `subresources`) has a source for each of its subresources, levels
+  // first - source n is layer n % layers of level n / layers. Its contents are the sources'
+  // bytes; kMirrorInteger makes the alpha of a four-channel mirror the integer 1 (the mirror is an integer image showing a normalised one: Direct3D's R8_UINT view of an NV12 plane), kMirrorWriteBack
   // gives the `channels` the GPU drew into the mirror back to its one source once the pass that drew is over (a render target of that integer view). The kernel's devices
   // have no views of other formats or of several images, so a mirror is a copy: command streams bring it up to date (refresh_mirror) before it is sampled or drawn into.
   // An empty `sources` makes it an ordinary image again. kInvalidParameter for images that cannot be mirrored so.

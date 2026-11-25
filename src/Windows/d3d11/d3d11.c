@@ -34,7 +34,8 @@
  *   vertex layouts     the kernel takes 32-bit floats only: a layout with R8G8B8A8 / B8G8R8A8 colours gets its vertex buffers converted (a second
  *                      buffer, made again when the first changes).
  *   states             a Direct3D 12 pipeline state for each combination of shaders, layout, blend, depth and rasterizer state that is drawn with,
- *                      kept in a cache.
+ *                      kept in a cache. Its strips are cut at the index buffer's largest index (Direct3D 12's strip cut of the list, set with the
+ *                      index buffer at each indexed draw); its lines are those of MultisampleEnable / AntialiasedLineEnable (quadrilateral, alpha-antialiased).
  *   textures, samplers a table of 8 of each for all the stages (t0 .. t7, s0 .. s7; the sampler of t<n> is s<n>, as the kernel pairs them), and one of the
  *                      unordered access views (u0 .. u7).
  *   swap chains        dxgi.dll asks the device for its back buffers and their pixels (ITcosPresenter, src/Windows/tcosdx.h).
@@ -57,6 +58,7 @@
 #include <d3d10_1.h>
 #include <d3d12.h>
 #include <d3d12video.h>
+#include "../d3d12/d3d12_types.h"      /* (the Agility SDK's later interfaces and flags mingw lacks: ID3D12GraphicsCommandList9, the dynamic strip cut) */
 #include "../d3d12/video_types.h"
 #include <dxva.h>
 #include "video_types.h"
@@ -168,6 +170,7 @@ struct Tex {
   struct View *rt_views;
   int depth;                   /* a depth buffer: the CPU does not reach it */
   UINT block;                  /* a block-compressed format (BC1 .. BC3): the bytes of a 4 x 4 block (bpp is the same); its rows are rows of blocks */
+  UINT bits;                   /* R1_UNORM: a bit a pixel, rows of (width + 7) / 8 bytes (bpp 1 is not a pixel's) */
   ID3D12Resource *res;
   UINT used;
   UINT sampled;                /* the command list that has a draw sampling it */
@@ -829,7 +832,16 @@ static BOOL tex_d12_sub(const Tex *t, UINT sub, UINT *out) {
   return TRUE;
 }
 /* The bytes of a row of a level `w` pixels wide as the program has it (a row of blocks of a compressed format), and the rows of a level `h` high. */
-static UINT tex_pitch(const Tex *t, UINT w) { return t->block ? (w + 3) / 4 * t->block : w * t->bpp; }
+/* The format a view of `view_format` (UNKNOWN: none given) of the texture has below: the view's own of a typeless R8 / R8G8 / R16 / R16G16 texture (Direct3D 12 shows such a texture
+ * as each kind of its family: R8_UINT, R16_FLOAT ...), else the format Direct3D 12 keeps the texture in. */
+static DXGI_FORMAT view_format12(const Tex *t, DXGI_FORMAT view_format) {
+  const DXGI_FORMAT stored = t->stored;
+  if ((stored == DXGI_FORMAT_R8_TYPELESS || stored == DXGI_FORMAT_R8G8_TYPELESS || stored == DXGI_FORMAT_R16_TYPELESS || stored == DXGI_FORMAT_R16G16_TYPELESS) &&
+      view_format != DXGI_FORMAT_UNKNOWN)
+    return view_format;
+  return stored;
+}
+static UINT tex_pitch(const Tex *t, UINT w) { return t->block ? (w + 3) / 4 * t->block : t->bits ? (w + 7) / 8 : w * t->bpp; }
 static UINT tex_rows(const Tex *t, UINT h) { return t->block ? (h + 3) / 4 : t->planar ? h + (h + 1) / 2 : h; }      /* (a planar texture: the luma's rows and the chroma's) */
 /* The slices of a level of a volume (1 for the other kinds). */
 static UINT tex_slices(const Tex *t, UINT sub) { return t->kind == 1 ? mip_size(t->slices, sub % t->desc.MipLevels) : 1; }
@@ -1123,7 +1135,8 @@ static HRESULT tex_write_rows(Dev *d, Tex *t, UINT sub, UINT x, UINT y, UINT z, 
   ++t->version;
   UINT d12_sub;
   if (!tex_d12_sub(t, sub, &d12_sub)) return S_OK;      /* (a level the kernel does not keep) */
-  const UINT row_bytes = t->block ? tex_pitch(t, w) : w * t->stored_bpp, row_pitch = (row_bytes + 255u) & ~255u, rows_of = tex_rows(t, h);
+  if (t->bits && (x % 8)) return E_INVALIDARG;      /* (R1_UNORM: a box that starts on a byte) */
+  const UINT row_bytes = t->block || t->bits ? tex_pitch(t, w) : w * t->stored_bpp, row_pitch = (row_bytes + 255u) & ~255u, rows_of = tex_rows(t, h);
   /* The copy goes into the list in order with the draws: those recorded before it still see the old pixels, and a draw that samples the texture later sends
    * the list first (`written`, in draw_prepare). As with a render target, a texture the list has sampled already is not copied into in the same list. */
   settle(d, t->sampled);
@@ -1136,7 +1149,7 @@ static HRESULT tex_write_rows(Dev *d, Tex *t, UINT sub, UINT x, UINT y, UINT z, 
   for (UINT row = 0; row < rows_of; ++row) {
     const BYTE *in = rows + (SIZE_T)row * pitch;
     BYTE *to = memory + (SIZE_T)row * row_pitch;
-    if (raw) memcpy(to, in, (SIZE_T)w * t->stored_bpp); else row_to_stored(t->fmt, in, to, w, row_bytes);
+    if (raw) memcpy(to, in, t->bits ? (SIZE_T)row_bytes : (SIZE_T)w * t->stored_bpp); else row_to_stored(t->fmt, in, to, w, row_bytes);
   }
   ID3D12Resource_Unmap(upload, 0, NULL);
   D3D12_TEXTURE_COPY_LOCATION to, from;
@@ -1170,7 +1183,7 @@ static HRESULT tex_read_rows(Dev *d, Tex *t, UINT sub, UINT z, BYTE *rows, BOOL 
   const UINT level = sub % t->desc.MipLevels, w = mip_size(t->desc.Width, level), h = mip_size(t->desc.Height, level);
   UINT d12_sub;
   if (!tex_d12_sub(t, sub, &d12_sub)) { memset(rows, 0, (SIZE_T)tex_pitch(t, w) * tex_rows(t, h)); return S_OK; }      /* (a level the kernel does not keep) */
-  const UINT row_pitch = ((t->block ? tex_pitch(t, w) : w * t->stored_bpp) + 255u) & ~255u, rows_of = tex_rows(t, h);
+  const UINT row_pitch = ((t->block || t->bits ? tex_pitch(t, w) : w * t->stored_bpp) + 255u) & ~255u, rows_of = tex_rows(t, h);
   ID3D12Resource *readback = make_buffer(d, D3D12_HEAP_TYPE_READBACK, (UINT64)row_pitch * rows_of);
   if (!readback) return E_OUTOFMEMORY;
   D3D12_TEXTURE_COPY_LOCATION to, from;
@@ -1196,7 +1209,8 @@ static HRESULT tex_read_rows(Dev *d, Tex *t, UINT sub, UINT z, BYTE *rows, BOOL 
     for (UINT row = 0; row < rows_of; ++row) {
       const BYTE *in = memory + (SIZE_T)row * row_pitch;
       BYTE *to_row = rows + (SIZE_T)row * tex_pitch(t, w);
-      if (raw) memcpy(rows + (SIZE_T)row * w * t->stored_bpp, in, (SIZE_T)w * t->stored_bpp);
+      if (raw && t->bits) memcpy(rows + (SIZE_T)row * tex_pitch(t, w), in, tex_pitch(t, w));
+      else if (raw) memcpy(rows + (SIZE_T)row * w * t->stored_bpp, in, (SIZE_T)w * t->stored_bpp);
       else row_from_stored(t->fmt, in, to_row, w, tex_pitch(t, w));
     }
     ID3D12Resource_Unmap(readback, 0, NULL);
@@ -1409,6 +1423,13 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
   t->stored_bpp = t->fmt->stored_bpp;
   t->depth = (t->fmt->flags & FMT_DEPTH) != 0;
   t->block = (t->fmt->flags & FMT_BLOCK) ? t->bpp : 0;
+  t->bits = desc.Format == DXGI_FORMAT_R1_UNORM;
+  /* (R1_UNORM: Direct3D 12's texture is sampled only - no CPU access, staging or dynamic copy, tiles or cube; render targets and unordered access are FMT_SAMPLE's) */
+  if (t->bits && (desc.CPUAccessFlags || desc.Usage == D3D11_USAGE_STAGING || desc.Usage == D3D11_USAGE_DYNAMIC || tiled || cube)) {
+    tex_refused(&desc, "R1_UNORM, for that use");
+    dx_Release(OBJ(t));
+    return E_INVALIDARG;
+  }
   if (tiled) {
     /* (kept as the program's texels: the tiles are the format's) */
     TexFormat *own = mem_alloc(sizeof *own);
@@ -1745,7 +1766,7 @@ static HRESULT rtv_create(Dev *d, ID3D11Resource *resource, const D3D11_RENDER_T
     /* (an array, a cube or a volume Direct3D 12 below draws into: a view of the layers the description names - all of them without one) */
     D3D12_RENDER_TARGET_VIEW_DESC r;
     memset(&r, 0, sizeof r);
-    r.Format = t->stored;
+    r.Format = view_format12(t, desc ? desc->Format : DXGI_FORMAT_UNKNOWN);
     UINT first = 0, count = t->kind == 1 ? mip_size(t->slices, level) : t->desc.ArraySize;      /* (a volume's level: half the slices of the one above) */
     if (desc && desc->ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DARRAY) first = desc->Texture2DArray.FirstArraySlice, count = desc->Texture2DArray.ArraySize;
     if (desc && desc->ViewDimension == D3D11_RTV_DIMENSION_TEXTURE1DARRAY) first = desc->Texture1DArray.FirstArraySlice, count = desc->Texture1DArray.ArraySize;
@@ -1793,9 +1814,16 @@ static HRESULT rtv_create(Dev *d, ID3D11Resource *resource, const D3D11_RENDER_T
     /* (a level of a 2D texture Direct3D 12 below draws into) */
     D3D12_RENDER_TARGET_VIEW_DESC r;
     memset(&r, 0, sizeof r);
-    r.Format = t->stored;
+    r.Format = view_format12(t, desc ? desc->Format : DXGI_FORMAT_UNKNOWN);
     r.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
     r.Texture2D.MipSlice = level;
+    ID3D12Device_CreateRenderTargetView(d->d12, t->res, &r, v->handle);
+  } else if (desc && view_format12(t, desc->Format) != t->stored) {
+    /* (a typed view of a typeless narrow texture: Direct3D 12's view of that format) */
+    D3D12_RENDER_TARGET_VIEW_DESC r;
+    memset(&r, 0, sizeof r);
+    r.Format = desc->Format;
+    r.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
     ID3D12Device_CreateRenderTargetView(d->d12, t->res, &r, v->handle);
   } else ID3D12Device_CreateRenderTargetView(d->d12, t->res, NULL, v->handle);
   return give(v, (void **)out);
@@ -2607,6 +2635,12 @@ static HRESULT STDMETHODCALLTYPE dev_CreateSamplerState(Dev *d, const D3D11_SAMP
       desc->MaxAnisotropy > D3D11_MAX_MAXANISOTROPY || desc->MinLOD > desc->MaxLOD || desc->MinLOD != desc->MinLOD || desc->MaxLOD != desc->MaxLOD)
     return E_INVALIDARG;
   if (((UINT)desc->Filter >> 7 & 3u) == 1 && !comparison_valid(desc->ComparisonFunc)) return E_INVALIDARG;      /* (a comparison filter needs a comparison) */
+  /* (the MINIMUM_ / MAXIMUM_ filters: where the device has them - MinMaxFiltering, D3D11_FEATURE_D3D11_OPTIONS1, the kernel's kFeature2SamplerReductions) */
+  if (((UINT)desc->Filter >> 7 & 3u) >= 2) {
+    UINT features2 = 0;
+    TcosD3D12DeviceFeatures(d->d12, NULL, &features2);
+    if (!(features2 & (1u << 19))) return E_INVALIDARG;      /* (graphics::kFeature2SamplerReductions) */
+  }
   D3D11_SAMPLER_DESC key = *desc;
   if (((UINT)desc->Filter & 0x7Fu) != 0x55) key.MaxAnisotropy = 0;
   if (((UINT)desc->Filter >> 7 & 3u) != 1) key.ComparisonFunc = D3D11_COMPARISON_NEVER;

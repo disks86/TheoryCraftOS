@@ -354,6 +354,13 @@ constexpr Vec4 border_color_value(BorderColor b) { return b == BorderColor::Opaq
 // takes one lookup.
 // A border colour of any value (kFeature2SamplerState: custom_border): border_rgba, the channels as the texture keeps them (an integer texture's as the bits of its integers), in place of
 // `border`.
+// How the texels a filter reads make the result (kFeature2SamplerReductions): weighted (the usual filtering), or the least or the greatest value of each channel among the texels
+// the filter gives a weight above 0 - those of both levels a linear mip filter blends, both slices of a volume, the lookups of an anisotropic filter.
+enum class SamplerReduction : uint8_t { Weighted, Minimum, Maximum };
+// `filter` is the filter of minification and magnification, or - with separate_mag (kFeature2SeparateFilters) - of minification alone, mag_filter then the one of magnification:
+// a lookup minifies where its level of detail (with the bias and the clamps) is above 0 and magnifies elsewhere (Direct3D's MIN_*_MAG_*_MIP_* filters).
+// With `unnormalized` (kFeature2UnnormalizedCoordinates) the coordinates of a 2D image are in texels of the view's first level - 0 .. width, 0 .. height - and every lookup reads that
+// level (Direct3D 12's non-normalized samplers: one level, min and mag filter alike, point mip filter, no anisotropy or comparison, clamp or border addressing).
 struct SamplerDesc {
   Filter filter = Filter::Nearest;
   AddressMode address_u = AddressMode::Repeat;
@@ -372,8 +379,14 @@ struct SamplerDesc {
   uint8_t max_anisotropy = 1;   // 1 .. kMaxAnisotropy
   bool custom_border = false;
   float border_rgba[4] = {0, 0, 0, 0};
+  bool separate_mag = false;
+  Filter mag_filter = Filter::Nearest;
+  SamplerReduction reduction = SamplerReduction::Weighted;
+  bool unnormalized = false;
 };
 constexpr uint32_t kMaxAnisotropy = 16;
+// The filter of magnification (separate_mag's, or the one filter).
+constexpr Filter magnification_filter(const SamplerDesc& s) { return s.separate_mag ? s.mag_filter : s.filter; }
 // The colour a sampler gives outside the image (AddressMode::ClampToBorder).
 inline Vec4 sampler_border_value(const SamplerDesc& s) { return s.custom_border ? Vec4{s.border_rgba[0], s.border_rgba[1], s.border_rgba[2], s.border_rgba[3]} : border_color_value(s.border); }
 
@@ -933,6 +946,11 @@ inline float depth_bias_value(const DepthBias& b, float max_slope, float max_z) 
 enum class CullMode : uint8_t { None, Back, Front };
 enum class FrontFace : uint8_t { CounterClockwise, Clockwise };  // as seen on screen
 
+// How lines are drawn (Direct3D's line rasterization modes; kFeature2LineModes for all but Aliased): one pixel wide by the device's aliased rule; alpha-antialiased - a rectangle one
+// pixel wide between the two ends (not lengthened), each pixel it touches shaded once with the first target's alpha multiplied by the part of the pixel it covers; or a
+// quadrilateral - a rectangle 1.4 (wide) or 1.0 (narrow) pixels wide between the ends, rasterized as two triangles (with multisample, the samples it covers).
+enum class LineMode : uint8_t { Aliased, AlphaAntialiased, QuadrilateralWide, QuadrilateralNarrow };
+
 struct GraphicsPipelineDesc {
   const IShaderModule* vertex_shader = nullptr;
   const IShaderModule* fragment_shader = nullptr;
@@ -993,6 +1011,8 @@ struct GraphicsPipelineDesc {
   // kFeature2LogicOps: a logic operation in place of blending, for every colour target (the blend state is then not used).
   bool logic_op_enable = false;
   LogicOp logic_op = LogicOp::Noop;
+  // How the pipeline's lines are drawn: a wireframe triangle's edges and the line topologies (LineMode).
+  LineMode line_mode = LineMode::Aliased;
 };
 
 class IPipeline {
@@ -1282,6 +1302,10 @@ enum DeviceFeature2 : uint32_t {
   kFeature2SamplerState = 1u << 11,         // SamplerDesc::max_anisotropy and custom_border / border_rgba
   kFeature2Viewports = 1u << 12,            // ICommandBuffer::set_viewports / set_scissors and ShaderIo::viewport from geometry shaders
   kFeature2LayerFromAnyStage = 1u << 13,    // ShaderIo::layer and ShaderIo::viewport written by vertex and domain shaders (Direct3D 11.3's VPAndRTArrayIndexFromAnyShaderFeedingRasterizer)
+  kFeature2SeparateFilters = 1u << 18,      // SamplerDesc::separate_mag / mag_filter: a magnification filter apart from the minification one (Direct3D's MIN_POINT_MAG_LINEAR ...)
+  kFeature2SamplerReductions = 1u << 19,    // SamplerDesc::reduction Minimum / Maximum (Direct3D's MINIMUM_* / MAXIMUM_* filters)
+  kFeature2UnnormalizedCoordinates = 1u << 20,   // SamplerDesc::unnormalized: coordinates in texels (Direct3D 12's D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES)
+  kFeature2LineModes = 1u << 21,            // GraphicsPipelineDesc::line_mode other than Aliased: alpha-antialiased lines and quadrilateral lines of 1.4 and 1.0 pixels
   // The contents of the images the system keeps no memory of: IImage::read_depth_subresource / write_depth_subresource (a depth image's depth and stencil planes) and
   // IImage::copy_subresource (a whole subresource of a depth image or of a multisampled image into another of the same format, size and samples, on the device). (Bit 24: a high bit,
   // the ones between are left for the other features being added.)
@@ -1297,6 +1321,11 @@ enum DeviceFeature2 : uint32_t {
   // end_feedback), and lookups take a per-lookup minimum level of detail (Direct3D's SampleClamp). (A high bit, apart from the ones other work is adding.)
   kFeature2TileResidency = 1u << 27,
 };
+// The features a sampler needs beyond the base ones (kFeature2SeparateFilters, ..; 0 for one every device takes).
+constexpr uint32_t sampler_features2(const SamplerDesc& s) {
+  return (s.separate_mag && s.mag_filter != s.filter ? kFeature2SeparateFilters : 0u) | (s.reduction != SamplerReduction::Weighted ? kFeature2SamplerReductions : 0u) |
+         (s.unnormalized ? kFeature2UnnormalizedCoordinates : 0u);
+}
 constexpr uint32_t kMaxViewports = 16;
 
 

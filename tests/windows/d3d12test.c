@@ -5969,9 +5969,10 @@ static UINT target_bytes(DXGI_FORMAT format, const float v[4], BYTE out[16]) {
   }
 }
 /* One draw of `colour` (through ps, the float, unsigned or signed shader) into a 4 x 4 render target of `format`; its texel (1, 1) back into `out`. */
+static DXGI_FORMAT g_fd_texture;      /* (not UNKNOWN: format_draw's texture is of this format, drawn into through a view of `format` - a typeless texture's typed view) */
 static int format_draw(Scene *c, DXGI_FORMAT format, const void *ps, SIZE_T ps_size, const float colour[4], BYTE out[16], UINT bytes) {
   ID3D12Device *dev = c->dev;
-  ID3D12Resource *t = uav_texture(dev, D3D12_RESOURCE_DIMENSION_TEXTURE2D, 4, 4, 1, format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+  ID3D12Resource *t = uav_texture(dev, D3D12_RESOURCE_DIMENSION_TEXTURE2D, 4, 4, 1, g_fd_texture ? g_fd_texture : format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
   D3D12_ROOT_PARAMETER param;
   memset(&param, 0, sizeof param);
   param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
@@ -6020,7 +6021,11 @@ static int format_draw(Scene *c, DXGI_FORMAT format, const void *ps, SIZE_T ps_s
   int ok = 0;
   if (t && pso && rtvs && vb) {
     const D3D12_CPU_DESCRIPTOR_HANDLE rtv = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(rtvs);
-    ID3D12Device_CreateRenderTargetView(dev, t, NULL, rtv);
+    D3D12_RENDER_TARGET_VIEW_DESC rd;
+    memset(&rd, 0, sizeof rd);
+    rd.Format = format;
+    rd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    ID3D12Device_CreateRenderTargetView(dev, t, g_fd_texture ? &rd : NULL, rtv);
     CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
     CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, pso, &IID_ID3D12GraphicsCommandList, (void **)&list));
     if (list) {
@@ -7133,6 +7138,635 @@ done:
   if (heap) ID3D12Heap_Release(heap);
 }
 
+
+/* ---- fixed state and formats: strip cuts, samplers (separate filters, reductions, D3D12_SAMPLER_DESC2), line modes, typeless narrow views, R1_UNORM ---------------------- */
+
+/* Draws `index_count` indices (16-bit, or 32-bit with `wide`) of `verts` (seven floats a vertex) with `pso` as `topology` into the 64 x 64 target cleared black; the strip cut
+ * is the pipeline's, or - `cut` not -1 - IASetIndexBufferStripCutValue's (through a bundle with `bundle`). The picture into `out`. */
+static int gaps_draw_indexed(Scene *c, ID3D12PipelineState *pso, D3D_PRIMITIVE_TOPOLOGY topology, const float *verts, UINT vertex_count, const void *indices, UINT index_count,
+                             int wide, int cut, int bundle, UINT32 *out) {
+  ID3D12Device *dev = c->dev;
+  const UINT64 vb_bytes = (UINT64)vertex_count * 28, ib_bytes = (UINT64)index_count * (wide ? 4 : 2);
+  ID3D12Resource *vb = make_buffer(dev, D3D12_HEAP_TYPE_UPLOAD, vb_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+  ID3D12Resource *ib = make_buffer(dev, D3D12_HEAP_TYPE_UPLOAD, ib_bytes < 16 ? 16 : ib_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+  int ok = vb && ib && pso;
+  void *mapped = NULL;
+  if (ok && SUCCEEDED(ID3D12Resource_Map(vb, 0, NULL, &mapped)) && mapped) { memcpy(mapped, verts, (SIZE_T)vb_bytes); ID3D12Resource_Unmap(vb, 0, NULL); }
+  mapped = NULL;
+  if (ok && SUCCEEDED(ID3D12Resource_Map(ib, 0, NULL, &mapped)) && mapped) { memcpy(mapped, indices, (SIZE_T)ib_bytes); ID3D12Resource_Unmap(ib, 0, NULL); }
+  ID3D12GraphicsCommandList *list = NULL, *b = NULL;
+  ID3D12CommandAllocator *ba = NULL;
+  if (ok) {
+    CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+    CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+    ok = list != NULL;
+  }
+  if (ok) {
+    scene_begin(c, list, 1);
+    const D3D12_VERTEX_BUFFER_VIEW vbv = {ID3D12Resource_GetGPUVirtualAddress(vb), (UINT)vb_bytes, 28};
+    const D3D12_INDEX_BUFFER_VIEW ibv = {ID3D12Resource_GetGPUVirtualAddress(ib), (UINT)ib_bytes, wide ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT};
+    ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, c->rs);
+    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(list, 0, 16, kIdentity, 0);
+    ID3D12GraphicsCommandList_IASetVertexBuffers(list, 0, 1, &vbv);
+    ID3D12GraphicsCommandList_IASetIndexBuffer(list, &ibv);
+    if (bundle) {
+      /* (a bundle that sets the pipeline, the topology and the strip cut and draws: it takes the caller's root signature and buffers) */
+      CHECK_HR(ID3D12Device_CreateCommandAllocator(dev, D3D12_COMMAND_LIST_TYPE_BUNDLE, &IID_ID3D12CommandAllocator, (void **)&ba));
+      if (ba) CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_BUNDLE, ba, NULL, &IID_ID3D12GraphicsCommandList, (void **)&b));
+    }
+    ID3D12GraphicsCommandList *to = b ? b : list;
+    ID3D12GraphicsCommandList_SetPipelineState(to, pso);
+    ID3D12GraphicsCommandList_IASetPrimitiveTopology(to, topology);
+    if (cut >= 0) {
+      ID3D12GraphicsCommandList9 *l9 = NULL;
+      CHECK_HR(ID3D12GraphicsCommandList_QueryInterface(to, &IID_ID3D12GraphicsCommandList9, (void **)&l9));
+      if (l9) { ID3D12GraphicsCommandList9_IASetIndexBufferStripCutValue(l9, (D3D12_INDEX_BUFFER_STRIP_CUT_VALUE)cut); ID3D12GraphicsCommandList9_Release(l9); }
+    }
+    ID3D12GraphicsCommandList_DrawIndexedInstanced(to, index_count, 1, 0, 0, 0);
+    if (b) {
+      CHECK_HR(ID3D12GraphicsCommandList_Close(b));
+      ID3D12GraphicsCommandList_ExecuteBundle(list, b);
+    }
+    scene_read_target(c, list);
+    scene_run(c, list);
+    const UINT32 *px = NULL;
+    ok = SUCCEEDED(ID3D12Resource_Map(c->readback, 0, NULL, (void **)&px)) && px;
+    if (ok) { memcpy(out, px, 64 * 64 * 4); ID3D12Resource_Unmap(c->readback, 0, NULL); }
+  }
+  if (b) ID3D12GraphicsCommandList_Release(b);
+  if (ba) ID3D12CommandAllocator_Release(ba);
+  if (list) ID3D12GraphicsCommandList_Release(list);
+  if (ib) ID3D12Resource_Release(ib);
+  if (vb) ID3D12Resource_Release(vb);
+  return ok;
+}
+
+/* Index buffer strip cuts: a strip of six vertices cut after the third by 0xFFFF draws two triangles at the top; with IBStripCutValue DISABLED 0xFFFF is vertex 65535 at the
+ * bottom, and the strip's triangles through it cover the middle. The cut of the command list (D3D12_PIPELINE_STATE_FLAG_DYNAMIC_INDEX_BUFFER_STRIP_CUT,
+ * IASetIndexBufferStripCutValue), also from a bundle, and SetPipelineState bringing the pipeline's back; 0xFFFFFFFF of 32-bit indices; a triangle fan (TriangleFanSupported). */
+static void test_strip_cuts(Scene *c) {
+  static UINT32 img[64 * 64];
+  static float v[65536 * 7];
+  memset(v, 0, sizeof v);
+  const float top[6][7] = {{-0.9f, 0.9f, 0.5f, 1, 0, 0, 1}, {-0.1f, 0.9f, 0.5f, 1, 0, 0, 1}, {-0.5f, 0.3f, 0.5f, 1, 0, 0, 1},
+                           {0.1f, 0.9f, 0.5f, 0, 1, 0, 1}, {0.9f, 0.9f, 0.5f, 0, 1, 0, 1}, {0.5f, 0.3f, 0.5f, 0, 1, 0, 1}};
+  memcpy(v, top, sizeof top);
+  const float bottom[7] = {0.0f, -0.9f, 0.5f, 0, 0, 1, 1};
+  memcpy(v + 65535 * 7, bottom, sizeof bottom);
+  const UINT16 strip[7] = {0, 1, 2, 0xFFFF, 3, 4, 5};
+  D3D12_FEATURE_DATA_D3D12_OPTIONS15 o15;
+  memset(&o15, 0, sizeof o15);
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(c->dev, D3D12_FEATURE_D3D12_OPTIONS15, &o15, sizeof o15));
+  CHECK(o15.DynamicIndexBufferStripCutSupported && o15.TriangleFanSupported);
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
+  D3D12_INPUT_ELEMENT_DESC layout[2];
+  fs_desc(c, &pd, layout);
+  pd.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF;
+  ID3D12PipelineState *cut16 = fs_pso(c, &pd);
+  pd.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
+  ID3D12PipelineState *uncut = fs_pso(c, &pd);
+  pd.Flags = D3D12_PIPELINE_STATE_FLAG_DYNAMIC_INDEX_BUFFER_STRIP_CUT;
+  ID3D12PipelineState *dynamic = fs_pso(c, &pd);
+  pd.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+  pd.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF;
+  ID3D12PipelineState *cut32 = fs_pso(c, &pd);
+  ID3D12PipelineState *bad = NULL;
+  pd.IBStripCutValue = (D3D12_INDEX_BUFFER_STRIP_CUT_VALUE)3;
+  CHECK(ID3D12Device_CreateGraphicsPipelineState(c->dev, &pd, &IID_ID3D12PipelineState, (void **)&bad) == E_INVALIDARG && !bad);
+  /* (the middle - below the strip's triangles, above vertex 65535 - is black when the strip is cut and drawn when it is not) */
+  const int mid = 40 * 64 + 32;
+  if (gaps_draw_indexed(c, cut16, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP, v, 65536, strip, 7, 0, -1, 0, img)) {
+    printf("strip cut 0xFFFF: %08x %08x %08x\n", (unsigned)img[8 * 64 + 16], (unsigned)img[8 * 64 + 48], (unsigned)img[mid]);
+    CHECK(FS_RGB(img[8 * 64 + 16]) == 0xFF0000 && FS_RGB(img[8 * 64 + 48]) == 0x00FF00 && FS_RGB(img[mid]) == 0);
+  } else CHECK(0);
+  if (gaps_draw_indexed(c, uncut, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP, v, 65536, strip, 7, 0, -1, 0, img)) {
+    printf("strip not cut: %08x\n", (unsigned)img[mid]);
+    CHECK(FS_RGB(img[mid]) != 0 && FS_RGB(img[8 * 64 + 16]) == 0xFF0000);
+  } else CHECK(0);
+  /* (the list's cut on a dynamic pipeline: set after the pipeline; then a pipeline set again brings its own - DISABLED - back) */
+  if (gaps_draw_indexed(c, dynamic, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP, v, 65536, strip, 7, 0, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF, 0, img))
+    CHECK(FS_RGB(img[mid]) == 0 && FS_RGB(img[8 * 64 + 48]) == 0x00FF00);
+  else CHECK(0);
+  if (gaps_draw_indexed(c, dynamic, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP, v, 65536, strip, 7, 0, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF, 1, img))
+    CHECK(FS_RGB(img[mid]) == 0 && FS_RGB(img[8 * 64 + 48]) == 0x00FF00);      /* (from a bundle) */
+  else CHECK(0);
+  if (gaps_draw_indexed(c, dynamic, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP, v, 65536, strip, 7, 0, -1, 0, img)) CHECK(FS_RGB(img[mid]) != 0);
+  else CHECK(0);
+  /* (32-bit indices: 0xFFFFFFFF cuts with its value; 0xFFFF is then vertex 65535 like any other) */
+  const UINT32 strip32[7] = {0, 1, 2, 0xFFFFFFFFu, 3, 4, 5}, through[7] = {0, 1, 2, 0xFFFF, 3, 4, 5};
+  if (gaps_draw_indexed(c, cut32, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP, v, 65536, strip32, 7, 1, -1, 0, img)) CHECK(FS_RGB(img[mid]) == 0 && FS_RGB(img[8 * 64 + 48]) == 0x00FF00);
+  else CHECK(0);
+  if (gaps_draw_indexed(c, cut32, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP, v, 65536, through, 7, 1, -1, 0, img)) CHECK(FS_RGB(img[mid]) != 0);
+  else CHECK(0);
+  /* (a fan of the first three around vertex 0, then cut: the second fan) */
+  const UINT16 fan[9] = {0, 1, 2, 0xFFFF, 3, 4, 5, 0xFFFF, 0xFFFF};
+  if (gaps_draw_indexed(c, cut16, (D3D_PRIMITIVE_TOPOLOGY)6, v, 65536, fan, 9, 0, -1, 0, img)) {
+    printf("triangle fan: %08x %08x %08x\n", (unsigned)img[8 * 64 + 16], (unsigned)img[8 * 64 + 48], (unsigned)img[mid]);
+    CHECK(FS_RGB(img[8 * 64 + 16]) == 0xFF0000 && FS_RGB(img[8 * 64 + 48]) == 0x00FF00 && FS_RGB(img[mid]) == 0);
+  } else CHECK(0);
+  ID3D12PipelineState *list[4] = {cut16, uncut, dynamic, cut32};
+  for (int i = 0; i < 4; ++i) if (list[i]) ID3D12PipelineState_Release(list[i]);
+}
+
+/* A root signature of a table (t0, u0), a table of one sampler (s0) and four root constants (b0): cs_smp_lod's. */
+static ID3D12RootSignature *sampler_signature(ID3D12Device *dev) {
+  D3D12_DESCRIPTOR_RANGE ranges[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 1}};
+  D3D12_DESCRIPTOR_RANGE sampler_range = {D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 1, 0, 0, 0};
+  D3D12_ROOT_PARAMETER params[3];
+  memset(params, 0, sizeof params);
+  params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  params[0].DescriptorTable.NumDescriptorRanges = 2;
+  params[0].DescriptorTable.pDescriptorRanges = ranges;
+  params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  params[1].DescriptorTable.NumDescriptorRanges = 1;
+  params[1].DescriptorTable.pDescriptorRanges = &sampler_range;
+  params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  params[2].Constants.Num32BitValues = 4;
+  D3D12_ROOT_SIGNATURE_DESC rsd = {3, params, 0, NULL, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+  ID3DBlob *blob = NULL, *error = NULL;
+  ID3D12RootSignature *rs = NULL;
+  CHECK_HR(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1_0, &blob, &error));
+  if (blob) {
+    CHECK_HR(ID3D12Device_CreateRootSignature(dev, 0, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, (void **)&rs));
+    ID3D10Blob_Release(blob);
+  }
+  return rs;
+}
+/* cs_smp_lod with the sampler `s` (CreateSampler2) over `tex` (view of `view`, levels from 0): sixteen lookups half way between texel x and x + 1 of row y at level of detail `lod`,
+ * the coordinates in texels when `texels`. */
+static int sampler_dispatch(Scene *c, ID3D12RootSignature *rs, ID3D12Resource *tex, DXGI_FORMAT view, const D3D12_SAMPLER_DESC2 *s, float lod, int texels, float out[16][4]) {
+  ID3D12Device *dev = c->dev;
+  ID3D12Device11 *dev11 = NULL;
+  CHECK_HR(ID3D12Device_QueryInterface(dev, &IID_ID3D12Device11, (void **)&dev11));
+  ID3D12PipelineState *pso = compute_pso(dev, rs, dx_cs_smp_lod_dxbc, sizeof dx_cs_smp_lod_dxbc);
+  ID3D12Resource *buf = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 256, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  ID3D12Resource *down = make_buffer(dev, D3D12_HEAP_TYPE_READBACK, 256, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  ID3D12DescriptorHeap *heap = view_heap(dev, 2, 1), *samplers = NULL;
+  D3D12_DESCRIPTOR_HEAP_DESC sh = {D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+  CHECK_HR(ID3D12Device_CreateDescriptorHeap(dev, &sh, &IID_ID3D12DescriptorHeap, (void **)&samplers));
+  ID3D12GraphicsCommandList *list = NULL;
+  int ok = 0;
+  if (dev11 && pso && buf && down && heap && samplers) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC sd;
+    memset(&sd, 0, sizeof sd);
+    sd.Format = view;
+    sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sd.Texture2D.MipLevels = (UINT)-1;
+    ID3D12Device_CreateShaderResourceView(dev, tex, &sd, heap_cpu(dev, heap, 0));
+    D3D12_UNORDERED_ACCESS_VIEW_DESC ud;
+    memset(&ud, 0, sizeof ud);
+    ud.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    ud.Buffer.NumElements = 16;
+    ud.Buffer.StructureByteStride = 16;
+    ID3D12Device_CreateUnorderedAccessView(dev, buf, NULL, &ud, heap_cpu(dev, heap, 1));
+    ID3D12Device11_CreateSampler2(dev11, s, ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(samplers));
+    CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+    CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, pso, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  }
+  if (list) {
+    ID3D12DescriptorHeap *heaps[2] = {heap, samplers};
+    const float constants[4] = {lod, texels ? 1.0f : 0.25f, 0, 0};
+    ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 2, heaps);
+    ID3D12GraphicsCommandList_SetComputeRootSignature(list, rs);
+    ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 0, heap_gpu(dev, heap, 0));
+    ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 1, ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(samplers));
+    ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(list, 2, 4, constants, 0);
+    ID3D12GraphicsCommandList_Dispatch(list, 1, 1, 1);
+    D3D12_RESOURCE_BARRIER b;
+    memset(&b, 0, sizeof b);
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = buf;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &b);
+    ID3D12GraphicsCommandList_CopyBufferRegion(list, down, 0, buf, 0, 256);
+    scene_run(c, list);
+    ID3D12GraphicsCommandList_Release(list);
+    const float *p = NULL;
+    if (SUCCEEDED(ID3D12Resource_Map(down, 0, NULL, (void **)&p)) && p) {
+      memcpy(out, p, 256);
+      ok = 1;
+      ID3D12Resource_Unmap(down, 0, NULL);
+    }
+  }
+  if (dev11) ID3D12Device11_Release(dev11);
+  if (pso) ID3D12PipelineState_Release(pso);
+  if (buf) ID3D12Resource_Release(buf);
+  if (down) ID3D12Resource_Release(down);
+  if (heap) ID3D12DescriptorHeap_Release(heap);
+  if (samplers) ID3D12DescriptorHeap_Release(samplers);
+  return ok;
+}
+static D3D12_SAMPLER_DESC2 sampler2(D3D12_FILTER filter, D3D12_TEXTURE_ADDRESS_MODE mode) {
+  D3D12_SAMPLER_DESC2 s;
+  memset(&s, 0, sizeof s);
+  s.Filter = filter;
+  s.AddressU = s.AddressV = s.AddressW = mode;
+  s.MaxAnisotropy = 1;
+  s.MaxLOD = 1000.0f;
+  return s;
+}
+
+/* Samplers: the minification and magnification filters of their own (a lookup at level of detail 0 magnifies, at 1 minifies: half way between two texels a point filter
+ * gives one of them, a linear one their mean), the MINIMUM_ and MAXIMUM_ reductions (the least and greatest of the two texels a linear filter weighs - also across a linear
+ * mip filter's two levels), the anisotropic filters with a point mip filter (AnisoFilterWithPointMipSupported: one level, not the blend), a border colour of integers
+ * (D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR: the bits as they are - those of 0.25 read as 0.25 from a float texture) and coordinates in texels
+ * (D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES, where NonNormalizedCoordinateSamplersSupported); descriptions that break the rules are null descriptors. */
+static void test_sampler_filters(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  ID3D12RootSignature *rs = sampler_signature(dev);
+  /* a 4 x 4 R8G8B8A8_UNORM texture of two levels: texel x of each row is 0, 255, 0, 255 in red, x * 64 in green; level 1 (2 x 2) all blue */
+  D3D12_HEAP_PROPERTIES defaults = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+  D3D12_RESOURCE_DESC td = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 4, 4, 1, 2, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+  ID3D12Resource *tex = NULL;
+  CHECK_HR(ID3D12Device_CreateCommittedResource(dev, &defaults, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&tex));
+  if (!rs || !tex) { CHECK(0); if (rs) ID3D12RootSignature_Release(rs); if (tex) ID3D12Resource_Release(tex); return; }
+  UINT32 level0[16], level1[4];
+  for (int i = 0; i < 16; ++i) level0[i] = ((i & 1) ? 0xFFu : 0u) | (UINT32)((i % 4) * 64) << 8 | 0xFF000000u;
+  for (int i = 0; i < 4; ++i) level1[i] = 0xFFFF0000u;
+  texture_write(c, tex, 0, level0, 4);
+  texture_write(c, tex, 1, level1, 4);
+  float got[16][4];
+  const int software = !g_hardware;
+  /* (a texture of one level, the same texels: the lookups' level of detail - clamped by MinLOD and MaxLOD, not by the levels - still picks minification or magnification; thread 0
+   * is half way between texel 0 - red 0 - and texel 1 - red 1) */
+  ID3D12Resource *single = uav_texture(dev, D3D12_RESOURCE_DIMENSION_TEXTURE2D, 4, 4, 1, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE);
+  if (single) texture_write(c, single, 0, level0, 4);
+  else CHECK(0);
+  D3D12_SAMPLER_DESC2 s = sampler2(D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
+  if (single && sampler_dispatch(c, rs, single, DXGI_FORMAT_R8G8B8A8_UNORM, &s, 0.0f, 0, got)) {
+    printf("MIN_POINT_MAG_LINEAR, magnified: %g\n", got[0][0]);
+    CHECK(near_value(got[0][0], 0.5f, 0.02f));
+  } else CHECK(0);
+  if (single && sampler_dispatch(c, rs, single, DXGI_FORMAT_R8G8B8A8_UNORM, &s, 1.0f, 0, got)) {
+    printf("MIN_POINT_MAG_LINEAR, minified: %g\n", got[0][0]);
+    CHECK(got[0][0] == 0.0f || got[0][0] == 1.0f);
+  } else CHECK(0);
+  s.Filter = D3D12_FILTER_MIN_LINEAR_MAG_MIP_POINT;
+  if (single && sampler_dispatch(c, rs, single, DXGI_FORMAT_R8G8B8A8_UNORM, &s, 0.0f, 0, got)) CHECK(got[0][0] == 0.0f || got[0][0] == 1.0f);
+  else CHECK(0);
+  if (single && sampler_dispatch(c, rs, single, DXGI_FORMAT_R8G8B8A8_UNORM, &s, 1.0f, 0, got)) {
+    printf("MIN_LINEAR_MAG_MIP_POINT, minified: %g\n", got[0][0]);
+    CHECK(near_value(got[0][0], 0.5f, 0.02f));
+  } else CHECK(0);
+  /* (the reductions: of the two texels of thread 0 the least red is 0, the greatest 1; with a linear mip filter at level of detail 0.5 the blue of level 1 is the greatest blue) */
+  if (software) {
+    s = sampler2(D3D12_FILTER_MINIMUM_MIN_MAG_LINEAR_MIP_POINT, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
+    if (sampler_dispatch(c, rs, tex, DXGI_FORMAT_R8G8B8A8_UNORM, &s, 0.0f, 0, got)) {
+      printf("MINIMUM: %g %g\n", got[0][0], got[0][1]);
+      CHECK(got[0][0] == 0.0f && near_value(got[0][1], 0.0f, 0.001f) && near_value(got[1][1], 64.0f / 255.0f, 0.001f));
+    } else CHECK(0);
+    s.Filter = D3D12_FILTER_MAXIMUM_MIN_MAG_LINEAR_MIP_POINT;
+    if (sampler_dispatch(c, rs, tex, DXGI_FORMAT_R8G8B8A8_UNORM, &s, 0.0f, 0, got)) {
+      printf("MAXIMUM: %g %g\n", got[0][0], got[0][1]);
+      CHECK(got[0][0] == 1.0f && near_value(got[0][1], 64.0f / 255.0f, 0.001f) && got[0][2] == 0.0f);
+    } else CHECK(0);
+    s.Filter = D3D12_FILTER_MAXIMUM_MIN_MAG_MIP_LINEAR;
+    if (sampler_dispatch(c, rs, tex, DXGI_FORMAT_R8G8B8A8_UNORM, &s, 0.5f, 0, got)) {
+      printf("MAXIMUM of two levels: %g %g %g\n", got[0][0], got[0][1], got[0][2]);
+      CHECK(got[0][0] == 1.0f && got[0][2] == 1.0f);      /* (the red of level 0, the blue of level 1) */
+    } else CHECK(0);
+    s.Filter = D3D12_FILTER_MINIMUM_MIN_MAG_MIP_POINT;
+    if (sampler_dispatch(c, rs, tex, DXGI_FORMAT_R8G8B8A8_UNORM, &s, 0.0f, 0, got)) CHECK(got[0][0] == 0.0f || got[0][0] == 1.0f);      /* (one texel: itself) */
+    else CHECK(0);
+  }
+  /* (anisotropic filtering with a point mip filter at level of detail 0.75: level 1 alone - all blue, no red -, where the linear mip filter blends the two levels) */
+  s = sampler2((D3D12_FILTER)0x54, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
+  s.MaxAnisotropy = 4;
+  if (sampler_dispatch(c, rs, tex, DXGI_FORMAT_R8G8B8A8_UNORM, &s, 0.75f, 0, got)) {
+    printf("MIN_MAG_ANISOTROPIC_MIP_POINT at 0.75: %g %g\n", got[0][0], got[0][2]);
+    CHECK(got[0][0] == 0.0f && got[0][2] == 1.0f);
+  } else CHECK(0);
+  s.Filter = D3D12_FILTER_ANISOTROPIC;
+  if (sampler_dispatch(c, rs, tex, DXGI_FORMAT_R8G8B8A8_UNORM, &s, 0.75f, 0, got)) CHECK(got[0][2] > 0.6f && got[0][2] < 0.9f);
+  else CHECK(0);
+  /* (a border colour of integers: D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR, the bits of 0.25, 0.5, 0.75 and 1 - outside the texture, thread 3 of row 0 reads half the border) */
+  s = sampler2(D3D12_FILTER_MIN_MAG_MIP_POINT, D3D12_TEXTURE_ADDRESS_MODE_BORDER);
+  s.Flags = D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR;
+  s.UintBorderColor[0] = float_bits_(0.25f), s.UintBorderColor[1] = float_bits_(0.5f), s.UintBorderColor[2] = float_bits_(0.75f), s.UintBorderColor[3] = float_bits_(1.0f);
+  if (sampler_dispatch(c, rs, tex, DXGI_FORMAT_R8G8B8A8_UNORM, &s, 0.0f, 0, got)) {
+    printf("UINT border colour: %g %g %g %g\n", got[3][0], got[3][1], got[3][2], got[3][3]);
+    /* (a GPU keeps the border colour in the texture's precision: within a code of 8 bits) */
+    CHECK(near_value(got[3][0], 0.25f, 0.005f) && near_value(got[3][1], 0.5f, 0.005f) && near_value(got[3][2], 0.75f, 0.005f) && got[3][3] == 1.0f);
+  } else CHECK(0);
+  /* (coordinates in texels: (x + 1, y + 0.5) is the same place as the normalised (x + 1) / 4, (y + 0.5) / 4 - a linear filter's mean of texels x and x + 1 -; the rules: MinLOD and
+   * MaxLOD 0, clamp or border addressing, min and mag alike, a point mip filter) */
+  D3D12_FEATURE_DATA_D3D12_OPTIONS17 o17;
+  memset(&o17, 0, sizeof o17);
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS17, &o17, sizeof o17));
+  if (o17.NonNormalizedCoordinateSamplersSupported) {
+    s = sampler2(D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
+    s.MaxLOD = 0.0f;
+    s.Flags = D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES;
+    if (sampler_dispatch(c, rs, tex, DXGI_FORMAT_R8G8B8A8_UNORM, &s, 0.0f, 1, got)) {
+      printf("non-normalized coordinates: %g %g, %g\n", got[0][0], got[1][0], got[1][1]);
+      CHECK(near_value(got[0][0], 0.5f, 0.02f) && near_value(got[1][1], 96.0f / 255.0f, 0.01f) && got[5][2] == 0.0f);
+    } else CHECK(0);
+    s.Filter = D3D12_FILTER_MAXIMUM_MIN_MAG_LINEAR_MIP_POINT;
+    if (software && sampler_dispatch(c, rs, tex, DXGI_FORMAT_R8G8B8A8_UNORM, &s, 0.0f, 1, got)) CHECK(got[0][0] == 1.0f);
+  }
+  /* (the descriptions a non-normalized sampler may not have, a filter that is not one and flags that do not exist write null descriptors: CreateSampler2 is void - the call is
+   * made, and nothing crashes) */
+  {
+    D3D12_DESCRIPTOR_HEAP_DESC hd = {D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    ID3D12DescriptorHeap *h = NULL;
+    ID3D12Device11 *dev11 = NULL;
+    CHECK_HR(ID3D12Device_CreateDescriptorHeap(dev, &hd, &IID_ID3D12DescriptorHeap, (void **)&h));
+    CHECK_HR(ID3D12Device_QueryInterface(dev, &IID_ID3D12Device11, (void **)&dev11));
+    if (h && dev11) {
+      D3D12_SAMPLER_DESC2 bad = sampler2(D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_TEXTURE_ADDRESS_MODE_WRAP);
+      bad.Flags = D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES;
+      ID3D12Device11_CreateSampler2(dev11, &bad, ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(h));
+      bad.Flags = (D3D12_SAMPLER_FLAGS)8;
+      ID3D12Device11_CreateSampler2(dev11, &bad, ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(h));
+      bad.Flags = 0, bad.Filter = (D3D12_FILTER)0x40;      /* (anisotropic with point min and mag: not a filter) */
+      ID3D12Device11_CreateSampler2(dev11, &bad, ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(h));
+      CHECK(1);
+    }
+    if (dev11) ID3D12Device11_Release(dev11);
+    if (h) ID3D12DescriptorHeap_Release(h);
+  }
+  ID3D12Resource_Release(tex);
+  if (single) ID3D12Resource_Release(single);
+  ID3D12RootSignature_Release(rs);
+}
+
+/* Lines (LINE_RASTERIZATION_MODE, and MultisampleEnable / AntialiasedLineEnable of D3D12_RASTERIZER_DESC): a horizontal line at y = 32 (between rows 31 and 32) is one row of
+ * pixels aliased; two rows as a quadrilateral 1.4 pixels wide (rows 31 and 32 have their centres 0.5 from it); one row 1.0 wide (the centres on its edges: the top-left rule takes
+ * one); alpha-antialiased, a diagonal line blended with SRC_ALPHA leaves pixels partly covered - neither black nor the full red - along it. */
+static void test_line_modes(Scene *c) {
+  static UINT32 img[64 * 64];
+  D3D12_FEATURE_DATA_D3D12_OPTIONS19 o19;
+  memset(&o19, 0, sizeof o19);
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(c->dev, D3D12_FEATURE_D3D12_OPTIONS19, &o19, sizeof o19));
+  const float horizontal[2][7] = {{-0.8f, 0.0f, 0.5f, 1, 0, 0, 1}, {0.8f, 0.0f, 0.5f, 1, 0, 0, 1}};
+  const float diagonal[2][7] = {{-0.8f, -0.6f, 0.5f, 1, 0, 0, 1}, {0.8f, 0.5f, 0.5f, 1, 0, 0, 1}};
+  const UINT16 two[2] = {0, 1};
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
+  D3D12_INPUT_ELEMENT_DESC layout[2];
+  fs_desc(c, &pd, layout);
+  pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+  ID3D12PipelineState *aliased = fs_pso(c, &pd);
+  pd.RasterizerState.MultisampleEnable = TRUE;
+  ID3D12PipelineState *wide = fs_pso(c, &pd);
+  pd.RasterizerState.MultisampleEnable = FALSE;
+  pd.RasterizerState.AntialiasedLineEnable = TRUE;
+  D3D12_RENDER_TARGET_BLEND_DESC *b = &pd.BlendState.RenderTarget[0];
+  b->BlendEnable = TRUE;
+  b->SrcBlend = D3D12_BLEND_SRC_ALPHA, b->DestBlend = D3D12_BLEND_INV_SRC_ALPHA, b->BlendOp = D3D12_BLEND_OP_ADD;
+  b->SrcBlendAlpha = D3D12_BLEND_ONE, b->DestBlendAlpha = D3D12_BLEND_ZERO, b->BlendOpAlpha = D3D12_BLEND_OP_ADD;
+  ID3D12PipelineState *smooth = fs_pso(c, &pd);
+  /* (narrow quadrilateral lines: RASTERIZER2's mode, in a pipeline stream) */
+  ID3D12PipelineState *narrow = NULL;
+  {
+    ID3D12Device2 *dev2 = NULL;
+    CHECK_HR(ID3D12Device_QueryInterface(c->dev, &IID_ID3D12Device2, (void **)&dev2));
+    if (dev2) {
+      struct {
+        struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; ID3D12RootSignature *v; } __attribute__((aligned(sizeof(void *)))) rs;
+        struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; D3D12_SHADER_BYTECODE v; } __attribute__((aligned(sizeof(void *)))) vs, ps;
+        struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; D3D12_INPUT_LAYOUT_DESC v; } __attribute__((aligned(sizeof(void *)))) il;
+        struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; D3D12_PRIMITIVE_TOPOLOGY_TYPE v; } __attribute__((aligned(sizeof(void *)))) topology;
+        struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; struct D3D12_RT_FORMAT_ARRAY v; } __attribute__((aligned(sizeof(void *)))) rt;
+        struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; D3D12_RASTERIZER_DESC2 v; } __attribute__((aligned(sizeof(void *)))) raster;
+      } st;
+      memset(&st, 0, sizeof st);
+      st.rs.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, st.rs.v = c->rs;
+      st.vs.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, st.vs.v.pShaderBytecode = dx_vs_dxbc, st.vs.v.BytecodeLength = sizeof dx_vs_dxbc;
+      st.ps.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, st.ps.v.pShaderBytecode = dx_ps_color_dxbc, st.ps.v.BytecodeLength = sizeof dx_ps_color_dxbc;
+      st.il.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, st.il.v.pInputElementDescs = layout, st.il.v.NumElements = 2;
+      st.topology.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, st.topology.v = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+      st.rt.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, st.rt.v.NumRenderTargets = 1, st.rt.v.RTFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+      st.raster.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2;
+      st.raster.v.FillMode = D3D12_FILL_MODE_SOLID, st.raster.v.CullMode = D3D12_CULL_MODE_NONE, st.raster.v.DepthClipEnable = TRUE;
+      st.raster.v.LineRasterizationMode = D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_NARROW;
+      const D3D12_PIPELINE_STATE_STREAM_DESC sd = {sizeof st, &st};
+      const HRESULT hr = ID3D12Device2_CreatePipelineState(dev2, &sd, &IID_ID3D12PipelineState, (void **)&narrow);
+      CHECK(o19.NarrowQuadrilateralLinesSupported ? SUCCEEDED(hr) && narrow : hr == E_INVALIDARG && !narrow);
+      ID3D12Device2_Release(dev2);
+    }
+  }
+  int rows[4] = {0, 0, 0, 0};
+  ID3D12PipelineState *modes[4] = {aliased, wide, narrow, smooth};
+  for (int m = 0; m < 3; ++m) {
+    if (!modes[m]) continue;
+    if (!gaps_draw_indexed(c, modes[m], D3D_PRIMITIVE_TOPOLOGY_LINELIST, &horizontal[0][0], 2, two, 2, 0, -1, 0, img)) { CHECK(0); continue; }
+    for (int y = 0; y < 64; ++y) rows[m] += FS_RGB(img[y * 64 + 32]) != 0;
+  }
+  printf("lines: aliased %d rows, quadrilateral 1.4 %d, 1.0 %d\n", rows[0], rows[1], rows[2]);
+  CHECK(rows[0] == 1);
+  if (!g_hardware) CHECK(rows[1] == 2 && rows[2] == 1);      /* (a GPU draws its own lines into a target of one sample) */
+  else CHECK(rows[1] >= 1 && (!narrow || rows[2] >= 1));
+  if (smooth && gaps_draw_indexed(c, smooth, D3D_PRIMITIVE_TOPOLOGY_LINELIST, &diagonal[0][0], 2, two, 2, 0, -1, 0, img)) {
+    int partial = 0, full = 0, lit = 0;
+    for (int i = 0; i < 64 * 64; ++i) {
+      const UINT r = (img[i] >> 16) & 0xFF;
+      lit += r != 0, partial += r != 0 && r < 250, full += r >= 250;
+    }
+    printf("alpha-antialiased line: %d pixels, %d partly covered, %d fully\n", lit, partial, full);
+    CHECK(lit > 40 && partial > 10 && (img[32 * 64 + 2] & 0xFFFFFF) == 0);
+  } else CHECK(0);
+  for (int m = 0; m < 4; ++m) if (modes[m]) ID3D12PipelineState_Release(modes[m]);
+}
+
+/* Typeless R8 / R8G8 / R16 / R16G16 textures, which the kernel keeps natively where the device has their formats: the texels written read back as they are through a view of
+ * every kind of the family (Load: unorm, snorm, uint, sint, and 16-bit float), drawn into through an integer render target view of a typeless texture (a mirror that gives its
+ * channels back), stored through a typed unordered access view; a view of another family is a null descriptor (nothing read). */
+static void test_typeless_narrow(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  ID3D12RootSignature *rs = format_signature(dev);
+  if (!rs) { CHECK(0); return; }
+  static const struct { DXGI_FORMAT typeless; LoadCase views[5]; UINT count; } families[] = {
+      {DXGI_FORMAT_R8_TYPELESS, {{DXGI_FORMAT_R8_UNORM, 1, 1, 8, FK_UNORM, 0}, {DXGI_FORMAT_R8_SNORM, 1, 1, 8, FK_SNORM, 0}, {DXGI_FORMAT_R8_UINT, 1, 1, 8, FK_UINT, 1},
+                                 {DXGI_FORMAT_R8_SINT, 1, 1, 8, FK_SINT, 2}}, 4},
+      {DXGI_FORMAT_R8G8_TYPELESS, {{DXGI_FORMAT_R8G8_UNORM, 2, 2, 8, FK_UNORM, 0}, {DXGI_FORMAT_R8G8_SNORM, 2, 2, 8, FK_SNORM, 0}, {DXGI_FORMAT_R8G8_UINT, 2, 2, 8, FK_UINT, 1},
+                                   {DXGI_FORMAT_R8G8_SINT, 2, 2, 8, FK_SINT, 2}}, 4},
+      {DXGI_FORMAT_R16_TYPELESS, {{DXGI_FORMAT_R16_UNORM, 2, 1, 16, FK_UNORM, 0}, {DXGI_FORMAT_R16_SNORM, 2, 1, 16, FK_SNORM, 0}, {DXGI_FORMAT_R16_UINT, 2, 1, 16, FK_UINT, 1},
+                                  {DXGI_FORMAT_R16_SINT, 2, 1, 16, FK_SINT, 2}, {DXGI_FORMAT_R16_FLOAT, 2, 1, 16, FK_FLOAT, 0}}, 5},
+      {DXGI_FORMAT_R16G16_TYPELESS, {{DXGI_FORMAT_R16G16_UNORM, 4, 2, 16, FK_UNORM, 0}, {DXGI_FORMAT_R16G16_SNORM, 4, 2, 16, FK_SNORM, 0}, {DXGI_FORMAT_R16G16_UINT, 4, 2, 16, FK_UINT, 1},
+                                     {DXGI_FORMAT_R16G16_SINT, 4, 2, 16, FK_SINT, 2}, {DXGI_FORMAT_R16G16_FLOAT, 4, 2, 16, FK_FLOAT, 0}}, 5},
+  };
+  int families_read = 0;
+  for (UINT f = 0; f < sizeof families / sizeof families[0]; ++f) {
+    const UINT bytes = families[f].views[0].bytes;
+    ID3D12Resource *t = uav_texture(dev, D3D12_RESOURCE_DIMENSION_TEXTURE2D, 4, 4, 1, families[f].typeless, D3D12_RESOURCE_FLAG_NONE);
+    if (!t) { CHECK(0); continue; }
+    BYTE texels[16 * 4], back[16 * 4];
+    for (UINT k = 0; k < 16 * bytes; ++k) texels[k] = (BYTE)(k * 41 + f * 13 + 7);
+    if (bytes == 2 || bytes == 4)      /* (finite half floats for the float view) */
+      for (UINT k = 1; k < 16 * bytes; k += 2) texels[k] &= 0x3F;
+    texture_write(c, t, 0, texels, bytes);
+    CHECK(texture_read(c, t, 0, back, bytes) && memcmp(back, texels, 16 * bytes) == 0);
+    int views_ok = 0;
+    for (UINT v = 0; v < families[f].count; ++v) {
+      const LoadCase *lc = &families[f].views[v];
+      float got[16][4];
+      const void *code = lc->load == 1 ? dx_cs_fmt_loadu_dxbc : lc->load == 2 ? dx_cs_fmt_loadi_dxbc : dx_cs_fmt_load_dxbc;
+      const SIZE_T size = lc->load == 1 ? sizeof dx_cs_fmt_loadu_dxbc : lc->load == 2 ? sizeof dx_cs_fmt_loadi_dxbc : sizeof dx_cs_fmt_load_dxbc;
+      if (!format_dispatch(c, rs, code, size, t, lc->format, got)) { CHECK(0); continue; }
+      int wrong = 0;
+      for (UINT k = 0; k < 16; ++k) {
+        float want[4];
+        reference_texel(lc, texels + k * bytes, want);
+        for (UINT ch = 0; ch < 4; ++ch) {
+          const int integer = lc->kind == FK_UINT || lc->kind == FK_SINT;
+          const int ok = integer ? float_bits_(got[k][ch]) == float_bits_(want[ch]) : near_value(got[k][ch], want[ch], lc->kind == FK_FLOAT ? 0.0f : 1e-5f);
+          if (!ok && wrong++ < 2) printf("  typeless %u as %u texel %u channel %u: %08x, not %08x\n", families[f].typeless, lc->format, k, ch, float_bits_(got[k][ch]), float_bits_(want[ch]));
+        }
+      }
+      CHECK(wrong == 0);
+      views_ok += wrong == 0;
+    }
+    families_read += views_ok == (int)families[f].count;
+    ID3D12Resource_Release(t);
+  }
+  printf("typeless narrow textures: %d of 4 families read through every view\n", families_read);
+  /* (drawn into as integers: an R8_TYPELESS / R16_TYPELESS texture through an R8_UINT / R16_UINT render target view - the bytes of the integers, read back) */
+  {
+    const float colour[4] = {bits_of(200), bits_of(0), bits_of(0), bits_of(1)};
+    BYTE got[16];
+    g_fd_texture = DXGI_FORMAT_R8_TYPELESS;
+    if (format_draw(c, DXGI_FORMAT_R8_UINT, dx_ps_fmt_outu_dxbc, sizeof dx_ps_fmt_outu_dxbc, colour, got, 1)) {
+      printf("R8_TYPELESS drawn as R8_UINT: %u\n", got[0]);
+      CHECK(got[0] == 200);
+    } else CHECK(0);
+    const float big[4] = {bits_of(40000), bits_of(0), bits_of(0), bits_of(1)};
+    g_fd_texture = DXGI_FORMAT_R16_TYPELESS;
+    if (format_draw(c, DXGI_FORMAT_R16_UINT, dx_ps_fmt_outu_dxbc, sizeof dx_ps_fmt_outu_dxbc, big, got, 2)) {
+      const UINT16 value = (UINT16)(got[0] | got[1] << 8);
+      printf("R16_TYPELESS drawn as R16_UINT: %u\n", value);
+      CHECK(value == 40000);
+    } else CHECK(0);
+    g_fd_texture = DXGI_FORMAT_UNKNOWN;
+  }
+  /* (another family's view: a null descriptor, a draw that reads it reads nothing - the call is made) */
+  {
+    ID3D12Resource *t = uav_texture(dev, D3D12_RESOURCE_DIMENSION_TEXTURE2D, 4, 4, 1, DXGI_FORMAT_R8_TYPELESS, D3D12_RESOURCE_FLAG_NONE);
+    ID3D12DescriptorHeap *heap = view_heap(dev, 1, 0);
+    if (t && heap) {
+      D3D12_SHADER_RESOURCE_VIEW_DESC sd;
+      memset(&sd, 0, sizeof sd);
+      sd.Format = DXGI_FORMAT_R16_UINT;
+      sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+      sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+      sd.Texture2D.MipLevels = 1;
+      ID3D12Device_CreateShaderResourceView(dev, t, &sd, heap_cpu(dev, heap, 0));
+      CHECK(1);
+    }
+    if (heap) ID3D12DescriptorHeap_Release(heap);
+    if (t) ID3D12Resource_Release(t);
+  }
+  ID3D12RootSignature_Release(rs);
+}
+
+/* R1_UNORM: a bit a pixel (the first pixel of a row the most significant bit of its first byte), rows of (width + 7) / 8 bytes in footprints; 1D and 2D textures sampled and
+ * loaded as 0 and 1 in red; copies keep the bits; no render target, unordered access or volume (E_INVALIDARG), and a footprint box that does not start on a byte is not copied. */
+static void test_r1_unorm(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  D3D12_FORMAT_SUPPORT2 s2;
+  const D3D12_FORMAT_SUPPORT1 s1 = fmt_support(dev, DXGI_FORMAT_R1_UNORM, &s2);
+  printf("R1_UNORM support: %08x\n", (unsigned)s1);
+  CHECK((s1 & (D3D12_FORMAT_SUPPORT1_TEXTURE1D | D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE)) ==
+        (D3D12_FORMAT_SUPPORT1_TEXTURE1D | D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE));
+  CHECK(!(s1 & (D3D12_FORMAT_SUPPORT1_RENDER_TARGET | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW | D3D12_FORMAT_SUPPORT1_TEXTURE3D)) && !(s2 & D3D12_FORMAT_SUPPORT2_TILED));
+  CHECK(!texture_makes(dev, DXGI_FORMAT_R1_UNORM, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) && !texture_makes(dev, DXGI_FORMAT_R1_UNORM, 1, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
+  /* (a 4 x 4 texture: footprints of one byte a row) */
+  ID3D12Resource *t = uav_texture(dev, D3D12_RESOURCE_DIMENSION_TEXTURE2D, 4, 4, 1, DXGI_FORMAT_R1_UNORM, D3D12_RESOURCE_FLAG_NONE);
+  if (!t) { CHECK(0); return; }
+  const D3D12_RESOURCE_DESC rd = ID3D12Resource_GetDesc(t);
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp;
+  UINT rows = 0;
+  UINT64 row_bytes = 0, total = 0;
+  ID3D12Device_GetCopyableFootprints(dev, &rd, 0, 1, 0, &fp, &rows, &row_bytes, &total);
+  CHECK(row_bytes == 1 && rows == 4 && fp.Footprint.RowPitch == 256);
+  /* (rows 0xA0 (1 0 1 0), 0x50 (0 1 0 1), 0xF0, 0x10) */
+  const BYTE bits[4] = {0xA0, 0x50, 0xF0, 0x10};
+  {
+    ID3D12Resource *up = make_buffer(dev, D3D12_HEAP_TYPE_UPLOAD, total, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    BYTE *p = NULL;
+    if (up && SUCCEEDED(ID3D12Resource_Map(up, 0, NULL, (void **)&p)) && p) {
+      for (UINT y = 0; y < 4; ++y) p[fp.Offset + (UINT64)y * fp.Footprint.RowPitch] = bits[y];
+      ID3D12Resource_Unmap(up, 0, NULL);
+      ID3D12GraphicsCommandList *list = NULL;
+      CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+      CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+      if (list) {
+        D3D12_TEXTURE_COPY_LOCATION to, from;
+        memset(&to, 0, sizeof to);
+        memset(&from, 0, sizeof from);
+        to.pResource = t, to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        from.pResource = up, from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, from.PlacedFootprint = fp;
+        ID3D12GraphicsCommandList_CopyTextureRegion(list, &to, 0, 0, 0, &from, NULL);
+        scene_run(c, list);
+        ID3D12GraphicsCommandList_Release(list);
+      }
+    } else CHECK(0);
+    if (up) ID3D12Resource_Release(up);
+  }
+  ID3D12RootSignature *rs = format_signature(dev);
+  float got[16][4];
+  if (rs && format_dispatch(c, rs, dx_cs_fmt_load_dxbc, sizeof dx_cs_fmt_load_dxbc, t, DXGI_FORMAT_R1_UNORM, got)) {
+    int wrong = 0;
+    for (UINT k = 0; k < 16; ++k) {
+      const float want = (bits[k / 4] >> (7 - k % 4)) & 1 ? 1.0f : 0.0f;
+      if (got[k][0] != want || got[k][1] != 0.0f || got[k][3] != 1.0f) ++wrong;
+    }
+    printf("R1_UNORM Load: %g %g %g %g, wrong %d\n", got[0][0], got[1][0], got[2][0], got[3][0], wrong);
+    CHECK(wrong == 0);
+  } else CHECK(0);
+  /* (sampled half way between pixel 0 - 1 - and pixel 1 - 0 - of row 0: 0.5) */
+  if (rs && format_dispatch(c, rs, dx_cs_fmt_sample_dxbc, sizeof dx_cs_fmt_sample_dxbc, t, DXGI_FORMAT_R1_UNORM, got)) CHECK(near_value(got[0][0], 0.5f, 0.02f));
+  else CHECK(0);
+  /* (copied back into a footprint: the bits as they were) */
+  BYTE back[4] = {0, 0, 0, 0};
+  {
+    ID3D12Resource *down = make_buffer(dev, D3D12_HEAP_TYPE_READBACK, total, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    ID3D12GraphicsCommandList *list = NULL;
+    CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+    CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+    if (down && list) {
+      D3D12_TEXTURE_COPY_LOCATION to, from;
+      memset(&to, 0, sizeof to);
+      memset(&from, 0, sizeof from);
+      to.pResource = down, to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, to.PlacedFootprint = fp;
+      from.pResource = t, from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      ID3D12GraphicsCommandList_CopyTextureRegion(list, &to, 0, 0, 0, &from, NULL);
+      scene_run(c, list);
+      const BYTE *p = NULL;
+      if (SUCCEEDED(ID3D12Resource_Map(down, 0, NULL, (void **)&p)) && p) {
+        for (UINT y = 0; y < 4; ++y) back[y] = p[fp.Offset + (UINT64)y * fp.Footprint.RowPitch] & 0xF0;
+        ID3D12Resource_Unmap(down, 0, NULL);
+      }
+    }
+    if (list) ID3D12GraphicsCommandList_Release(list);
+    if (down) ID3D12Resource_Release(down);
+  }
+  printf("R1_UNORM copied back: %02x %02x %02x %02x\n", back[0], back[1], back[2], back[3]);
+  CHECK(memcmp(back, bits, 4) == 0);
+  /* (a 1D texture of 20 pixels: rows of 3 bytes) */
+  D3D12_RESOURCE_DESC d1 = {D3D12_RESOURCE_DIMENSION_TEXTURE1D, 0, 20, 1, 1, 1, DXGI_FORMAT_R1_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+  ID3D12Device_GetCopyableFootprints(dev, &d1, 0, 1, 0, &fp, &rows, &row_bytes, &total);
+  CHECK(row_bytes == 3);
+  D3D12_HEAP_PROPERTIES defaults = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+  ID3D12Resource *one = NULL;
+  CHECK_HR(ID3D12Device_CreateCommittedResource(dev, &defaults, D3D12_HEAP_FLAG_NONE, &d1, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&one));
+  if (one) ID3D12Resource_Release(one);
+  one = NULL;
+  D3D12_RESOURCE_DESC d3 = {D3D12_RESOURCE_DIMENSION_TEXTURE3D, 0, 8, 8, 2, 1, DXGI_FORMAT_R1_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+  CHECK(ID3D12Device_CreateCommittedResource(dev, &defaults, D3D12_HEAP_FLAG_NONE, &d3, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&one) == E_INVALIDARG && !one);
+  if (rs) ID3D12RootSignature_Release(rs);
+  ID3D12Resource_Release(t);
+}
+
+static void test_fixed_state_gaps(Scene *c) {
+  test_strip_cuts(c);
+  test_sampler_filters(c);
+  test_line_modes(c);
+  test_typeless_narrow(c);
+  test_r1_unorm(c);
+}
+
 static void test_extras(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fence *fence, UINT64 *fence_value) {
   Scene c;
   memset(&c, 0, sizeof c);
@@ -7177,6 +7811,7 @@ static void test_extras(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fenc
   test_mip_layers(&c);
   test_formats(&c);
   test_tiled_tiers(&c);
+  test_fixed_state_gaps(&c);
 }
 
 /* ---- the interfaces after ID3D12Device and ID3D12GraphicsCommandList ---------------------------------------------------------------------------------------------------- */
@@ -7953,11 +8588,23 @@ static void test_root_signature_12(ID3D12Device *dev) {
   v11.Desc_1_1.NumStaticSamplers = 1;
   v11.Desc_1_1.pStaticSamplers = &old;
   CHECK(D3D12SerializeVersionedRootSignature(&v11, &b12, &error) == E_INVALIDARG && !b12);
-  /* coordinates in texels: written, but no device here samples with them (NonNormalizedCoordinateSamplersSupported is FALSE) */
+  /* coordinates in texels: the CPU renderer samples with them (NonNormalizedCoordinateSamplersSupported), virgl does not; a static sampler of them that breaks their rules
+   * (a MaxLOD that is not 0) is a root signature no device takes, one that keeps them is made (the draws that use it are the device's to refuse) */
   D3D12_FEATURE_DATA_D3D12_OPTIONS17 o17;
   CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS17, &o17, sizeof o17));
-  CHECK(!o17.NonNormalizedCoordinateSamplersSupported);
+  CHECK(o17.NonNormalizedCoordinateSamplersSupported == !g_hardware);
   ss[0].Flags = D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES;
+  ss[0].BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK;
+  ss[0].MaxLOD = 0.0f;
+  CHECK_HR(D3D12SerializeVersionedRootSignature((const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *)&vd, &b12, &error));
+  if (b12) {
+    rs = NULL;
+    CHECK_HR(ID3D12Device_CreateRootSignature(dev, 0, ID3D10Blob_GetBufferPointer(b12), ID3D10Blob_GetBufferSize(b12), &IID_ID3D12RootSignature, (void **)&rs));
+    if (rs) ID3D12RootSignature_Release(rs);
+    ID3D10Blob_Release(b12);
+    b12 = NULL;
+  }
+  ss[0].MaxLOD = 1000.0f;
   CHECK_HR(D3D12SerializeVersionedRootSignature((const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *)&vd, &b12, &error));
   if (b12) {
     rs = NULL;
@@ -8144,7 +8791,12 @@ static void test_agility_streams(ID3D12Device *dev) {
     D3D12_RASTERIZER_DESC2 r = r2;
     D3D12_DEPTH_STENCIL_DESC2 d = ds2;
     HRESULT want = S_OK;
-    if (variant == 1) { r.LineRasterizationMode = D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_NARROW; want = E_INVALIDARG; }      /* (NarrowQuadrilateralLinesSupported FALSE) */
+    if (variant == 1) {      /* (narrow quadrilateral lines where NarrowQuadrilateralLinesSupported: the kernel's line modes) */
+      D3D12_FEATURE_DATA_D3D12_OPTIONS19 lines;
+      CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS19, &lines, sizeof lines));
+      r.LineRasterizationMode = D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_NARROW;
+      want = lines.NarrowQuadrilateralLinesSupported ? S_OK : E_INVALIDARG;
+    }
     if (variant == 2) { r.LineRasterizationMode = (D3D12_LINE_RASTERIZATION_MODE)7; want = E_INVALIDARG; }
     if (variant == 3) { d.StencilEnable = TRUE; d.BackFace.StencilReadMask = 0x0F; want = o14.IndependentFrontAndBackStencilRefMaskSupported ? S_OK : E_INVALIDARG; }      /* (OPTIONS14) */
     if (variant == 4) { d.BackFace.StencilReadMask = 0x0F; }      /* (masks that differ with the stencil test off) */
@@ -8323,7 +8975,8 @@ static void test_agility_interfaces(ID3D12Device *dev, ID3D12CommandQueue *queue
   CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS12, &o12, sizeof o12));
   CHECK(o12.EnhancedBarriersSupported && !o12.RelaxedFormatCastingSupported);
   CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS19, &o19, sizeof o19));
-  CHECK(o19.RasterizerDesc2Supported && !o19.NarrowQuadrilateralLinesSupported && o19.MaxSamplerDescriptorHeapSize == 2048 && o19.MaxViewDescriptorHeapSize == 1000000);
+  CHECK(o19.RasterizerDesc2Supported && o19.NarrowQuadrilateralLinesSupported && o19.AnisoFilterWithPointMipSupported && !o19.MismatchingOutputDimensionsSupported);
+  CHECK(o19.MaxSamplerDescriptorHeapSize == 4096 && o19.MaxViewDescriptorHeapSize == 4096 && (o19.SupportedSampleCountsWithNoOutputs & 1) && o19.PointSamplingAddressesNeverRoundUp == !g_hardware);
   CHECK(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS19, &o19, sizeof o19 - 4) == E_INVALIDARG);
   CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS20, &o20, sizeof o20));
   CHECK(o20.RecreateAtTier == D3D12_RECREATE_AT_TIER_NOT_SUPPORTED);
