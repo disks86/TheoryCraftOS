@@ -60,6 +60,7 @@
 #include <dxgi1_3.h>
 #include <dxgi1_2.h>
 #include "../tcosdx.h"
+#include "dxbc_link.h"
 
 #pragma GCC diagnostic ignored "-Wunused-function"
 #pragma GCC diagnostic ignored "-Wincompatible-pointer-types"
@@ -220,6 +221,7 @@ typedef struct Shader {
   BOOL so_only;
   ID3D12PipelineState *compute;           /* a compute shader: its Direct3D 12 pipeline, made at its first Dispatch */
   UINT used;                              /* ... and the list that last dispatched it */
+  struct ShaderLink *link;                /* a shader with interface slots: what they are, and the shader specialised for the instances bound (linkage.inc) */
 } Shader;
 
 typedef struct Layout {
@@ -305,7 +307,7 @@ typedef struct Ctx {
   Blend *blend;
   Depth *depth;
   Raster *raster;
-  struct ClassInst *instances[6][8];  /* the class instances bound with each stage's shader (vs, ps, gs, hs, ds, cs) */
+  struct ClassInst *instances[6][D3D11_SHADER_MAX_INTERFACES];  /* the class instances bound with each stage's shader (vs, ps, gs, hs, ds, cs), by interface slot */
   struct Query *predicate;            /* SetPredication: the predicate, and the value that leaves the commands out */
   /* ---- the plain values */
   UINT vb_stride[VERTEX_SLOTS], vb_offset[VERTEX_SLOTS];
@@ -1706,11 +1708,14 @@ static HRESULT STDMETHODCALLTYPE dev_CreateUnorderedAccessView(Dev *d, ID3D11Res
   return uav_create(d, resource, desc, -1, out);
 }
 
+#include "linkage.inc"
+
 /* ---- shaders, layouts and states ------------------------------------------------------------------------------------------------------------------- */
 
 static void shader_destroy(DxObj *o) {
   Shader *s = (Shader *)o;
   if (s->compute) { settle(s->c.dev, s->used); ID3D12PipelineState_Release(s->compute); }
+  shader_link_free(s->c.dev, s->link);
   mem_free(s->so);
   mem_free(s->so_names);
   mem_free(s->code);
@@ -1777,7 +1782,7 @@ static void shader_constants(Shader *s) {
   for (UINT slot = 0; slot < CONSTANT_SLOTS; ++slot) s->registers += s->cb_registers[slot];
 }
 
-static HRESULT shader_make(Dev *d, const void *code, SIZE_T bytes, const void *vtbl, const GUID *const *iids, void **out) {
+static HRESULT shader_make(Dev *d, const void *code, SIZE_T bytes, const void *vtbl, const GUID *const *iids, ID3D11ClassLinkage *linkage, void **out) {
   if (out) *out = NULL;
   if (!code || bytes < 32 || bytes > 60000) return E_INVALIDARG;
   Shader *s = child_new(sizeof *s, d, vtbl, iids, shader_destroy);
@@ -1789,34 +1794,30 @@ static HRESULT shader_make(Dev *d, const void *code, SIZE_T bytes, const void *v
   memset(s->tex_kind, 0xFF, sizeof s->tex_kind);
   shader_constants(s);
   if (s->registers * 16 > CONSTANT_BLOCK) { dx_Release(OBJ(s)); return E_INVALIDARG; }
+  const HRESULT hr = shader_link(s, linkage);
+  if (FAILED(hr)) { dx_Release(OBJ(s)); return hr; }
   return give(s, out);
 }
 static HRESULT STDMETHODCALLTYPE dev_CreateVertexShader(Dev *d, const void *code, SIZE_T bytes, ID3D11ClassLinkage *linkage, ID3D11VertexShader **out) {
-  (void)linkage;
-  return shader_make(d, code, bytes, &vs_vtbl, g_vs_iids, (void **)out);
+  return shader_make(d, code, bytes, &vs_vtbl, g_vs_iids, linkage, (void **)out);
 }
 static HRESULT STDMETHODCALLTYPE dev_CreatePixelShader(Dev *d, const void *code, SIZE_T bytes, ID3D11ClassLinkage *linkage, ID3D11PixelShader **out) {
-  (void)linkage;
-  return shader_make(d, code, bytes, &ps_vtbl, g_ps_iids, (void **)out);
+  return shader_make(d, code, bytes, &ps_vtbl, g_ps_iids, linkage, (void **)out);
 }
 /* (geometry, hull and domain shaders go into the pipeline as they are: the kernel takes gs_4_0 / gs_5_0, hs_5_0 and ds_5_0; see docs/Direct3DKernelMode.md) */
 static HRESULT STDMETHODCALLTYPE dev_CreateGeometryShader(Dev *d, const void *code, SIZE_T bytes, ID3D11ClassLinkage *linkage, ID3D11GeometryShader **out) {
-  (void)linkage;
-  return shader_make(d, code, bytes, &gs_vtbl, g_gs_iids, (void **)out);
+  return shader_make(d, code, bytes, &gs_vtbl, g_gs_iids, linkage, (void **)out);
 }
 static HRESULT STDMETHODCALLTYPE dev_CreateHullShader(Dev *d, const void *code, SIZE_T bytes, ID3D11ClassLinkage *linkage, ID3D11HullShader **out) {
-  (void)linkage;
-  return shader_make(d, code, bytes, &hs_vtbl, g_hs_iids, (void **)out);
+  return shader_make(d, code, bytes, &hs_vtbl, g_hs_iids, linkage, (void **)out);
 }
 static HRESULT STDMETHODCALLTYPE dev_CreateDomainShader(Dev *d, const void *code, SIZE_T bytes, ID3D11ClassLinkage *linkage, ID3D11DomainShader **out) {
-  (void)linkage;
-  return shader_make(d, code, bytes, &ds_vtbl, g_ds_iids, (void **)out);
+  return shader_make(d, code, bytes, &ds_vtbl, g_ds_iids, linkage, (void **)out);
 }
 /* A geometry shader whose outputs go into stream output buffers, or the code of a vertex or domain shader whose outputs do (there is then no geometry stage). */
 static HRESULT STDMETHODCALLTYPE dev_CreateGeometryShaderWithStreamOutput(Dev *d, const void *code, SIZE_T bytes, const D3D11_SO_DECLARATION_ENTRY *entries, UINT count,
                                                                          const UINT *strides, UINT stride_count, UINT rasterized, ID3D11ClassLinkage *linkage,
                                                                          ID3D11GeometryShader **out) {
-  (void)linkage;
   if (out) *out = NULL;
   if (!entries || count == 0 || count > D3D11_SO_STREAM_COUNT * D3D11_SO_OUTPUT_COMPONENT_COUNT || stride_count > D3D11_SO_BUFFER_SLOT_COUNT || (stride_count && !strides)) return E_INVALIDARG;
   if (rasterized != D3D11_SO_NO_RASTERIZED_STREAM && rasterized >= D3D11_SO_STREAM_COUNT) return E_INVALIDARG;
@@ -1834,7 +1835,7 @@ static HRESULT STDMETHODCALLTYPE dev_CreateGeometryShaderWithStreamOutput(Dev *d
   for (UINT slot = 0; slot < 4; ++slot)
     if (components[slot] && slot < stride_count && strides[slot] && strides[slot] < components[slot] * 4) return E_INVALIDARG;      /* (a record wider than its stride) */
   Shader *s = NULL;
-  HRESULT hr = shader_make(d, code, bytes, &gs_vtbl, g_gs_iids, (void **)&s);
+  HRESULT hr = shader_make(d, code, bytes, &gs_vtbl, g_gs_iids, linkage, (void **)&s);
   if (FAILED(hr)) return hr;
   if (s->program_type != 1 && s->program_type != 2 && s->program_type != 4) { dx_Release(OBJ(s)); return E_INVALIDARG; }
   s->so_only = s->program_type != 2;
@@ -1861,88 +1862,11 @@ static HRESULT STDMETHODCALLTYPE dev_CreateGeometryShaderWithStreamOutput(Dev *d
   return give(s, (void **)out);
 }
 
-/* ---- class linkage ----------------------------------------------------------------------------------------------------------------------------------- */
-/* Dynamic shader linkage: a linkage object, and the class instances made from it. The kernel has no dynamic linkage (interfaces and fcall), so a shader that
- * declares class instances is not run, and no instance of one is known to GetClassInstance (docs/Direct3D11.md). */
-typedef struct Linkage { Child c; } Linkage;
-typedef struct ClassInst {
-  Child c;
-  Linkage *linkage;            /* a reference */
-  D3D11_CLASS_INSTANCE_DESC desc;
-  char type_name[256];
-  char instance_name[256];
-} ClassInst;
-static HRESULT STDMETHODCALLTYPE dev_CreateClassLinkage(Dev *d, ID3D11ClassLinkage **out) {
-  extern const ID3D11ClassLinkageVtbl link_vtbl;
-  static const GUID *const iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11ClassLinkage, NULL};
-  if (!out) return E_INVALIDARG;
-  *out = NULL;
-  Linkage *l = child_new(sizeof *l, d, &link_vtbl, iids, child_destroy);
-  if (!l) return E_OUTOFMEMORY;
-  *out = (ID3D11ClassLinkage *)l;
-  return S_OK;
-}
-static void inst_destroy(DxObj *o) {
-  ClassInst *i = (ClassInst *)o;
-  unhold(i->linkage);
-  child_destroy(o);
-}
-/* A string into a buffer of `size` (`*length` in: its room, out: the length with the NUL; no buffer: only the length). */
-static void name_out(const char *name, LPSTR buffer, SIZE_T *length) {
-  if (!length) return;
-  SIZE_T n = 0;
-  while (name[n]) ++n;
-  if (buffer && *length) {
-    const SIZE_T copied = n + 1 <= *length ? n : *length - 1;
-    memcpy(buffer, name, copied);
-    buffer[copied] = 0;
-  }
-  *length = n + 1;
-}
-static void STDMETHODCALLTYPE inst_GetClassLinkage(ClassInst *i, ID3D11ClassLinkage **out) { if (!out) return; dx_AddRef(OBJ(i->linkage)); *out = (ID3D11ClassLinkage *)i->linkage; }
-static void STDMETHODCALLTYPE inst_GetDesc(ClassInst *i, D3D11_CLASS_INSTANCE_DESC *desc) { if (desc) *desc = i->desc; }
-static void STDMETHODCALLTYPE inst_GetInstanceName(ClassInst *i, LPSTR name, SIZE_T *length) { name_out(i->instance_name, name, length); }
-static void STDMETHODCALLTYPE inst_GetTypeName(ClassInst *i, LPSTR name, SIZE_T *length) { name_out(i->type_name, name, length); }
-/* An instance that is not a shader's variable: the type, and where its data is (the constant buffer, the offset in it in vectors, the first texture and sampler).
- * Its instance name is empty, and it counts as made (Created). */
-static HRESULT STDMETHODCALLTYPE link_CreateClassInstance(Linkage *l, LPCSTR type_name, UINT cb, UINT cb_offset, UINT texture, UINT sampler, ID3D11ClassInstance **out) {
-  extern const ID3D11ClassInstanceVtbl inst_vtbl;
-  static const GUID *const iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11ClassInstance, NULL};
-  if (out) *out = NULL;
-  if (!type_name || !out) return E_INVALIDARG;
-  SIZE_T n = 0;
-  while (type_name[n]) ++n;
-  if (n == 0 || n >= sizeof ((ClassInst *)0)->type_name) return E_INVALIDARG;
-  ClassInst *i = child_new(sizeof *i, l->c.dev, &inst_vtbl, iids, inst_destroy);
-  if (!i) return E_OUTOFMEMORY;
-  hold(l);
-  i->linkage = l;
-  memcpy(i->type_name, type_name, n + 1);
-  i->instance_name[0] = 0;
-  i->desc.InstanceId = 0;
-  i->desc.InstanceIndex = 0;
-  i->desc.TypeId = 0;
-  i->desc.ConstantBuffer = cb;
-  i->desc.BaseConstantBufferOffset = cb_offset;
-  i->desc.BaseTexture = texture;
-  i->desc.BaseSampler = sampler;
-  i->desc.Created = TRUE;
-  *out = (ID3D11ClassInstance *)i;
-  return S_OK;
-}
-static HRESULT STDMETHODCALLTYPE link_GetClassInstance(Linkage *l, LPCSTR name, UINT index, ID3D11ClassInstance **out) {
-  (void)l; (void)index;
-  if (out) *out = NULL;
-  if (!name || !out) return E_INVALIDARG;
-  return E_INVALIDARG;      /* (no shader made with the linkage has class instances this device runs: see above) */
-}
-
 /* (a compute shader's Direct3D 12 pipeline is made at its first Dispatch: ctx_compute_prepare) */
 static HRESULT STDMETHODCALLTYPE dev_CreateComputeShader(Dev *d, const void *code, SIZE_T bytes, ID3D11ClassLinkage *linkage, ID3D11ComputeShader **out) {
   extern const ID3D11ComputeShaderVtbl cs_vtbl;
   static const GUID *const iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11ComputeShader, NULL};
-  (void)linkage;
-  return shader_make(d, code, bytes, &cs_vtbl, iids, (void **)out);
+  return shader_make(d, code, bytes, &cs_vtbl, iids, linkage, (void **)out);
 }
 
 /* ---- input layouts ----------------------------------------------------------------------------------------------------------------------------------------------- */

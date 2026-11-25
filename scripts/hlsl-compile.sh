@@ -4,6 +4,8 @@
 # build does not need it. Needs x86_64-w64-mingw32-gcc and wine. The profile says what comes out: vs_4_0 / ps_4_0 a DXBC container, vs_1_1 .. vs_3_0
 # and ps_2_0 .. ps_3_0 the token stream of Direct3D 9.
 # Usage: scripts/hlsl-compile.sh <in.hlsl> <entry point> <profile> <out>
+# TCOS_D3DCOMPILER=<path of Microsoft's d3dcompiler_47.dll>: compile with that one instead (run as Wine's native DLL), for what Wine's compiler does not have -
+# classes and interfaces (tests/data/dxbc/ps_iface.hlsl).
 set -euo pipefail
 [ $# -eq 4 ] || { echo "usage: $0 <in.hlsl> <entry point> <profile> <out>" >&2; exit 2; }
 work=${TMPDIR:-/tmp}/tcos-hlsl-compile
@@ -34,6 +36,9 @@ C
   x86_64-w64-mingw32-gcc -O1 -static -o "$work/hc.exe" "$work/hc.c" -ld3dcompiler_47
 fi
 cp "$1" "$work/in.hlsl"
-rm -f "$work/out.bin"
-(cd "$work" && WINEDEBUG=-all wine hc.exe in.hlsl "$2" "$3" out.bin) 2> >(grep -v "radv is not a conformant" >&2)
+rm -f "$work/out.bin" "$work/d3dcompiler_47.dll"
+overrides=
+if [ -n "${TCOS_D3DCOMPILER:-}" ]; then cp "$TCOS_D3DCOMPILER" "$work/d3dcompiler_47.dll"; overrides="d3dcompiler_47=n"; fi
+(cd "$work" && WINEDEBUG=-all WINEDLLOVERRIDES="$overrides" wine hc.exe in.hlsl "$2" "$3" out.bin) 2> >(grep -v "radv is not a conformant" >&2)
+rm -f "$work/d3dcompiler_47.dll"
 cp "$work/out.bin" "$4"

@@ -50,11 +50,20 @@ static D3D11_BLEND_DESC default_blend(void) {
 static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
   Pipeline key;
   memset(&key, 0, sizeof key);
-  key.vs = c->vs->c.id;
-  key.ps = c->ps ? c->ps->c.id : 0;
-  key.gs = c->gs ? c->gs->c.id : 0;
-  key.hs = c->hs ? c->hs->c.id : 0;
-  key.ds = c->ds ? c->ds->c.id : 0;
+  /* the code of each stage: the shader's, or for one with interfaces the shader specialised for the class instances bound with it */
+  Shader *const stage_shader[5] = {c->vs, c->ps, c->gs, c->hs, c->ds};
+  const BYTE *code[5] = {NULL, NULL, NULL, NULL, NULL};
+  SIZE_T code_bytes[5] = {0, 0, 0, 0, 0};
+  UINT code_id[5] = {0, 0, 0, 0, 0};
+  for (UINT k = 0; k < 5; ++k) {
+    Variant *variant;
+    if (stage_shader[k] && !shader_code(d, c, k, stage_shader[k], &code[k], &code_bytes[k], &code_id[k], &variant)) return NULL;
+  }
+  key.vs = code_id[0];
+  key.ps = code_id[1];
+  key.gs = code_id[2];
+  key.hs = code_id[3];
+  key.ds = code_id[4];
   key.layout = c->layout ? c->layout->c.id : 0;
   key.blend = c->blend ? c->blend->desc : default_blend();
   key.depth = c->depth ? c->depth->desc : g_default_depth;
@@ -87,10 +96,10 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
   D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
   memset(&pd, 0, sizeof pd);
   pd.pRootSignature = d->root;
-  pd.VS.pShaderBytecode = c->vs->code;
-  pd.VS.BytecodeLength = c->vs->bytes;
-  if (c->ps) { pd.PS.pShaderBytecode = c->ps->code; pd.PS.BytecodeLength = c->ps->bytes; }
-  if (c->gs && !c->gs->so_only) { pd.GS.pShaderBytecode = c->gs->code; pd.GS.BytecodeLength = c->gs->bytes; }
+  pd.VS.pShaderBytecode = code[0];
+  pd.VS.BytecodeLength = code_bytes[0];
+  if (c->ps) { pd.PS.pShaderBytecode = code[1]; pd.PS.BytecodeLength = code_bytes[1]; }
+  if (c->gs && !c->gs->so_only) { pd.GS.pShaderBytecode = code[2]; pd.GS.BytecodeLength = code_bytes[2]; }
   if (c->gs && c->gs->so) {
     /* (stream output: of the geometry shader, or of the stage whose code the "geometry shader" is - which is then the vertex or domain shader bound) */
     pd.StreamOutput.pSODeclaration = (const D3D12_SO_DECLARATION_ENTRY *)c->gs->so;      /* (the two structures are the same) */
@@ -99,8 +108,8 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
     pd.StreamOutput.NumStrides = c->gs->so_stride_count;
     pd.StreamOutput.RasterizedStream = c->gs->so_rasterized;
   }
-  if (c->hs) { pd.HS.pShaderBytecode = c->hs->code; pd.HS.BytecodeLength = c->hs->bytes; }
-  if (c->ds) { pd.DS.pShaderBytecode = c->ds->code; pd.DS.BytecodeLength = c->ds->bytes; }
+  if (c->hs) { pd.HS.pShaderBytecode = code[3]; pd.HS.BytecodeLength = code_bytes[3]; }
+  if (c->ds) { pd.DS.pShaderBytecode = code[4]; pd.DS.BytecodeLength = code_bytes[4]; }
   pd.SampleMask = 0xFFFFFFFFu;
   pd.BlendState.AlphaToCoverageEnable = key.blend.AlphaToCoverageEnable;
   pd.BlendState.IndependentBlendEnable = key.blend.IndependentBlendEnable;
@@ -873,10 +882,18 @@ static void STDMETHODCALLTYPE ctx_DSSetConstantBuffers(Ctx *c, UINT start, UINT 
 static void STDMETHODCALLTYPE ctx_DSSetConstantBuffers1(Ctx *c, UINT start, UINT count, ID3D11Buffer *const *buffers, const UINT *first, const UINT *number) { cb_set(c, 4, start, count, buffers, first, number); }
 static void STDMETHODCALLTYPE ctx_DSGetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers) { cb_get(c, 4, start, count, buffers, NULL, NULL); }
 static void STDMETHODCALLTYPE ctx_DSGetConstantBuffers1(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers, UINT *first, UINT *number) { cb_get(c, 4, start, count, buffers, first, number); }
-/* The class instances bound with a stage's shader (at most 8 are kept: the kernel runs no shader that uses them, see docs/Direct3D11.md). */
+/* The class instances bound with a stage's shader, by interface slot (linkage.inc specialises the shader for them). Only class instances of this
+ * library are taken (another object in the array: the slot is empty). */
 static void set_instances(Ctx *c, UINT stage, ID3D11ClassInstance *const *instances, UINT count) {
-  for (UINT i = 0; i < 8; ++i) bind(&c->instances[stage][i], i < count && instances ? instances[i] : NULL);
-  c->instance_count[stage] = instances ? (count < 8 ? count : 8) : 0;
+  extern const ID3D11ClassInstanceVtbl inst_vtbl;
+  if (!instances || count > D3D11_SHADER_MAX_INTERFACES) count = 0;
+  for (UINT i = 0; i < D3D11_SHADER_MAX_INTERFACES; ++i) {
+    ID3D11ClassInstance *in = i < count ? instances[i] : NULL;
+    if (in && ((DxObj *)in)->lpVtbl != (const void *)&inst_vtbl) in = NULL;
+    if (i >= count && i >= c->instance_count[stage] && !c->instances[stage][i]) break;      /* (nothing above: nothing to undo) */
+    bind(&c->instances[stage][i], in);
+  }
+  c->instance_count[stage] = count;
 }
 /* (*count in: the room in `instances`; out: how many are bound) */
 static void get_instances(Ctx *c, UINT stage, ID3D11ClassInstance **instances, UINT *count) {
@@ -1184,14 +1201,21 @@ static BOOL compute_prepare(Ctx *c) {
   for (UINT i = 0; i < TEXTURE_SLOTS; ++i) if (c->cs_srv[i] && c->cs_srv[i]->tex) tex_before_read(d, c->cs_srv[i]->tex);
   uav_textures_before(d, c->cs_uav, cs->uav_mask);
   if (d->ring_used + CONSTANT_BLOCK > RING_BYTES || d->view_used + TEXTURE_SLOTS + UAV_SLOTS > VIEW_HEAP || d->sampler_used + TEXTURE_SLOTS > VIEW_HEAP) flush(d);
-  if (!cs->compute) {
+  /* (a shader with interfaces: the variant for the instances bound keeps the pipeline) */
+  const BYTE *cs_code;
+  SIZE_T cs_bytes;
+  UINT cs_id;
+  Variant *variant;
+  if (!shader_code(d, c, 5, cs, &cs_code, &cs_bytes, &cs_id, &variant)) return FALSE;
+  ID3D12PipelineState **pipeline = variant ? &variant->compute : &cs->compute;
+  if (!*pipeline) {
     D3D12_COMPUTE_PIPELINE_STATE_DESC pd;
     memset(&pd, 0, sizeof pd);
     pd.pRootSignature = d->root;
-    pd.CS.pShaderBytecode = cs->code;
-    pd.CS.BytecodeLength = cs->bytes;
-    if (FAILED(ID3D12Device_CreateComputePipelineState(d->d12, &pd, &IID_ID3D12PipelineState, (void **)&cs->compute)) || !cs->compute) {
-      cs->compute = NULL;
+    pd.CS.pShaderBytecode = cs_code;
+    pd.CS.BytecodeLength = cs_bytes;
+    if (FAILED(ID3D12Device_CreateComputePipelineState(d->d12, &pd, &IID_ID3D12PipelineState, (void **)pipeline)) || !*pipeline) {
+      *pipeline = NULL;
       static volatile LONG said;
       if (!InterlockedExchange(&said, 1)) dx_say("dx: refused: a compute shader the kernel does not take (see docs/Direct3D11.md)");
       return FALSE;
@@ -1201,7 +1225,7 @@ static BOOL compute_prepare(Ctx *c) {
   ID3D12DescriptorHeap *heaps[2] = {d->view_heap, d->sampler_heap};
   ID3D12GraphicsCommandList_SetComputeRootSignature(list, d->root);
   ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 2, heaps);
-  ID3D12GraphicsCommandList_SetPipelineState(list, cs->compute);
+  ID3D12GraphicsCommandList_SetPipelineState(list, *pipeline);
   const Shader *const stages[1] = {cs};
   static const UINT stage_of[1] = {5};
   constants_record(d, c, stages, stage_of, 1);
@@ -1213,6 +1237,7 @@ static BOOL compute_prepare(Ctx *c) {
   ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 3, uavs);
   tables_mark_used(d, c->cs_srv, c->cs_uav, cs->uav_mask);
   cs->used = d->epoch;
+  if (variant) variant->used = d->epoch;
   d->dirty |= DIRTY_ROOT;      /* (the next draw sets the graphics root signature and the heaps again) */
   d->recorded = 1;
   return TRUE;

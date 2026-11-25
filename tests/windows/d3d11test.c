@@ -3068,6 +3068,147 @@ static void test_vertex_formats(void) {
   for (int i = 0; i < 3; ++i) ID3D11VertexShader_Release(shaders[i]);
 }
 
+/* Dynamic shader linkage: ps_iface (tests/data/dxbc/ps_iface.hlsl, Microsoft's compiler) returns g_first.get() + g_list[which].get() through the interface
+ * iColour, with cConst, cScaled (a return inside an if), cLoop (a return inside a loop) and cTex instances in its constant buffer and textures. */
+static UINT32 draw_linked(ID3D11VertexShader *vs, ID3D11PixelShader *ps, ID3D11ClassInstance *const *instances, UINT count, ID3D11Buffer *classes, ID3D11Buffer *params, UINT which) {
+  const UINT params_data[4] = {which, 0, 0, 0};
+  ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)params, 0, NULL, params_data, 0, 0);
+  ID3D11Buffer *vertices = triangle(0.5f, 0.5f, 0.5f, 0);
+  begin(NULL);
+  clear(0, 0, 0);
+  bind_floats(vertices);
+  ID3D11DeviceContext_VSSetShader(g_context, vs, NULL, 0);
+  ID3D11DeviceContext_PSSetShader(g_context, ps, instances, count);
+  ID3D11Buffer *buffers[2] = {classes, params};
+  ID3D11DeviceContext_PSSetConstantBuffers(g_context, 0, 2, buffers);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  const UINT32 got = read_target() ? pixel(32, 40) : 0;
+  if (vertices) ID3D11Buffer_Release(vertices);
+  return got;
+}
+static int near_rgb(UINT32 p, int r, int g, int b) {
+  const int dr = red(p) - r, dg = green(p) - g, db = blue(p) - b;
+  return dr >= -2 && dr <= 2 && dg >= -2 && dg <= 2 && db >= -2 && db <= 2;
+}
+static void test_class_linkage(void) {
+  ID3D11ClassLinkage *linkage = NULL;
+  ID3D11VertexShader *vs = NULL;
+  ID3D11PixelShader *ps = NULL;
+  ID3D11ClassInstance *red_i = NULL, *greens1 = NULL, *halved = NULL, *loop = NULL, *greens0 = NULL, *tex = NULL, *made = NULL, *missing = NULL, *none = NULL;
+  ID3D11Buffer *classes = NULL, *params = NULL;
+  D3D11_CLASS_INSTANCE_DESC desc;
+  HRESULT hr = ID3D11Device_CreateClassLinkage(g_device, &linkage);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreateVertexShader(g_device, dx_vs_vol_dxbc, sizeof dx_vs_vol_dxbc, NULL, &vs);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreatePixelShader(g_device, dx_ps_iface_dxbc, sizeof dx_ps_iface_dxbc, linkage, &ps);
+  check(SUCCEEDED(hr) && linkage && vs && ps, "class linkage: a pixel shader with interfaces made with a linkage");
+  if (FAILED(hr)) goto done;
+  /* the instances the shader declares, found by name */
+  check(SUCCEEDED(ID3D11ClassLinkage_GetClassInstance(linkage, "red", 0, &red_i)) && red_i, "GetClassInstance finds a shader's instance by name");
+  if (!red_i) goto done;
+  ID3D11ClassInstance_GetDesc(red_i, &desc);
+  check(desc.InstanceId == 1 && desc.InstanceIndex == 0 && desc.TypeId == 3 && desc.ConstantBuffer == 0 && desc.BaseConstantBufferOffset == 0 && !desc.Created,
+        "... its description: the instance and type numbers of the shader, the buffer and offset of its data, not created");
+  {
+    char name[32];
+    SIZE_T length = sizeof name;
+    ID3D11ClassInstance_GetInstanceName(red_i, name, &length);
+    check(strcmp(name, "red") == 0 && length == 4, "... GetInstanceName");
+    length = sizeof name;
+    ID3D11ClassInstance_GetTypeName(red_i, name, &length);
+    check(strcmp(name, "cConst") == 0 && length == 7, "... GetTypeName");
+    ID3D11ClassLinkage *back = NULL;
+    ID3D11ClassInstance_GetClassLinkage(red_i, &back);
+    check(back == linkage, "... GetClassLinkage");
+    if (back) ID3D11ClassLinkage_Release(back);
+  }
+  check(SUCCEEDED(ID3D11ClassLinkage_GetClassInstance(linkage, "greens", 1, &greens1)) && greens1, "an element of an instance array");
+  if (greens1) { ID3D11ClassInstance_GetDesc(greens1, &desc); check(desc.InstanceIndex == 1 && desc.BaseConstantBufferOffset == 2, "... its data after the first element's"); }
+  check(ID3D11ClassLinkage_GetClassInstance(linkage, "greens", 2, &none) == E_INVALIDARG && !none, "an index past the array: E_INVALIDARG");
+  check(ID3D11ClassLinkage_GetClassInstance(linkage, "nothing", 0, &none) == E_INVALIDARG && !none, "a name no shader has: E_INVALIDARG");
+  ID3D11ClassLinkage_GetClassInstance(linkage, "halved", 0, &halved);
+  ID3D11ClassLinkage_GetClassInstance(linkage, "loop", 0, &loop);
+  ID3D11ClassLinkage_GetClassInstance(linkage, "greens", 0, &greens0);
+  ID3D11ClassLinkage_GetClassInstance(linkage, "texture_colour", 0, &tex);
+  if (tex) { ID3D11ClassInstance_GetDesc(tex, &desc); check(desc.BaseTexture == 0 && desc.BaseSampler == 0, "a class with a texture and a sampler: its first ones"); }
+  check(SUCCEEDED(ID3D11ClassLinkage_CreateClassInstance(linkage, "cConst", 0, 4, 0, 0, &made)) && made, "CreateClassInstance");
+  if (made) { ID3D11ClassInstance_GetDesc(made, &desc); check(desc.Created && desc.TypeId == 3 && desc.BaseConstantBufferOffset == 4, "... its description"); }
+  ID3D11ClassLinkage_CreateClassInstance(linkage, "cMissing", 0, 0, 0, 0, &missing);
+  check(ID3D11ClassLinkage_CreateClassInstance(linkage, NULL, 0, 0, 0, 0, &none) == E_INVALIDARG, "CreateClassInstance without a type: E_INVALIDARG");
+  if (!halved || !loop || !greens0 || !tex || !made || !greens1) goto done;
+  {
+    /* the constants: red, greens[0], greens[1], halved (colour, scale), loop.step */
+    float classes_data[6][4] = {{0.5f, 0, 0, 0}, {0, 0.5f, 0, 0}, {0, 0, 1, 0}, {0, 1, 0, 0}, {0.5f, 0, 0, 0}, {0.25f, 0, 0, 0.6f}};
+    const UINT params_data[4] = {0, 0, 0, 0};
+    classes = make_buffer(D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_DEFAULT, 0, classes_data, sizeof classes_data);
+    params = make_buffer(D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_DEFAULT, 0, params_data, sizeof params_data);
+    if (!classes || !params) goto done;
+    ID3D11ClassInstance *set1[3] = {red_i, halved, greens1};
+    check(near_rgb(draw_linked(vs, ps, set1, 3, classes, params, 0), 128, 128, 0), "a draw through interfaces: red + halved (a static and a dynamically indexed slot)");
+    check(near_rgb(draw_linked(vs, ps, set1, 3, classes, params, 1), 128, 0, 255), "... the other element of the array: red + greens[1]");
+    {
+      ID3D11ClassInstance *got[4] = {NULL, NULL, NULL, NULL};
+      UINT n = 4;
+      ID3D11PixelShader *bound = NULL;
+      ID3D11DeviceContext_PSGetShader(g_context, &bound, got, &n);
+      check(bound == ps && n == 3 && got[0] == red_i && got[1] == halved && got[2] == greens1 && !got[3], "PSGetShader gives back the instances bound");
+      if (bound) ID3D11PixelShader_Release(bound);
+      for (int i = 0; i < 4; ++i) if (got[i]) ID3D11ClassInstance_Release(got[i]);
+    }
+    classes_data[4][0] = -1;      /* (halved returns magenta from inside an if) */
+    ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)classes, 0, NULL, classes_data, 0, 0);
+    check(near_rgb(draw_linked(vs, ps, set1, 3, classes, params, 0), 255, 0, 255), "a body that returns from inside an if");
+    classes_data[4][0] = 0.5f;
+    ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)classes, 0, NULL, classes_data, 0, 0);
+    ID3D11ClassInstance *set2[3] = {loop, greens0, loop};
+    check(near_rgb(draw_linked(vs, ps, set2, 3, classes, params, 0), 191, 128, 0), "a body that returns from inside a loop (three steps of 0.25)");
+    ID3D11ClassInstance *set3[3] = {made, red_i, red_i};
+    check(near_rgb(draw_linked(vs, ps, set3, 3, classes, params, 1), 255, 0, 0), "a created instance with its data where it was made to be");
+    {
+      /* the texture class: the texture of slot t0 */
+      const UINT32 blue_texel = 0xFFFF0000u;      /* (R8G8B8A8: blue) */
+      D3D11_TEXTURE2D_DESC td = {1, 1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+      D3D11_SUBRESOURCE_DATA initial = {&blue_texel, 4, 0};
+      ID3D11Texture2D *texture = NULL;
+      ID3D11ShaderResourceView *view = NULL;
+      ID3D11SamplerState *sampler = point_sampler();
+      if (SUCCEEDED(ID3D11Device_CreateTexture2D(g_device, &td, &initial, &texture)) &&
+          SUCCEEDED(ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)texture, NULL, &view)) && sampler) {
+        ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &view);
+        ID3D11DeviceContext_PSSetSamplers(g_context, 0, 1, &sampler);
+        ID3D11ClassInstance *set4[3] = {tex, greens0, red_i};
+        check(near_rgb(draw_linked(vs, ps, set4, 3, classes, params, 1), 128, 0, 255), "a class with a texture: the instance's texture and sampler");
+        ID3D11ShaderResourceView *no_view = NULL;
+        ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &no_view);
+      } else {
+        check(0, "a texture for the texture class");
+      }
+      if (view) ID3D11ShaderResourceView_Release(view);
+      if (texture) ID3D11Texture2D_Release(texture);
+      if (sampler) ID3D11SamplerState_Release(sampler);
+    }
+    if (missing) {
+      /* an instance of a class the shader does not have: the draw is left out */
+      ID3D11ClassInstance *set5[3] = {missing, red_i, red_i};
+      check(near_rgb(draw_linked(vs, ps, set5, 3, classes, params, 0), 0, 0, 0), "an instance of a class the shader does not have: nothing drawn");
+    }
+    ID3D11DeviceContext_PSSetShader(g_context, NULL, NULL, 0);
+  }
+done:
+  if (classes) ID3D11Buffer_Release(classes);
+  if (params) ID3D11Buffer_Release(params);
+  if (red_i) ID3D11ClassInstance_Release(red_i);
+  if (greens1) ID3D11ClassInstance_Release(greens1);
+  if (greens0) ID3D11ClassInstance_Release(greens0);
+  if (halved) ID3D11ClassInstance_Release(halved);
+  if (loop) ID3D11ClassInstance_Release(loop);
+  if (tex) ID3D11ClassInstance_Release(tex);
+  if (made) ID3D11ClassInstance_Release(made);
+  if (missing) ID3D11ClassInstance_Release(missing);
+  if (ps) ID3D11PixelShader_Release(ps);
+  if (vs) ID3D11VertexShader_Release(vs);
+  if (linkage) ID3D11ClassLinkage_Release(linkage);
+}
+
 int main(void) {
   test_device();
   if (g_device && g_context) {
@@ -3100,6 +3241,7 @@ int main(void) {
       test_texture1d();
       test_formats();
       test_vertex_formats();
+      test_class_linkage();
       test_creation_and_interop();
       test_render_to_levels();
       test_texture_uavs();
