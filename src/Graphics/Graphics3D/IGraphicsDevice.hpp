@@ -699,6 +699,9 @@ struct ShaderModuleDesc {
   // The text reads the comparison of the sampler bound to each texture unit u it compares with (SampleCmp, GatherCmp) at CONST[kSamplerCompareRegister + u]: (1 if reference < texel passes,
   // 1 if reference == texel passes, 1 if reference > texel passes, 1 for a linear filter, else 0 each) - the device puts them there from the bound SamplerDescs (sampler_compare_constant).
   bool sampler_constants = false;
+  // The text is the GL translator's (src/WebGl/TgsiTranslator.cpp): its images are GL's rows bottom first, so TGSI's DDY runs up them, and a flat varying takes the
+  // primitive's last vertex (GL's provoking vertex). The Direct3D layer's texts run down and take the first. virgl's GL host does both by itself; a Vulkan device must be told.
+  bool tgsi_gl = false;
   TgsiBindings tgsi_bindings;   // (the storage the text names, and where the device binds it)
   // Direct3D 9 shader bytecode (vs_2_0 / ps_2_0 token stream) for the VMware SVGA3D device. A vertex shader writes clip space with +Y up (Direct3D's)
   // when it takes the c31 constant (1, -1, 1, 1) as a factor of the position; the device supplies it, so that Vulkan's +Y down comes out right.
@@ -1167,6 +1170,9 @@ struct DeviceInfo {
   uint32_t sample_counts = 0;               // kFeatureMultisample: bit n set: ImageDesc::samples = n is supported
   DeviceLimits limits;                      // vertex attributes, varyings, texture units, colour targets and vertex buffers the device takes
   bool blend_constant = false;              // with kFeatureBlendState: the BlendFactor Constant* factors and BlendState::constant
+  // A multisampled image's samples are numbered as Direct3D's standard pattern (Vulkan's standard sample locations). virgl's host numbers 4x samples otherwise,
+  // and the Direct3D layer's TGSI turns the index around for it unless this is set.
+  bool d3d_sample_order = false;
   uint32_t features2 = 0;                   // DeviceFeature2 bits
 };
 

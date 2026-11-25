@@ -284,6 +284,7 @@ struct AdapterCaps {
   uint32_t max_texture_dimension = 0;
   uint32_t max_vertex_attributes = 0;
   uint32_t max_varyings = 0;
+  bool d3d_sample_order = false;   // (DeviceInfo::d3d_sample_order: the TGSI's multisampled loads take Direct3D's sample numbers as they are)
   uint32_t max_texture_units = 0;
   uint32_t max_color_targets = 0;
   uint32_t max_vertex_buffers = 0;

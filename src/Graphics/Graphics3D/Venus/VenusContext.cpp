@@ -32,7 +32,8 @@ bool same(const char* a, const char* b) { return StringView(a) == StringView(b);
 const char* const kWanted[] = {
     VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME,      VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME,
     VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME,   VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME,
-    VK_EXT_LINE_RASTERIZATION_EXTENSION_NAME,
+    VK_EXT_LINE_RASTERIZATION_EXTENSION_NAME,      VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
+    VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,            VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME,
 };
 constexpr uint32_t kWantedCount = sizeof(kWanted) / sizeof(kWanted[0]);
 
@@ -125,6 +126,10 @@ bool VenusContext::open() {
   auto clip = vk_struct<VkPhysicalDeviceDepthClipEnableFeaturesEXT>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT);
   auto u8 = vk_struct<VkPhysicalDeviceIndexTypeUint8FeaturesEXT>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT);
   auto lines = vk_struct<VkPhysicalDeviceLineRasterizationFeaturesEXT>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES_EXT);
+  auto divisor = vk_struct<VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT);
+  auto provoking = vk_struct<VkPhysicalDeviceProvokingVertexFeaturesEXT>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT);
+  auto robust2 = vk_struct<VkPhysicalDeviceRobustness2FeaturesEXT>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT);
+  auto bias = vk_struct<VkPhysicalDeviceDepthBiasControlFeaturesEXT>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_BIAS_CONTROL_FEATURES_EXT);
   auto v13 = vk_struct<VkPhysicalDeviceVulkan13Features>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES);
   auto v12 = vk_struct<VkPhysicalDeviceVulkan12Features>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES);
   auto v11 = vk_struct<VkPhysicalDeviceVulkan11Features>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES);
@@ -141,6 +146,10 @@ bool VenusContext::open() {
   link(clip, enabled(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME));
   link(u8, enabled(VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME));
   link(lines, enabled(VK_EXT_LINE_RASTERIZATION_EXTENSION_NAME));
+  link(divisor, enabled(VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME));
+  link(provoking, enabled(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME));
+  link(robust2, enabled(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME));
+  link(bias, enabled(VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME));
   link(v13, true);
   link(v12, true);
   link(v11, true);
@@ -153,6 +162,8 @@ bool VenusContext::open() {
   // (what is not used and has a cost or a rule of its own is left off)
   v12.bufferDeviceAddressCaptureReplay = VK_FALSE, v12.bufferDeviceAddressMultiDevice = VK_FALSE;
   cond.inheritedConditionalRendering = VK_FALSE;
+  provoking.transformFeedbackPreservesProvokingVertex = VK_FALSE;
+  bias.leastRepresentableValueForceUnormRepresentation = VK_FALSE;
   lines.stippledRectangularLines = lines.stippledBresenhamLines = lines.stippledSmoothLines = VK_FALSE;
 
   const VkPhysicalDeviceFeatures& f = features.features;
@@ -175,6 +186,13 @@ bool VenusContext::open() {
   caps_.depth_clip_enable = enabled(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME) && clip.depthClipEnable;
   caps_.index_type_uint8 = enabled(VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME) && u8.indexTypeUint8;
   caps_.line_rasterization = enabled(VK_EXT_LINE_RASTERIZATION_EXTENSION_NAME);
+  caps_.vertex_attribute_divisor = enabled(VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME) && divisor.vertexAttributeInstanceRateDivisor;
+  caps_.vertex_attribute_zero_divisor = caps_.vertex_attribute_divisor && divisor.vertexAttributeInstanceRateZeroDivisor;
+  caps_.provoking_vertex_last = enabled(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME) && provoking.provokingVertexLast;
+  caps_.null_descriptor = enabled(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME) && robust2.nullDescriptor;
+  caps_.robust_buffer_access2 = enabled(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME) && robust2.robustBufferAccess2;
+  caps_.robust_image_access2 = enabled(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME) && robust2.robustImageAccess2;
+  caps_.depth_bias_float = enabled(VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME) && bias.depthBiasControl && bias.floatRepresentation && bias.depthBiasExact;
 
   // The driver's name (for the boot log and GL_RENDERER).
   auto driver = vk_struct<VkPhysicalDeviceDriverProperties>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES);

@@ -59,6 +59,7 @@ class TgsiEmitter {
       : kScratch(program.temp_count_), p_(program), a_(allocator), body_(allocator), imms_(allocator), varyings_(varyings) {}
 
   NtStatus run(String* out);
+  void set_d3d_sample_order(bool v) { d3d_sample_order_ = v; }
 
  private:
   // (the emitter's registers come after the program's temporaries: the text declares no more registers than it uses)
@@ -317,6 +318,7 @@ class TgsiEmitter {
   void write_control_point_outputs();
 
   const D3d9Program& p_;
+  bool d3d_sample_order_ = false;
   allocators::IAllocator& a_;
   String body_;
   List<Imm> imms_;
@@ -1613,7 +1615,7 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       const String xy = temp(kWork3, ".xy"), sw = temp(kWork3, ".w"), packed = temp(kWork3);
       line("MOV", &xy, &coordinate);
       line("MOV", &sw, &sample);
-      if (p_.texture_samples_[unit] == 4) {
+      if (p_.texture_samples_[unit] == 4 && !d3d_sample_order_) {
         // (the host's sample 1 is Direct3D's sample 3 and the other way round - found by drawing edges through a pixel and seeing which samples they covered: an index of 1 or 3 has its
         // second bit flipped: index ^ ((index & 1) << 1))
         const String one = splat(1.0f), t = temp(kWork2, ".w"), tx = temp(kWork2, ".wwww"), swx = temp(kWork3, ".wwww");
@@ -2343,8 +2345,9 @@ NtStatus TgsiEmitter::run(String* out) {
   return status::kSuccess;
 }
 
-NtStatus D3d9Program::emit_tgsi(String* out, uint32_t varyings, graphics::TgsiBindings* bindings) const {
+NtStatus D3d9Program::emit_tgsi(String* out, uint32_t varyings, graphics::TgsiBindings* bindings, bool d3d_sample_order) const {
   TgsiEmitter emitter(*this, allocator_, varyings < graphics::kMaxVaryings ? varyings : graphics::kMaxVaryings);
+  emitter.set_d3d_sample_order(d3d_sample_order);
   const NtStatus s = emitter.run(out);
   if (s == status::kSuccess && bindings) *bindings = emitter.bindings();
   return s;

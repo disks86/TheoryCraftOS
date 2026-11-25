@@ -43,6 +43,10 @@ struct VenusCaps {
   bool depth_clip_enable = false;        // VK_EXT_depth_clip_enable
   bool index_type_uint8 = false;         // VK_EXT_index_type_uint8
   bool line_rasterization = false;       // VK_EXT_line_rasterization
+  bool vertex_attribute_divisor = false, vertex_attribute_zero_divisor = false;   // VK_EXT_vertex_attribute_divisor
+  bool provoking_vertex_last = false;    // VK_EXT_provoking_vertex (GL's flat varyings)
+  bool null_descriptor = false, robust_buffer_access2 = false, robust_image_access2 = false;   // VK_EXT_robustness2 (unbound resources read 0)
+  bool depth_bias_float = false;         // VK_EXT_depth_bias_control with the float representation (normalised depth formats' bias on D32F)
   bool shader_float64 = false;
   bool geometry_shader = false, tessellation_shader = false, dual_src_blend = false, logic_op = false, sampler_anisotropy = false;
   bool multi_viewport = false, shader_output_layer = false, shader_output_viewport_index = false;

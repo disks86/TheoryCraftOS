@@ -24,7 +24,7 @@
 # LINUX=1: tests/linux/<program>.c (default vulkantest) instead, a static Linux program over libvulkan.a, through /dev/dri/renderD128 (prints
 # "vulkan-linux: N checks").
 # Usage: tests/venus_qemu.sh [program]        HOSTMEM=<size> (default 1G): the device's host memory window. VENUS=off: the same machine without Venus (the
-# Direct3D backend over virgl: what the program does when there is no host Vulkan).
+# Direct3D backend over virgl: what the program does when there is no host Vulkan). GPU_BACKEND=AUTO|VENUS|VIRGL: the kernel's own 3D device (TCOS_GPU_BACKEND).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 build=${BUILD:-build-venus-qemu}
@@ -44,7 +44,7 @@ else
   x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wno-cast-function-type -o "$work/$program.exe" "tests/windows/$program.c"
   autorun=/Windows/$program.exe image="file:/Windows/$program.exe=$work/$program.exe" banner=$program
 fi
-cmake -S . -B "$build" -G Ninja "-DTCOS_AUTORUN=$autorun" -DTCOS_AUTORUN_ARGUMENTS= -DTCOS_AUTORUN_ELEVATED=OFF >/dev/null
+cmake -S . -B "$build" -G Ninja "-DTCOS_AUTORUN=$autorun" -DTCOS_AUTORUN_ARGUMENTS= -DTCOS_AUTORUN_ELEVATED=OFF "-DTCOS_GPU_BACKEND=${GPU_BACKEND:-AUTO}" >/dev/null
 cmake --build "$build" -j "${JOBS:-8}" >"$work/build.log" 2>&1 || { tail -30 "$work/build.log"; exit 1; }
 cmake --build "$build" --target vars >/dev/null
 "$build/tools/primary_image" "$build/primary.img" "$image" >/dev/null
@@ -62,7 +62,7 @@ for a in "${words[@]}"; do
 done
 rm -f "$build/debugcon.log"
 (cd "$build" && timeout "${QEMU_SECONDS:-180}" "${args[@]}" </dev/null >/dev/null 2>"$work/qemu-err.txt") || true
-grep -a -E "^$banner|^FAIL|^venus|virtio-gpu capsets|autorun:|PANIC|user program:" "$build/debugcon.log" || echo "no output from $program"
+grep -a -E "^$banner|^FAIL|^venus|virtio-gpu capsets|Venus|autorun:|PANIC|user program:" "$build/debugcon.log" || echo "no output from $program"
 status=0
 grep -a -q -E "^$banner: [0-9]* checks, 0 failed" "$build/debugcon.log" || status=1
 grep -a -q -E "autorun: ended, result 0, exit code 0x0* " "$build/debugcon.log" || status=1

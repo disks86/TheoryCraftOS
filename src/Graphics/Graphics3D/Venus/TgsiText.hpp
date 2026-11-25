@@ -34,6 +34,7 @@
 #include <stdint.h>
 #include "Allocators/IAllocator.hpp"
 #include "ObjectContainer/List.hpp"
+#include "Utility/ByteBuffer.hpp"
 #include "Utility/FixedString.hpp"
 #include "Utility/StringView.hpp"
 
@@ -176,6 +177,19 @@ struct ParseError {
   uint32_t line = 0;
   FixedString<96> message;
 };
+
+// The marks the Direct3D layer's text has where a number or a format depends on what is bound (IGraphicsDevice.hpp's TgsiBindings): IMGFMT<k> the format of what is
+// bound to IMAGE[k], IMGOFS<k> / IMGLEN<k> the first element and the count of a buffer view there, TBOFS<k> / TBLEN<k> those of the typed view SVIEW[16 + k].
+constexpr uint32_t kMarkImages = 32, kMarkTexelViews = 16;
+struct MarkValues {
+  ImageFormat image_format[kMarkImages] = {};   // (None: R8G8B8A8_UNORM, as VirglDevice writes for nothing bound)
+  uint32_t image_first[kMarkImages] = {}, image_count[kMarkImages] = {};
+  uint32_t texel_first[kMarkTexelViews] = {}, texel_count[kMarkTexelViews] = {};
+};
+bool has_marks(StringView text);
+// `text` with every mark replaced (no terminating NUL). False when memory ran out.
+[[nodiscard]] bool substitute_marks(StringView text, const MarkValues& values, ByteBuffer* out);
+const char* image_format_name(ImageFormat format);
 
 // Reads `text` into `out` (empty before). False with `error` set when the text is not TGSI this reader takes.
 [[nodiscard]] bool parse(StringView text, Program* out, ParseError* error);

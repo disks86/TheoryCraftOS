@@ -38,6 +38,7 @@ namespace graphics {
 
 class IntelRenderStack;
 class VegaGraphicsDevice;
+class VenusDevice;
 
 class RenderNode {
  public:
@@ -68,6 +69,7 @@ class RenderNode {
   void build_accelerated(hardware::VirtioGpu* virtio, hardware::VmwareSvgaGpu* vmware, hardware::IntelGpu* intel, hardware::AmdVegaM* vega, allocators::IAllocator& allocator,
                          bool allow_acceleration, bool allow_intel_render);
   void destroy_accelerated();
+  void build_venus(hardware::VirtioGpu& virtio, allocators::IAllocator& allocator);
   bool self_test(IGraphicsDevice& device);
   // Draws a triangle on the device and looks at the pixel: for back ends whose protocol could not be tried against a real host in advance.
   bool drawing_test(IGraphicsDevice& device);
@@ -84,6 +86,8 @@ class RenderNode {
   bool svga_ = false;
   IntelRenderStack* intel_stack_ = nullptr;          // (RenderNodeAccel.cpp makes and destroys it, so this file needs nothing of the Intel driver)
   allocators::IAllocator* intel_allocator_ = nullptr;
+  VenusDevice* venus_device_ = nullptr;              // (the host's Vulkan through virtio-gpu's Venus, when it is the node's: allocated from venus_allocator_)
+  allocators::IAllocator* venus_allocator_ = nullptr;
   VegaGraphicsDevice* vega_device_ = nullptr;        // (the Vega M's device, when it is the node's: allocated from vega_allocator_)
   allocators::IAllocator* vega_allocator_ = nullptr;
   const char* reason_ = "";

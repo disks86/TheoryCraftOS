@@ -669,6 +669,12 @@ add_executable(BOOTX64
   src/Graphics/Graphics3D/Venus/KernelVulkan.c
   src/Graphics/Graphics3D/Venus/KernelVulkanOs.cpp
   src/Graphics/Graphics3D/Venus/VenusContext.cpp
+  src/Graphics/Graphics3D/Venus/VenusDevice.cpp
+  src/Graphics/Graphics3D/Venus/VenusPipeline.cpp
+  src/Graphics/Graphics3D/Venus/VenusSubmit.cpp
+  src/Graphics/Graphics3D/Venus/TgsiText.cpp
+  src/Graphics/Graphics3D/Venus/TgsiSpirv.cpp
+  src/Graphics/Graphics3D/Venus/Spirv.cpp
   src/Graphics/Graphics3D/Svga/SvgaDevice.cpp
   src/Graphics/RenderNode.cpp
   src/Graphics/RenderNodeAccel.cpp
@@ -1667,6 +1673,13 @@ if(TCOS_USERMODE_DEMO AND TCOS_USERMODE_DEMO_PROGRAM)
   file(WRITE ${CMAKE_BINARY_DIR}/demo_files.S "${_demo_files_s}")
   target_sources(BOOTX64 PRIVATE ${CMAKE_BINARY_DIR}/demo_files.S)
   set_source_files_properties(${CMAKE_BINARY_DIR}/demo_files.S PROPERTIES OBJECT_DEPENDS "${TCOS_USERMODE_DEMO_FILES}")
+endif()
+set(TCOS_GPU_BACKEND AUTO CACHE STRING "The 3D device on QEMU's virtio-gpu: AUTO (Venus - the host's Vulkan - when the device offers it and it does all virgl does, else virgl), VENUS (Venus whenever it works), VIRGL (never Venus)")
+set_property(CACHE TCOS_GPU_BACKEND PROPERTY STRINGS AUTO VENUS VIRGL)
+if(TCOS_GPU_BACKEND STREQUAL "VENUS")
+  target_compile_definitions(BOOTX64 PRIVATE TCOS_GPU_BACKEND_VENUS)
+elseif(TCOS_GPU_BACKEND STREQUAL "VIRGL")
+  target_compile_definitions(BOOTX64 PRIVATE TCOS_GPU_BACKEND_VIRGL)
 endif()
 option(TCOS_INTEL_RENDER "Use the render engine of an Intel Gen9.5 display GPU for 3D and for the desktop (not yet run on real hardware; the CPU renderer is used if its self-test fails; -DTCOS_INTEL_RENDER=OFF keeps the CPU renderer)" ON)
 if(TCOS_INTEL_RENDER)

@@ -668,6 +668,71 @@ ImageFormat image_format_by_name(StringView name) {
   return lookup(kFormats, name, &f) ? f.format : ImageFormat::None;
 }
 
+const char* image_format_name(ImageFormat format) {
+  for (const NamedFormat& f : kFormats)
+    if (f.format == format) return f.name;
+  return "PIPE_FORMAT_R8G8B8A8_UNORM";
+}
+
+namespace {
+// A mark at text[at]: its kind (0 IMGFMT, 1 IMGOFS, 2 IMGLEN, 3 TBOFS, 4 TBLEN), its number, and its length; 0 when there is none.
+uint64_t mark_at(StringView text, uint64_t at, uint32_t* kind, uint32_t* index) {
+  static constexpr const char* kNames[] = {"IMGFMT", "IMGOFS", "IMGLEN", "TBOFS", "TBLEN"};
+  if (at > 0) {
+    const char before = text[at - 1];
+    if ((before >= 'A' && before <= 'Z') || (before >= 'a' && before <= 'z') || before == '_') return 0;
+  }
+  for (uint32_t k = 0; k < 5; ++k) {
+    const StringView name(kNames[k]);
+    if (at + name.size() > text.size() || text.substr(at, name.size()) != name) continue;
+    uint64_t end = at + name.size();
+    uint32_t n = 0, digits = 0;
+    while (end < text.size() && digits < 4 && text[end] >= '0' && text[end] <= '9') n = n * 10 + static_cast<uint32_t>(text[end++] - '0'), ++digits;
+    if (!digits) continue;
+    *kind = k, *index = n;
+    return end - at;
+  }
+  return 0;
+}
+}  // namespace
+
+bool has_marks(StringView text) {
+  uint32_t kind = 0, index = 0;
+  for (uint64_t i = 0; i < text.size(); ++i)
+    if (text[i] == 'I' || text[i] == 'T')
+      if (mark_at(text, i, &kind, &index)) return true;
+  return false;
+}
+
+bool substitute_marks(StringView text, const MarkValues& v, ByteBuffer* out) {
+  out->clear();
+  uint64_t i = 0;
+  while (i < text.size()) {
+    uint32_t kind = 0, index = 0;
+    const uint64_t taken = (text[i] == 'I' || text[i] == 'T') ? mark_at(text, i, &kind, &index) : 0;
+    if (!taken) {
+      if (!out->put8(static_cast<uint8_t>(text[i]))) return false;
+      ++i;
+      continue;
+    }
+    if (kind == 0) {
+      const char* name = image_format_name(index < kMarkImages ? v.image_format[index] : ImageFormat::None);
+      if (!out->append(ConstByteView(reinterpret_cast<const uint8_t*>(name), StringView(name).size()))) return false;   // (a string's bytes)
+    } else {
+      const uint32_t value = kind == 1 ? (index < kMarkImages ? v.image_first[index] : 0) : kind == 2 ? (index < kMarkImages ? v.image_count[index] : 0)
+                             : kind == 3 ? (index < kMarkTexelViews ? v.texel_first[index] : 0) : (index < kMarkTexelViews ? v.texel_count[index] : 0);
+      char digits[12];
+      uint32_t n = 0, x = value;
+      do digits[n++] = static_cast<char>('0' + x % 10), x /= 10;
+      while (x);
+      while (n)
+        if (!out->put8(static_cast<uint8_t>(digits[--n]))) return false;
+    }
+    i += taken;
+  }
+  return true;
+}
+
 bool parse(StringView text, Program* out, ParseError* error) {
   ParseError ignored;
   Reader r(*out, error ? *error : ignored);

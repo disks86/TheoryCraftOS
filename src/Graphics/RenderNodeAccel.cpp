@@ -23,7 +23,7 @@
 #include "Graphics/Graphics3D/BuiltinShaders.hpp"
 #include "Graphics/Graphics3D/IntelGen9/IntelRenderStack.hpp"
 #include "Graphics/Graphics3D/Venus/KernelVulkanOs.hpp"
-#include "Graphics/Graphics3D/Venus/VenusContext.hpp"
+#include "Graphics/Graphics3D/Venus/VenusDevice.hpp"
 #include "BootLog.hpp"
 #ifdef TCOS_AMD_VEGAM
 #include "Graphics/Graphics3D/Vega/VegaGraphicsDevice.hpp"
@@ -39,20 +39,21 @@ void RenderNode::build_accelerated(hardware::VirtioGpu* virtio, hardware::Vmware
     if (!virtio->has_3d()) {
       reason_ = "virtio-gpu without virgl (start QEMU with virtio-gpu-gl and a gl display)";
     } else {
+      // The host's Vulkan (Venus) when the device offers it and the Venus device can stand in for virgl; virgl otherwise. TCOS_GPU_BACKEND (CMake: AUTO, VENUS,
+      // VIRGL) forces one for testing: VENUS takes the Venus device whenever it works, whatever virgl would do that it does not.
       venus::set_kernel_vulkan_allocator(allocator);
-      if (tcos_kernel_vulkan_available()) {   // PROBE (temporary): the kernel's own Vulkan on the host's driver
-        venus::VenusContext probe;
-        bootlog::Entry e(bootlog::Level::Info, "Venus");
-        if (probe.open()) e.text("kernel Vulkan on ").text(probe.properties().deviceName).text(" (").text(probe.driver_name()).text("), Vulkan ").dec(VK_API_VERSION_MAJOR(probe.properties().apiVersion)).text(".").dec(VK_API_VERSION_MINOR(probe.properties().apiVersion));
-        else e.text("kernel Vulkan: the host's device did not open");
-      }
-      VirglDevice* device = new (virgl_storage_) VirglDevice(*virtio);
-      if (self_test(*device)) {
-        gpu_device_ = device;
-        active_ = device;
-      } else {
-        device->~VirglDevice();
-        reason_ = "the virgl device failed its self-test";
+#if !defined(TCOS_GPU_BACKEND_VIRGL)
+      if (tcos_kernel_vulkan_available()) build_venus(*virtio, allocator);
+#endif
+      if (!venus_device_) {
+        VirglDevice* device = new (virgl_storage_) VirglDevice(*virtio);
+        if (self_test(*device)) {
+          gpu_device_ = device;
+          active_ = device;
+        } else {
+          device->~VirglDevice();
+          reason_ = "the virgl device failed its self-test";
+        }
       }
     }
   } else if (svga) {
@@ -120,8 +121,57 @@ void RenderNode::build_accelerated(hardware::VirtioGpu* virtio, hardware::Vmware
   }
 }
 
+// The Venus device: made, tested, and (AUTO) kept only if it does all that the virgl device on the same host would - every feature, every limit - so that taking
+// it costs no caller anything. The verdict is in the boot log.
+void RenderNode::build_venus(hardware::VirtioGpu& virtio, allocators::IAllocator& allocator) {
+  void* memory = allocator.allocate_aligned(sizeof(VenusDevice), alignof(VenusDevice));
+  if (!memory) return;
+  VenusDevice* device = new (memory) VenusDevice(allocator, virtio);
+  bootlog::Entry e(bootlog::Level::Info, "GPU");
+  bool use = false;
+  if (!device->initialize()) {
+    e.text("Venus: the host's Vulkan device did not open; virgl");
+  } else if (!self_test(*device) || !drawing_test(*device)) {
+    e.text("Venus: ").text(device->context().properties().deviceName).text(" did not draw the test picture; virgl");
+  } else {
+    e.text("Venus on ").text(device->context().properties().deviceName).text(" (").text(device->context().driver_name()).text(")");
+#if defined(TCOS_GPU_BACKEND_VENUS)
+    use = true;
+    e.text(": chosen (TCOS_GPU_BACKEND=VENUS)");
+#else
+    // (what virgl would offer: a virgl device made for the comparison and given back)
+    VirglDevice* virgl = new (virgl_storage_) VirglDevice(virtio);
+    const DeviceInfo want = virgl->info(), have = device->info();
+    virgl->~VirglDevice();
+    const uint32_t missing = want.features & ~have.features, missing2 = want.features2 & ~have.features2;
+    const bool limits = have.limits.texture_units >= want.limits.texture_units && have.limits.vertex_attributes >= want.limits.vertex_attributes &&
+                        have.limits.varyings >= want.limits.varyings && have.limits.color_targets >= want.limits.color_targets &&
+                        have.limits.vertex_buffers >= want.limits.vertex_buffers && have.limits.control_varyings >= want.limits.control_varyings &&
+                        (want.sample_counts & ~have.sample_counts) == 0 && have.max_push_constant_bytes >= want.max_push_constant_bytes;
+    use = !missing && !missing2 && limits;
+    if (use) e.text(": chosen (it does everything virgl does here)");
+    else e.text(": virgl kept (Venus lacks features ").hex(missing).text(" / ").hex(missing2).text(limits ? "" : ", limits").text("; TCOS_GPU_BACKEND=VENUS forces it)");
+#endif
+  }
+  if (!use) {
+    device->~VenusDevice();
+    allocator.deallocate(memory);
+    return;
+  }
+  venus_device_ = device;
+  venus_allocator_ = &allocator;
+  gpu_device_ = device;
+  active_ = device;
+}
+
 void RenderNode::destroy_accelerated() {
   if (locked_) locked_->~LockedDevice();
+  if (venus_device_) {   // (after the locked wrapper that points to it)
+    venus_device_->~VenusDevice();
+    venus_allocator_->deallocate(venus_device_);
+    venus_device_ = nullptr;
+    raw_device_ = nullptr;
+  }
   if (raw_device_ && !intel_stack_ && !vega_device_) {
     if (svga_) static_cast<SvgaDevice*>(raw_device_)->~SvgaDevice();
     else static_cast<VirglDevice*>(raw_device_)->~VirglDevice();

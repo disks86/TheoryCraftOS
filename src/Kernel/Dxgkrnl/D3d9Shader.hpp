@@ -163,7 +163,8 @@ class D3d9Program {
   // what the text cannot say (see D3d9Tgsi.cpp), kNoMemory.
   // `varyings`: how many interpolants the host's vertex and pixel shaders declare (DeviceLimits::varyings).
   // `bindings` (or null): where the text's BUFFER, IMAGE and buffer SVIEW registers are bound (graphics::TgsiBindings).
-  NtStatus emit_tgsi(String* out, uint32_t varyings = graphics::kBaseVaryings, graphics::TgsiBindings* bindings = nullptr) const;
+  // `d3d_sample_order`: the device numbers a multisampled image's samples as Direct3D does (DeviceInfo::d3d_sample_order); else 4x indexes are turned around for virgl's host.
+  NtStatus emit_tgsi(String* out, uint32_t varyings = graphics::kBaseVaryings, graphics::TgsiBindings* bindings = nullptr, bool d3d_sample_order = false) const;
 
   // For a vertex shader: whether it is the matrix transform of the fixed vertex kernel, found by running it on test vectors against the built-in shader. `colour_varying` is the varying
   // the colour attribute goes to.

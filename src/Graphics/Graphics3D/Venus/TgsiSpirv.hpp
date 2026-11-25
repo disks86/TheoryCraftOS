@@ -23,12 +23,14 @@
 // bits. Structured TGSI control flow (IF / UIF / ELSE / ENDIF, BGNLOOP / ENDLOOP / BRK / CONT, RET) becomes SPIR-V's structured control flow; KILL is a demote
 // (the invocation goes on as a helper, so derivatives after it work, as on virgl and the CPU machine).
 //
-// The resources are one descriptor set (set 0) whose bindings are the same numbers in every stage (kBinding*):
-//   kBindingConstants      a uniform buffer: CONST[n] is its 16-byte row n (the push constants, then from row 256 the samplers' comparison rows; IGraphicsDevice's layout)
-//   kBindingTexture + u    SVIEW[u] (u < 16: a texture unit; 16 + k: a typed buffer view, a uniform texel buffer)
-//   kBindingSampler + u    SAMP[u]
-//   kBindingStorage + k    BUFFER[k], a storage buffer of 32-bit words
-//   kBindingImage + k      IMAGE[k], a storage image (a storage texel buffer for the BUFFER target)
+// The resources are one descriptor set (set 0). Texture units are the same numbers in every stage; the storage the Direct3D layer numbers densely per shader
+// (BUFFER[k], IMAGE[k], the typed buffer views SVIEW[16 + k]: IGraphicsDevice.hpp's TgsiBindings) has bindings of each stage's own (stage_slot):
+//   kBindingConstants                     a uniform buffer: CONST[n] is its 16-byte row n (the push constants, then from row 256 the samplers' comparison rows)
+//   kBindingTexture + u, u < 16           SVIEW[u], a sampled image (texture unit u)
+//   kBindingSampler + u                   SAMP[u]
+//   binding_texel(stage, k)               SVIEW[16 + k], a uniform texel buffer
+//   binding_storage(stage, k)             BUFFER[k], a storage buffer of 32-bit words
+//   binding_image(stage, k)               IMAGE[k], a storage image (a storage texel buffer for the BUFFER target)
 // Stage interface: vertex attribute n is location n; GENERIC[i] is location i; PATCH[j] is location patch_base + j; the colour outputs COLOR[i] are location i
 // (COLOR[1] is location 0 index 1 for dual-source blending); positions, clip distances, point sizes are a gl_PerVertex block, the same in every stage.
 #pragma once
@@ -40,12 +42,13 @@
 
 namespace graphics::tgsi {
 
+constexpr uint32_t kMaxSviews = 32, kMaxUnits = 16, kMaxTexelViews = 16, kMaxStorage = 64, kMaxImages = 32, kMaxConstantRows = 4096, kMaxStages = 5;
 constexpr uint32_t kBindingConstants = 0;
-constexpr uint32_t kBindingTexture = 1;     // .. 32
-constexpr uint32_t kBindingSampler = 33;    // .. 64
-constexpr uint32_t kBindingStorage = 65;    // .. 128
-constexpr uint32_t kBindingImage = 129;     // .. 192
-constexpr uint32_t kMaxSviews = 32, kMaxStorage = 64, kMaxImages = 64, kMaxConstantRows = 4096;
+constexpr uint32_t kBindingTexture = 1;      // .. 16
+constexpr uint32_t kBindingSampler = 17;     // .. 32
+constexpr uint32_t binding_texel(uint32_t stage, uint32_t k) { return 40 + stage * kMaxTexelViews + k; }      // 40 .. 119
+constexpr uint32_t binding_storage(uint32_t stage, uint32_t k) { return 120 + stage * kMaxStorage + k; }      // 120 .. 439
+constexpr uint32_t binding_image(uint32_t stage, uint32_t k) { return 440 + stage * kMaxImages + k; }         // 440 .. 599
 constexpr uint32_t kMaxStreamOutput = 64;
 
 // The type a texture, an image or an attribute holds (what the shader's sampled type must be: Vulkan wants it to match the format).
@@ -60,12 +63,16 @@ struct StreamOutputEntry {
 };
 
 struct CompileOptions {
+  // Which of the pipeline's stages this is (0 .. 4: the bindings of its storage, binding_storage and the others).
+  uint32_t stage_slot = 0;
   // The constant buffer's rows (the declared CONST range is checked against it).
   uint32_t constant_rows = 272;
   // SVIEW / IMAGE / vertex attribute / colour output value types (from what is bound or the pipeline's formats).
   ValueType sview_type[kMaxSviews] = {};
   ValueType image_type[kMaxImages] = {};
   ValueType attribute_type[16] = {};
+  // Vertex attributes whose fourth component the shader sees as 1 whatever the buffer holds (a format of three components read through a four-component one, Bgrx8).
+  uint16_t attribute_one_w = 0;
   ValueType color_type[8] = {};
   // Image formats when the declaration has none (the ImageFormat of what is bound; None: the format-less access).
   ImageFormat image_format[kMaxImages] = {};
@@ -90,12 +97,18 @@ struct CompileOptions {
   uint32_t stream_output_stride[4] = {};
   // Geometry shader: stream numbers 0 and `swap_stream` are exchanged (the rasterized stream must be stream 0, as on virgl); 0: none.
   uint32_t swap_stream = 0;
+  // Tessellation evaluation: the tessellator's settings instead of the text's TES_VERTEX_ORDER_CW / TES_POINT_MODE / TES_SPACING (0 fractional odd, 1 even, 2 equal).
+  bool tess_override = false, tess_cw = false, tess_points = false;
+  uint32_t tess_spacing = 2;
+  // TGSI's DDY runs up the image's rows (the GL translator's images are GL's rows bottom first): DDY is the negated Vulkan dPdy. The Direct3D layer's run down.
+  bool ddy_up = false;
   // The device has shaderOutputLayer / shaderOutputViewportIndex (a layer or viewport from a vertex or domain shader).
   bool output_layer_any_stage = false;
 };
 
 struct CompileResult {
-  explicit CompileResult(allocators::IAllocator& allocator) : words(allocator) {}
+  explicit CompileResult(allocators::IAllocator& a) : allocator(a), words(a) {}
+  allocators::IAllocator& allocator;
   List<uint32_t> words;
   uint32_t line = 0;                  // a failure's TGSI line
   FixedString<96> error;

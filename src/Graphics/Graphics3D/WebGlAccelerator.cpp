@@ -93,9 +93,11 @@ uint32_t WebGlAccelerator::create_program_stages(const char* vs_tgsi, const char
   ShaderModuleDesc vd;
   vd.stage = ShaderStage::Vertex;
   vd.tgsi = vs_tgsi;
+  vd.tgsi_gl = true;
   ShaderModuleDesc fd;
   fd.stage = ShaderStage::Fragment;
   fd.tgsi = fs_tgsi;
+  fd.tgsi_gl = true;
   p->vs = device_.create_shader_module(vd);
   p->fs = p->vs ? device_.create_shader_module(fd) : nullptr;
   if (!p->vs || !p->fs) {   // a device without TGSI refuses here, and the draw stays on the CPU
@@ -110,6 +112,7 @@ uint32_t WebGlAccelerator::create_program_stages(const char* vs_tgsi, const char
     ShaderModuleDesc gd;
     gd.stage = ShaderStage::Geometry;
     gd.tgsi = p->gs_text.c_str();
+    gd.tgsi_gl = true;
     gd.geometry_input = static_cast<GeometryPrimitive>(stages.gs_input);
     gd.geometry_output = static_cast<GeometryTopology>(stages.gs_output);
     gd.geometry_max_vertices = stages.gs_max_vertices;
@@ -134,6 +137,7 @@ uint32_t WebGlAccelerator::create_program_stages(const char* vs_tgsi, const char
     td.tess_output = static_cast<TessOutput>(stages.tess_output);
     td.stage = ShaderStage::Hull;
     td.tgsi = p->tcs_text.c_str();
+    td.tgsi_gl = true;
     p->hs = device_.create_shader_module(td);
     td.stage = ShaderStage::Domain;
     td.tgsi = p->tes_text.c_str();

@@ -1,0 +1,931 @@
+/*
+ * TheoryCraftOS - a minimal UEFI x86_64 operating system.
+ * Copyright (C) 2026 Christopher Schaefer
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+// The Venus device's resources: the device itself, formats, buffers, images and their CPU transfers, samplers, presentation (VenusDevice.hpp). Pipelines are in
+// VenusPipeline.cpp, the command replay in VenusSubmit.cpp.
+#include "Graphics/Graphics3D/Venus/VenusDevice.hpp"
+#include <new>
+#include "Graphics/BlockCompression.hpp"
+#include "Graphics/Graphics3D/Mipmaps.hpp"
+#include "Graphics/Graphics3D/Venus/VenusObjects.hpp"
+#include "Graphics/WidePixels.hpp"
+#include "Hardware/GraphicsProcessingUnit/Virtio/VirtioGpu.hpp"
+#include "Utility/ByteStream.hpp"
+
+namespace graphics {
+
+namespace {
+constexpr uint64_t kConstantRingBytes = 8u << 20;   // (a submit's constant blocks: 4352 bytes each at most, so ~1900 draws; more and the submit is split)
+constexpr uint64_t kStagingStart = 4u << 20;
+}  // namespace
+
+VenusDevice::VenusDevice(allocators::IAllocator& allocator, hardware::VirtioGpu& gpu) : allocator_(allocator), gpu_(gpu), pools_(allocator), samplers_(allocator) {}
+
+VenusDevice::~VenusDevice() {
+  if (!ctx_.opened()) return;
+  vk().DeviceWaitIdle(device());
+  for (CachedSampler& s : samplers_) vk().DestroySampler(device(), s.sampler, nullptr);
+  for (VkDescriptorPool p : pools_) vk().DestroyDescriptorPool(device(), p, nullptr);
+  for (VkQueryPool p : pools_by_kind_)
+    if (p) vk().DestroyQueryPool(device(), p, nullptr);
+  free_memory(&so_counters_);
+  free_memory(&staging_);
+  free_memory(&constants_);
+  if (fence_) vk().DestroyFence(device(), fence_, nullptr);
+  if (pool_) vk().DestroyCommandPool(device(), pool_, nullptr);
+  ctx_.close();
+}
+
+bool VenusDevice::initialize() {
+  if (!ctx_.open()) return false;
+  const VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, nullptr, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, ctx_.queue_family()};
+  VkCommandBuffer buffers[2] = {};
+  const VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr, nullptr, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 2};
+  const VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, nullptr, 0};
+  if (vk().CreateCommandPool(device(), &pci, nullptr, &pool_) != VK_SUCCESS) {
+    pool_ = nullptr;
+    ctx_.close();
+    return false;
+  }
+  VkCommandBufferAllocateInfo ai = cai;
+  ai.commandPool = pool_;
+  if (vk().AllocateCommandBuffers(device(), &ai, buffers) != VK_SUCCESS || vk().CreateFence(device(), &fci, nullptr, &fence_) != VK_SUCCESS ||
+      !make_memory(kConstantRingBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &constants_) || !staging(kStagingStart)) {
+    fence_ = nullptr;
+    if (pool_) vk().DestroyCommandPool(device(), pool_, nullptr);
+    pool_ = nullptr;
+    free_memory(&constants_);
+    ctx_.close();
+    return false;
+  }
+  once_ = buffers[0], main_ = buffers[1];
+  const VkPhysicalDeviceLimits& l = ctx_.properties().limits;
+  uniform_alignment_ = static_cast<uint32_t>(l.minUniformBufferOffsetAlignment > 16 ? l.minUniformBufferOffsetAlignment : 16);
+  max_image_dimension_ = l.maxImageDimension2D < 16384 ? l.maxImageDimension2D : 16384;
+  const VkSampleCountFlags counts = l.framebufferColorSampleCounts & l.framebufferDepthSampleCounts & l.sampledImageColorSampleCounts;
+  for (uint32_t n = 2; n <= 16; n *= 2)
+    if (counts & n) sample_counts_ |= 1u << n;
+  initialized_ = true;
+  return true;
+}
+
+// ---- what the device does ----------------------------------------------------------------------------------------------------------------------------
+// What this device implements, where the host's device has it. (Multisampling and resolves are not offered yet: docs/Venus.md.)
+DeviceInfo VenusDevice::info() const {
+  DeviceInfo i{};
+  i.name = "Venus (virtio-gpu)", i.kind = DeviceKind::VirtualGpu, i.accelerated = true;
+  const VenusCaps& c = ctx_.caps();
+  i.max_push_constant_bytes = kMaxPushConstantBytes;
+  i.blend_constant = true;
+  i.features = kFeatureBlendState | kFeatureTexelAccess | kFeatureSystemInputs | kFeatureInstancing | kFeatureLines | kFeatureMultipleTargets | kFeatureFloatFormats |
+               kFeatureTextureKinds | kFeatureIndependentBlend | kFeatureCompute | kFeatureSrgbFormats | kFeatureUnorm16Formats | kFeatureIntegerFormats |
+               kFeatureSnormFormats | kFeatureStorageInDraws | kFeatureVertexFormats | kFeatureAddressModes;
+  if (c.fragment_stores_and_atomics) i.features |= kFeatureFragmentStores;
+  if (c.vertex_pipeline_stores_and_atomics) i.features |= kFeatureVertexStores;
+  if (c.geometry_shader) i.features |= kFeatureGeometryShaders;
+  if (c.geometry_shader && c.vertex_pipeline_stores_and_atomics) i.features |= kFeatureGeometryStores;
+  if (c.tessellation_shader) i.features |= kFeatureTessellation;
+  if (c.tessellation_shader && c.vertex_pipeline_stores_and_atomics) i.features |= kFeatureTessellationStores;
+  if (c.shader_clip_distance) i.features |= kFeatureClipDistances;
+  if (c.texture_compression_bc) i.features |= kFeatureCompressedFormats;
+  i.features |= kFeatureOcclusionQueries;
+  if (c.timestamp_valid_bits) i.features |= kFeatureTimestampQueries;
+  if (c.pipeline_statistics_query) i.features |= kFeatureStatisticsQueries;
+  if (c.transform_feedback) i.features |= kFeatureStreamOutput;
+  i.features2 = kFeature2SingleChannelFormats | kFeature2DepthTextures | kFeature2RasterizerState | kFeature2SamplerState | kFeature2StorageImages |
+                kFeature2StorageImagesInDraws | kFeature2TexelBuffers | kFeature2StorageImagesAllStages | kFeature2MipmappedLayers | kFeature2LayeredTargets |
+                kFeature2DepthAndStencilPlanes;
+  if (c.logic_op) i.features2 |= kFeature2LogicOps;
+  if (c.dual_src_blend) i.features2 |= kFeature2DualSourceBlend;
+  if (c.multi_viewport) i.features2 |= kFeature2Viewports;
+  if (c.shader_output_layer && c.shader_output_viewport_index) i.features2 |= kFeature2LayerFromAnyStage;
+  if (c.conservative_rasterization) i.features2 |= kFeature2ConservativeRaster;
+  i.sample_counts = 0;
+  i.limits.texture_units = kMaxTextureUnits;
+  i.limits.vertex_attributes = kMaxVertexAttributes;
+  i.limits.varyings = 15;            // (as virgl's: the Direct3D layer's text keeps one more output, the position as written, after them)
+  i.limits.color_targets = kMaxColorTargets;
+  i.limits.vertex_buffers = kMaxVertexBuffers;
+  i.limits.control_varyings = c.tessellation_shader ? 30 : 0;
+  return i;
+}
+
+// ---- memory ------------------------------------------------------------------------------------------------------------------------------------------
+bool VenusDevice::make_memory(uint64_t size, VkBufferUsageFlags usage, VenusMemory* out) {
+  *out = VenusMemory{};
+  const uint64_t bytes = (size + 4095) & ~uint64_t{4095};
+  VkBufferCreateInfo bi = vk_struct<VkBufferCreateInfo>(VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO);
+  bi.size = bytes;
+  bi.usage = usage | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  if (vk().CreateBuffer(device(), &bi, nullptr, &out->buffer) != VK_SUCCESS) {
+    out->buffer = nullptr;
+    return false;
+  }
+  VkMemoryRequirements req{};
+  vk().GetBufferMemoryRequirements(device(), out->buffer, &req);
+  const int32_t type = ctx_.memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+  VkMemoryAllocateInfo mi = vk_struct<VkMemoryAllocateInfo>(VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO);
+  mi.allocationSize = req.size;
+  mi.memoryTypeIndex = static_cast<uint32_t>(type);
+  void* map = nullptr;
+  if (type < 0 || vk().AllocateMemory(device(), &mi, nullptr, &out->memory) != VK_SUCCESS) {
+    out->memory = nullptr;
+    free_memory(out);
+    return false;
+  }
+  if (vk().BindBufferMemory(device(), out->buffer, out->memory, 0) != VK_SUCCESS || vk().MapMemory(device(), out->memory, 0, VK_WHOLE_SIZE, 0, &map) != VK_SUCCESS || !map) {
+    free_memory(out);
+    return false;
+  }
+  out->map = static_cast<uint8_t*>(map);
+  out->size = bytes;
+  ByteView(out->map, bytes).fill(0);
+  return true;
+}
+
+void VenusDevice::free_memory(VenusMemory* m) {
+  if (!ctx_.opened()) return;
+  if (m->buffer) vk().DestroyBuffer(device(), m->buffer, nullptr);
+  if (m->memory) vk().FreeMemory(device(), m->memory, nullptr);   // (the mapping goes with it)
+  *m = VenusMemory{};
+}
+
+VenusMemory* VenusDevice::staging(uint64_t size) {
+  if (staging_.buffer && staging_.size >= size) return &staging_;
+  uint64_t want = staging_.size ? staging_.size : kStagingStart;
+  while (want < size) {
+    if (want > (uint64_t{1} << 40)) return nullptr;
+    want *= 2;
+  }
+  VenusMemory fresh;
+  if (!make_memory(want, VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT, &fresh)) return nullptr;
+  free_memory(&staging_);
+  staging_ = fresh;
+  return &staging_;
+}
+
+void VenusDevice::add_video_memory(int64_t bytes) {
+  if (bytes >= 0) gpu_.add_resource_bytes(static_cast<uint64_t>(bytes));
+  else gpu_.remove_resource_bytes(static_cast<uint64_t>(-bytes));
+}
+
+bool VenusDevice::lock_queue() {
+  queue_lock_.lock();
+  return true;
+}
+void VenusDevice::unlock_queue() { queue_lock_.unlock(); }
+
+bool VenusDevice::wait_fence(VkFence fence) {
+  // (the backend polls the host; 20 s, as virgl's 3D commands wait for a cold shader compile)
+  const VkResult r = vk().WaitForFences(device(), 1, &fence, VK_TRUE, 20ull * 1000 * 1000 * 1000);
+  vk().ResetFences(device(), 1, &fence);
+  return r == VK_SUCCESS;
+}
+
+bool VenusDevice::begin_once() {
+  lock_queue();
+  const VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, nullptr};
+  if (vk().BeginCommandBuffer(once_, &bi) != VK_SUCCESS) {
+    unlock_queue();
+    return false;
+  }
+  return true;
+}
+
+bool VenusDevice::end_once() {
+  // (everything the copies wrote reaches the host's view before the fence: the CPU reads it after)
+  VkMemoryBarrier2 mb = vk_struct<VkMemoryBarrier2>(VK_STRUCTURE_TYPE_MEMORY_BARRIER_2);
+  mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, mb.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+  mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_2_HOST_BIT;
+  mb.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_HOST_READ_BIT;
+  VkDependencyInfo di = vk_struct<VkDependencyInfo>(VK_STRUCTURE_TYPE_DEPENDENCY_INFO);
+  di.memoryBarrierCount = 1, di.pMemoryBarriers = &mb;
+  vk().CmdPipelineBarrier2(once_, &di);
+  bool ok = vk().EndCommandBuffer(once_) == VK_SUCCESS;
+  if (ok) {
+    VkSubmitInfo si = vk_struct<VkSubmitInfo>(VK_STRUCTURE_TYPE_SUBMIT_INFO);
+    si.commandBufferCount = 1, si.pCommandBuffers = &once_;
+    ok = vk().QueueSubmit(ctx_.queue(), 1, &si, fence_) == VK_SUCCESS && wait_fence(fence_);
+  }
+  vk().ResetCommandBuffer(once_, 0);
+  unlock_queue();
+  return ok;
+}
+
+VkDescriptorPool VenusDevice::descriptor_pool() {
+  // A pool of many sets of every kind; pipelines take their sets from the newest and a new pool is made when it is full (VenusPipeline.cpp).
+  static constexpr uint32_t kSets = 1024;
+  const VkDescriptorPoolSize sizes[] = {
+      {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, kSets},         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kSets * 16}, {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, kSets * 4},
+      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kSets * 8},             {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kSets * 4},           {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, kSets * 4},
+      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kSets * 4},              {VK_DESCRIPTOR_TYPE_SAMPLER, kSets * 4},
+  };
+  VkDescriptorPoolCreateInfo ci = vk_struct<VkDescriptorPoolCreateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO);
+  ci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+  ci.maxSets = kSets;
+  ci.poolSizeCount = sizeof(sizes) / sizeof(sizes[0]);
+  ci.pPoolSizes = sizes;
+  VkDescriptorPool p = nullptr;
+  if (vk().CreateDescriptorPool(device(), &ci, nullptr, &p) != VK_SUCCESS) return nullptr;
+  if (!pools_.push_back(p)) {
+    vk().DestroyDescriptorPool(device(), p, nullptr);
+    return nullptr;
+  }
+  return p;
+}
+
+VkQueryPool VenusDevice::query_pool(QueryPoolKind kind) {
+  if (pools_by_kind_[kind]) return pools_by_kind_[kind];
+  VkQueryPoolCreateInfo ci = vk_struct<VkQueryPoolCreateInfo>(VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO);
+  ci.queryCount = kind == kPoolTimestamps ? kTimestamps : kQuerySegments;
+  switch (kind) {
+    case kPoolOcclusion: ci.queryType = VK_QUERY_TYPE_OCCLUSION; break;
+    case kPoolStatistics:
+      if (!ctx_.caps().pipeline_statistics_query) return nullptr;
+      ci.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS;
+      ci.pipelineStatistics = 0x7FF;   // (all eleven, in Direct3D's order: VkQueryPipelineStatisticFlagBits come in the same)
+      break;
+    case kPoolStreams:
+      if (!ctx_.caps().transform_feedback) return nullptr;
+      ci.queryType = VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT;
+      break;
+    default: ci.queryType = VK_QUERY_TYPE_TIMESTAMP; break;
+  }
+  if (vk().CreateQueryPool(device(), &ci, nullptr, &pools_by_kind_[kind]) != VK_SUCCESS) pools_by_kind_[kind] = nullptr;
+  return pools_by_kind_[kind];
+}
+
+VenusMemory* VenusDevice::stream_output_counters() {
+  if (!so_counters_.buffer && !make_memory(kStreamOutputCounters * 4, VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT, &so_counters_)) return nullptr;
+  return &so_counters_;
+}
+
+// ---- formats ---------------------------------------------------------------------------------------------------------------------------------------
+VkFormat VenusDevice::vk_format(Format f, bool storage, bool* swap_rb) const {
+  *swap_rb = false;
+  switch (f) {
+    case Format::B8G8R8A8Unorm:
+      if (storage) {   // (a storage image of 8-bit colour is RGBA: BGRA is not a storage format Vulkan promises; the CPU turns red and blue around)
+        *swap_rb = true;
+        return VK_FORMAT_R8G8B8A8_UNORM;
+      }
+      return VK_FORMAT_B8G8R8A8_UNORM;
+    case Format::R8G8B8A8Unorm: *swap_rb = true; return VK_FORMAT_R8G8B8A8_UNORM;
+    case Format::B8G8R8A8Srgb: return VK_FORMAT_B8G8R8A8_SRGB;
+    case Format::R8G8B8A8Srgb: *swap_rb = true; return VK_FORMAT_R8G8B8A8_SRGB;
+    case Format::D32Float: return VK_FORMAT_D32_SFLOAT;
+    case Format::R16G16B16A16Float: return VK_FORMAT_R16G16B16A16_SFLOAT;
+    case Format::R32G32B32A32Float: return VK_FORMAT_R32G32B32A32_SFLOAT;
+    case Format::R16G16B16A16Unorm: return VK_FORMAT_R16G16B16A16_UNORM;
+    case Format::R32G32B32A32Uint: return VK_FORMAT_R32G32B32A32_UINT;
+    case Format::R32G32B32A32Sint: return VK_FORMAT_R32G32B32A32_SINT;
+    case Format::R16G16B16A16Uint: return VK_FORMAT_R16G16B16A16_UINT;
+    case Format::R16G16B16A16Sint: return VK_FORMAT_R16G16B16A16_SINT;
+    case Format::R8G8B8A8Uint: return VK_FORMAT_R8G8B8A8_UINT;
+    case Format::R16G16B16A16Snorm: return VK_FORMAT_R16G16B16A16_SNORM;
+    case Format::R10G10B10A2Unorm: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    case Format::Bc1Unorm: return VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+    case Format::Bc2Unorm: return VK_FORMAT_BC2_UNORM_BLOCK;
+    case Format::Bc3Unorm: return VK_FORMAT_BC3_UNORM_BLOCK;
+    case Format::Bc1Srgb: return VK_FORMAT_BC1_RGBA_SRGB_BLOCK;
+    case Format::Bc2Srgb: return VK_FORMAT_BC2_SRGB_BLOCK;
+    case Format::Bc3Srgb: return VK_FORMAT_BC3_SRGB_BLOCK;
+    case Format::R32Uint: return VK_FORMAT_R32_UINT;
+    case Format::R32Sint: return VK_FORMAT_R32_SINT;
+    case Format::R32Float: return VK_FORMAT_R32_SFLOAT;
+    case Format::R8Unorm: return VK_FORMAT_R8_UNORM;
+    case Format::R8G8Unorm: return VK_FORMAT_R8G8_UNORM;
+    case Format::A8Unorm: return VK_FORMAT_R8_UNORM;   // (sampled through a view that reads (0, 0, 0, r))
+    case Format::B5G6R5Unorm: return VK_FORMAT_R5G6B5_UNORM_PACK16;
+    case Format::B5G5R5A1Unorm: return VK_FORMAT_A1R5G5B5_UNORM_PACK16;
+    case Format::B4G4R4A4Unorm: return VK_FORMAT_A4R4G4B4_UNORM_PACK16;
+    case Format::R8Snorm: return VK_FORMAT_R8_SNORM;
+    case Format::R8Uint: return VK_FORMAT_R8_UINT;
+    case Format::R8Sint: return VK_FORMAT_R8_SINT;
+    case Format::R8G8Snorm: return VK_FORMAT_R8G8_SNORM;
+    case Format::R8G8Uint: return VK_FORMAT_R8G8_UINT;
+    case Format::R8G8Sint: return VK_FORMAT_R8G8_SINT;
+    case Format::R8G8B8A8Snorm: return VK_FORMAT_R8G8B8A8_SNORM;
+    case Format::R8G8B8A8Sint: return VK_FORMAT_R8G8B8A8_SINT;
+    case Format::R16Unorm: return VK_FORMAT_R16_UNORM;
+    case Format::R16Snorm: return VK_FORMAT_R16_SNORM;
+    case Format::R16Uint: return VK_FORMAT_R16_UINT;
+    case Format::R16Sint: return VK_FORMAT_R16_SINT;
+    case Format::R16Float: return VK_FORMAT_R16_SFLOAT;
+    case Format::R16G16Unorm: return VK_FORMAT_R16G16_UNORM;
+    case Format::R16G16Snorm: return VK_FORMAT_R16G16_SNORM;
+    case Format::R16G16Uint: return VK_FORMAT_R16G16_UINT;
+    case Format::R16G16Sint: return VK_FORMAT_R16G16_SINT;
+    case Format::R16G16Float: return VK_FORMAT_R16G16_SFLOAT;
+    case Format::R32G32Uint: return VK_FORMAT_R32G32_UINT;
+    case Format::R32G32Sint: return VK_FORMAT_R32G32_SINT;
+    case Format::R32G32Float: return VK_FORMAT_R32G32_SFLOAT;
+    case Format::R32G32B32Uint: return VK_FORMAT_R32G32B32_UINT;
+    case Format::R32G32B32Sint: return VK_FORMAT_R32G32B32_SINT;
+    case Format::R32G32B32Float: return VK_FORMAT_R32G32B32_SFLOAT;
+    case Format::R11G11B10Float: return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+    case Format::R9G9B9E5Float: return VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
+    case Format::R10G10B10A2Uint: return VK_FORMAT_A2B10G10R10_UINT_PACK32;
+    case Format::Bc4Unorm: return VK_FORMAT_BC4_UNORM_BLOCK;
+    case Format::Bc4Snorm: return VK_FORMAT_BC4_SNORM_BLOCK;
+    case Format::Bc5Unorm: return VK_FORMAT_BC5_UNORM_BLOCK;
+    case Format::Bc5Snorm: return VK_FORMAT_BC5_SNORM_BLOCK;
+    case Format::Bc6hUfloat: return VK_FORMAT_BC6H_UFLOAT_BLOCK;
+    case Format::Bc6hSfloat: return VK_FORMAT_BC6H_SFLOAT_BLOCK;
+    case Format::Bc7Unorm: return VK_FORMAT_BC7_UNORM_BLOCK;
+    case Format::Bc7Srgb: return VK_FORMAT_BC7_SRGB_BLOCK;
+    default: return VK_FORMAT_UNDEFINED;
+  }
+}
+
+bool VenusDevice::format_supports(VkFormat f, VkFormatFeatureFlags features) const {
+  if (f == VK_FORMAT_UNDEFINED) return false;
+  VkFormatProperties p{};
+  vk().GetPhysicalDeviceFormatProperties(ctx_.physical(), f, &p);
+  return (p.optimalTilingFeatures & features) == features;
+}
+
+uint32_t VenusDevice::format_caps(Format format) const {
+  // (as VirglDevice: only the formats numbered from 64 answer; the others are described by the features)
+  if (static_cast<uint32_t>(format) < 64) return 0;
+  bool swap = false;
+  const VkFormat f = vk_format(format, false, &swap);
+  if (!format_supports(f, VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) return 0;
+  if (is_compressed_format(format)) return kFormatSampled | kFormatFiltered | kFormatMipmaps | kFormatNative;
+  uint32_t caps = kFormatSampled | kFormatMipmaps;
+  if (!is_integer_format(format) && format_supports(f, VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)) caps |= kFormatFiltered;
+  if (format != Format::A8Unorm && format != Format::R9G9B9E5Float && format_supports(f, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) {
+    caps |= kFormatRenderTarget;
+    if (!is_integer_format(format) && format_supports(f, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT)) caps |= kFormatBlendable;
+  }
+  const bool storable = format != Format::A8Unorm && format != Format::B5G6R5Unorm && format != Format::B5G5R5A1Unorm && format != Format::B4G4R4A4Unorm &&
+                        format != Format::R9G9B9E5Float && format != Format::R32G32B32Uint && format != Format::R32G32B32Sint && format != Format::R32G32B32Float;
+  if (storable && format_supports(f, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) caps |= kFormatStorage;
+  return caps;
+}
+
+uint32_t VenusDevice::max_image_dimension() const { return max_image_dimension_ < 4096 ? 4096 : max_image_dimension_; }
+
+// ---- samplers ----------------------------------------------------------------------------------------------------------------------------------------
+namespace {
+VkSamplerAddressMode address_mode(AddressMode m) {
+  switch (m) {
+    case AddressMode::Repeat: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    case AddressMode::ClampToEdge: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    case AddressMode::MirrorRepeat: return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+    case AddressMode::ClampToBorder: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    case AddressMode::MirrorOnce: return VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE;
+  }
+  return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+}
+bool same_sampler(const SamplerDesc& a, const SamplerDesc& b) {
+  return a.filter == b.filter && a.address_u == b.address_u && a.address_v == b.address_v && a.border == b.border && a.mip_filter == b.mip_filter &&
+         __builtin_memcmp(&a.lod_bias, &b.lod_bias, 4) == 0 && __builtin_memcmp(&a.min_lod, &b.min_lod, 4) == 0 && __builtin_memcmp(&a.max_lod, &b.max_lod, 4) == 0 &&
+         a.max_anisotropy == b.max_anisotropy && a.custom_border == b.custom_border && __builtin_memcmp(a.border_rgba, b.border_rgba, 16) == 0;
+}
+float clamp_lod(float v, float lo, float hi) { return !(v >= lo) ? lo : v > hi ? hi : v; }
+}  // namespace
+
+// The sampler of a SamplerDesc (VirglDevice's rules: integer textures point-sampled, r always clamped to the edge, no comparison - the shaders compare -, a border
+// only when an axis clamps to it, anisotropy only with linear filtering). Made once each.
+VkSampler VenusDevice::sampler_for(const SamplerDesc& d, bool integer) {
+  for (const CachedSampler& c : samplers_)
+    if (c.integer == integer && same_sampler(c.desc, d)) return c.sampler;
+  VkSamplerCreateInfo si = vk_struct<VkSamplerCreateInfo>(VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO);
+  const bool linear = d.filter == Filter::Linear && !integer;
+  si.magFilter = si.minFilter = linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+  si.mipmapMode = d.mip_filter == MipFilter::Linear && !integer ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
+  si.addressModeU = address_mode(d.address_u);
+  si.addressModeV = address_mode(d.address_v);
+  si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  if (d.mip_filter == MipFilter::None) {
+    si.minLod = si.maxLod = 0, si.mipLodBias = 0;
+  } else {
+    si.mipLodBias = clamp_lod(d.lod_bias, -16, 16);
+    si.minLod = clamp_lod(d.min_lod, 0, 16);
+    si.maxLod = clamp_lod(d.max_lod, 0, 16);
+    if (si.maxLod < si.minLod) si.maxLod = si.minLod;
+  }
+  if (linear && d.max_anisotropy > 1 && ctx_.caps().sampler_anisotropy) {
+    si.anisotropyEnable = VK_TRUE;
+    const float most = ctx_.caps().max_anisotropy < 16 ? ctx_.caps().max_anisotropy : 16;
+    si.maxAnisotropy = d.max_anisotropy > most ? most : d.max_anisotropy;
+  }
+  VkSamplerCustomBorderColorCreateInfoEXT custom = vk_struct<VkSamplerCustomBorderColorCreateInfoEXT>(VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT);
+  const bool border = d.address_u == AddressMode::ClampToBorder || d.address_v == AddressMode::ClampToBorder;
+  if (border) {
+    if (d.custom_border && ctx_.caps().custom_border_color) {
+      si.borderColor = integer ? VK_BORDER_COLOR_INT_CUSTOM_EXT : VK_BORDER_COLOR_FLOAT_CUSTOM_EXT;
+      __builtin_memcpy(custom.customBorderColor.uint32, d.border_rgba, 16);   // (the 32-bit patterns as given: integer textures see the integer bits)
+      custom.format = VK_FORMAT_UNDEFINED;
+      si.pNext = &custom;
+    } else {
+      const BorderColor b = d.border;
+      si.borderColor = b == BorderColor::OpaqueWhite ? (integer ? VK_BORDER_COLOR_INT_OPAQUE_WHITE : VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE)
+                       : b == BorderColor::OpaqueBlack ? (integer ? VK_BORDER_COLOR_INT_OPAQUE_BLACK : VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK)
+                                                       : (integer ? VK_BORDER_COLOR_INT_TRANSPARENT_BLACK : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK);
+    }
+  }
+  VkSampler s = nullptr;
+  if (vk().CreateSampler(device(), &si, nullptr, &s) != VK_SUCCESS) return nullptr;
+  CachedSampler c;
+  c.desc = d, c.integer = integer, c.sampler = s;
+  if (!samplers_.push_back(c)) {
+    vk().DestroySampler(device(), s, nullptr);
+    return nullptr;
+  }
+  return s;
+}
+
+// ---- buffers -----------------------------------------------------------------------------------------------------------------------------------------
+IBuffer* VenusDevice::create_buffer(uint64_t size, uint32_t usage) {
+  if (size == 0 || size > 0x7FFFFFFFu) return nullptr;
+  (void)usage;
+  VkBufferUsageFlags u = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                         VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+  if (ctx_.caps().transform_feedback) u |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT | VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT;
+  if (ctx_.caps().conditional_rendering) u |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
+  void* memory = allocator_.allocate_aligned(sizeof(VenusBuffer), alignof(VenusBuffer));
+  if (!memory) return nullptr;
+  VenusBuffer* b = new (memory) VenusBuffer(*this, size);
+  if (!make_memory(size, u, &b->memory_)) {
+    b->~VenusBuffer();
+    allocator_.deallocate(memory);
+    return nullptr;
+  }
+  add_video_memory(static_cast<int64_t>(size));
+  return b;
+}
+
+void VenusDevice::destroy_buffer(IBuffer* buffer) {
+  if (!buffer) return;
+  VenusBuffer* b = static_cast<VenusBuffer*>(buffer);
+  add_video_memory(-static_cast<int64_t>(b->size()));
+  free_memory(&b->memory_);
+  b->~VenusBuffer();
+  allocator_.deallocate(b);
+}
+
+ByteView VenusBuffer::map() { return ByteView(memory_.map, size_); }
+
+// ---- images ------------------------------------------------------------------------------------------------------------------------------------------
+IImage* VenusDevice::create_image(const ImageDesc& desc) {
+  void* memory = allocator_.allocate_aligned(sizeof(VenusImage), alignof(VenusImage));
+  if (!memory) return nullptr;
+  VenusImage* image = new (memory) VenusImage(*this, desc);
+  if (!image->create()) {
+    image->~VenusImage();
+    allocator_.deallocate(memory);
+    return nullptr;
+  }
+  return image;
+}
+
+void VenusDevice::destroy_image(IImage* image) {
+  if (!image) return;
+  VenusImage* v = static_cast<VenusImage*>(image);
+  v->~VenusImage();
+  allocator_.deallocate(v);
+}
+
+VenusImage::VenusImage(VenusDevice& device, const ImageDesc& desc) : device_(device), desc_(desc), views_(device.allocator()), targets_(device.allocator()) {}
+
+VenusImage::~VenusImage() {
+  const TcosKernelVulkan& vk = device_.vk();
+  for (const View& v : views_) vk.DestroyImageView(device_.device(), v.view, nullptr);
+  for (const Target& t : targets_) vk.DestroyImageView(device_.device(), t.view, nullptr);
+  if (image_) vk.DestroyImage(device_.device(), image_, nullptr);
+  if (memory_) vk.FreeMemory(device_.device(), memory_, nullptr);
+  if (accounted_) device_.add_video_memory(-static_cast<int64_t>(accounted_));
+}
+
+// The same refusals as VirglDevice::create_image (the kernel probes them), then the image.
+bool VenusImage::create() {
+  const ImageDesc& d = desc_;
+  const bool compressed = is_compressed_format(d.format);
+  const bool depth = d.format == Format::D32Float;
+  const bool storage = (d.usage & kImageStorage) != 0;
+  if (d.extent.width == 0 || d.extent.height == 0 || d.format == Format::Undefined) return false;
+  if (d.extent.width > device_.max_image_dimension() || d.extent.height > device_.max_image_dimension()) return false;
+  if (d.mip_levels == 0 || d.mip_levels > mip_level_limit(d.extent)) return false;
+  if (d.kind == TextureKind::Texture2DMS) return false;
+  if (d.kind == TextureKind::TextureCubeArray && (d.layers == 0 || d.layers % 6 != 0)) return false;
+  if (d.kind != TextureKind::Texture2D && (d.layers == 0 || d.layers > kMaxTextureLayers)) return false;
+  if (d.kind == TextureKind::Texture2D && d.layers != 1) return false;
+  if ((d.kind == TextureKind::TextureCube || d.kind == TextureKind::TextureCubeArray) && d.extent.width != d.extent.height) return false;
+  if (d.stencil && !depth) return false;
+  if ((d.usage & kImageSampled) && (d.usage & kImagePresent)) return false;   // (as VirglDevice: callers render into a present image and copy)
+  if (static_cast<uint32_t>(d.format) >= 64) {
+    const uint32_t caps = device_.format_caps(d.format);
+    if (!(caps & kFormatSampled) || ((d.usage & kImageColorAttachment) && !(caps & kFormatRenderTarget)) || (storage && !(caps & kFormatStorage)) ||
+        (d.mip_levels > 1 && !(caps & kFormatMipmaps)) || d.samples != 1)
+      return false;
+  }
+  if (compressed && (d.usage != kImageSampled || d.samples != 1)) return false;
+  if (storage && (!(d.usage & kImageSampled) || d.samples != 1 || depth || is_srgb_format(d.format))) return false;
+  if (d.samples != 1) {
+    if (!(device_.info().sample_counts & (1u << d.samples)) || d.kind != TextureKind::Texture2D || d.mip_levels != 1 || (d.usage & (kImagePresent | kImageStorage))) return false;
+    if (depth ? (d.usage & ~(kImageDepthAttachment)) != 0 : !(d.usage & kImageColorAttachment)) return false;
+  }
+  if ((d.usage & kImageSampled) && depth && (d.samples != 1 || (d.usage & ~(kImageSampled | kImageDepthAttachment)))) return false;
+  if (d.format == Format::A8Unorm && (d.usage & kImageColorAttachment)) return false;
+
+  format_ = device_.vk_format(d.format, storage, &swap_rb_);
+  if (depth && d.stencil) format_ = VK_FORMAT_D32_SFLOAT_S8_UINT;
+  if (format_ == VK_FORMAT_UNDEFINED) return false;
+  aspect_ = depth ? (d.stencil ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT) : VK_IMAGE_ASPECT_COLOR_BIT;
+  layers_ = image_layer_count(d.kind, d.layers);
+  VkImageCreateInfo ci = vk_struct<VkImageCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO);
+  ci.imageType = d.kind == TextureKind::Texture3D ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
+  ci.format = format_;
+  ci.extent = {d.extent.width, d.extent.height, d.kind == TextureKind::Texture3D ? d.layers : 1u};
+  ci.mipLevels = d.mip_levels;
+  ci.arrayLayers = d.kind == TextureKind::Texture3D ? 1 : layers_;
+  ci.samples = static_cast<VkSampleCountFlagBits>(d.samples);
+  ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+  ci.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  if (d.usage & kImageSampled) ci.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+  if (d.usage & kImageColorAttachment) ci.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+  if (d.usage & kImageDepthAttachment) ci.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+  if (storage) ci.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+  if (d.samples != 1 && !depth) ci.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;   // (Texture2DMS units fetch from it)
+  // (a 2D array of square faces in sixes may be seen as a cube; a storage image may be seen in another format of its size)
+  if (ci.imageType == VK_IMAGE_TYPE_2D && layers_ >= 6 && d.extent.width == d.extent.height && d.samples == 1) ci.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+  if (storage || (d.usage & kImageSampled)) ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+  if (ci.imageType == VK_IMAGE_TYPE_3D && (d.usage & (kImageColorAttachment | kImageDepthAttachment))) ci.flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
+  ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  const TcosKernelVulkan& vk = device_.vk();
+  if (vk.CreateImage(device_.device(), &ci, nullptr, &image_) != VK_SUCCESS) {
+    image_ = nullptr;
+    return false;
+  }
+  VkMemoryRequirements req{};
+  vk.GetImageMemoryRequirements(device_.device(), image_, &req);
+  const int32_t type = device_.context().memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  const int32_t any = type >= 0 ? type : device_.context().memory_type(req.memoryTypeBits, 0);
+  VkMemoryAllocateInfo mi = vk_struct<VkMemoryAllocateInfo>(VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO);
+  mi.allocationSize = req.size;
+  mi.memoryTypeIndex = static_cast<uint32_t>(any);
+  if (any < 0 || vk.AllocateMemory(device_.device(), &mi, nullptr, &memory_) != VK_SUCCESS) {
+    memory_ = nullptr;
+    return false;
+  }
+  if (vk.BindImageMemory(device_.device(), image_, memory_, 0) != VK_SUCCESS) return false;
+  accounted_ = req.size;
+  device_.add_video_memory(static_cast<int64_t>(accounted_));
+  // In GENERAL from here on, cleared to zero (what a fresh image holds on every device of this system).
+  return device_.run_once([&](VkCommandBuffer cb) {
+    VkImageMemoryBarrier2 b = vk_struct<VkImageMemoryBarrier2>(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2);
+    b.srcStageMask = VK_PIPELINE_STAGE_2_NONE, b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    b.dstAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = image_;
+    b.subresourceRange = {aspect_, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+    VkDependencyInfo di = vk_struct<VkDependencyInfo>(VK_STRUCTURE_TYPE_DEPENDENCY_INFO);
+    di.imageMemoryBarrierCount = 1, di.pImageMemoryBarriers = &b;
+    vk.CmdPipelineBarrier2(cb, &di);
+    const VkImageSubresourceRange range = {aspect_, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+    if (compressed) return;   // (only copies may write a compressed image)
+    if (depth) {
+      const VkClearDepthStencilValue z = {0.0f, 0};
+      vk.CmdClearDepthStencilImage(cb, image_, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &range);
+    } else {
+      const VkClearColorValue c = {};
+      vk.CmdClearColorImage(cb, image_, VK_IMAGE_LAYOUT_GENERAL, &c, 1, &range);
+    }
+  });
+}
+
+uint32_t VenusImage::level_layers(uint32_t level) const { return level_layer_count(desc_.kind, desc_.layers, level); }
+
+// Copies between the staging buffer and one level of one layer (a volume's slice); the staging buffer holds `width * height` texels of `texel` bytes (blocks for
+// a compressed image) from offset 0.
+bool VenusImage::copy(bool to_image, uint32_t level, uint32_t layer, uint32_t row_texels) {
+  const uint32_t width = mip_extent(desc_.extent.width, level), height = mip_extent(desc_.extent.height, level);
+  VenusMemory* staging = device_.staging(0);
+  if (!staging) return false;
+  VkBufferImageCopy region{};
+  region.bufferOffset = 0;
+  region.bufferRowLength = row_texels;
+  region.bufferImageHeight = 0;
+  const bool volume = desc_.kind == TextureKind::Texture3D;
+  const VkImageAspectFlags aspect = (aspect_ & VK_IMAGE_ASPECT_DEPTH_BIT) ? static_cast<VkImageAspectFlags>(VK_IMAGE_ASPECT_DEPTH_BIT) : aspect_;
+  region.imageSubresource = {aspect, level, volume ? 0u : layer, 1};
+  region.imageOffset = {0, 0, volume ? static_cast<int32_t>(layer) : 0};
+  region.imageExtent = {width, height, 1};
+  const TcosKernelVulkan& vk = device_.vk();
+  VkImage image = image_;
+  VkBuffer buffer = staging->buffer;
+  return device_.run_once([&](VkCommandBuffer cb) {
+    VkMemoryBarrier2 mb = vk_struct<VkMemoryBarrier2>(VK_STRUCTURE_TYPE_MEMORY_BARRIER_2);
+    mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_2_HOST_BIT, mb.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_HOST_WRITE_BIT;
+    mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, mb.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    VkDependencyInfo di = vk_struct<VkDependencyInfo>(VK_STRUCTURE_TYPE_DEPENDENCY_INFO);
+    di.memoryBarrierCount = 1, di.pMemoryBarriers = &mb;
+    vk.CmdPipelineBarrier2(cb, &di);
+    if (to_image) vk.CmdCopyBufferToImage(cb, buffer, image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    else vk.CmdCopyImageToBuffer(cb, image, VK_IMAGE_LAYOUT_GENERAL, buffer, 1, &region);
+  });
+}
+
+// 0xAARRGGBB words into the staging buffer as the image keeps them; its texel bytes (0: they do not fit or the format is wide).
+uint32_t VenusImage::stage(ArrayView<const uint32_t> pixels) {
+  if (is_wide_format(desc_.format) || is_compressed_format(desc_.format) || desc_.format == Format::D32Float) return 0;
+  const uint32_t texel = is_packed32_format(desc_.format) ? bytes_per_pixel(desc_.format) : 4u;
+  VenusMemory* s = device_.staging(pixels.size() * texel);
+  if (!s) return 0;
+  ByteWriter out{ByteView(s->map, s->size)};
+  for (const uint32_t p : pixels) {
+    if (texel == 4) out.le32(swap_rb_ ? (p & 0xFF00FF00u) | ((p & 0xFF) << 16) | ((p >> 16) & 0xFF) : p);
+    else if (desc_.format == Format::A8Unorm) out.u8(static_cast<uint8_t>(p >> 24));
+    else if (texel == 1) out.u8(static_cast<uint8_t>(packed32_from_argb(desc_.format, p)));
+    else out.le16(static_cast<uint16_t>(packed32_from_argb(desc_.format, p)));
+  }
+  return out.ok() ? texel : 0;
+}
+
+bool VenusImage::unstage(ArrayView<uint32_t> out) {
+  const uint32_t texel = is_packed32_format(desc_.format) ? bytes_per_pixel(desc_.format) : 4u;
+  VenusMemory* s = device_.staging(out.size() * texel);
+  if (!s) return false;
+  ByteReader in{ConstByteView(s->map, s->size)};
+  for (uint32_t& p : out) {
+    if (texel == 4) {
+      const uint32_t w = in.le32();
+      p = swap_rb_ ? (w & 0xFF00FF00u) | ((w & 0xFF) << 16) | ((w >> 16) & 0xFF) : w;
+    } else if (desc_.format == Format::A8Unorm) {
+      p = static_cast<uint32_t>(in.u8()) << 24;
+    } else {
+      p = packed32_to_argb(desc_.format, texel == 1 ? in.u8() : in.le16());
+    }
+  }
+  return in.ok();
+}
+
+bool VenusImage::stage_wide(ArrayView<const Vec4> pixels) {
+  VenusMemory* s = device_.staging(pixels.size() * bytes_per_pixel(desc_.format));
+  if (!s) return false;
+  ByteWriter out{ByteView(s->map, s->size)};
+  for (const Vec4& c : pixels) encode_wide_pixel(desc_.format, c, out);
+  return out.ok();
+}
+
+bool VenusImage::unstage_wide(ArrayView<Vec4> out) {
+  VenusMemory* s = device_.staging(out.size() * bytes_per_pixel(desc_.format));
+  if (!s) return false;
+  ByteReader in{ConstByteView(s->map, s->size)};
+  for (Vec4& c : out) c = decode_wide_pixel(desc_.format, in);
+  return in.ok();
+}
+
+bool VenusImage::transferable(uint32_t level, uint32_t layer, uint64_t count) const {
+  if (desc_.samples != 1 || level >= desc_.mip_levels || layer >= level_layers(level)) return false;
+  return count == uint64_t{mip_extent(desc_.extent.width, level)} * mip_extent(desc_.extent.height, level);
+}
+
+bool VenusImage::write_subresource(uint32_t level, uint32_t layer, ArrayView<const uint32_t> pixels) {
+  if (!transferable(level, layer, pixels.size()) || is_wide_format(desc_.format)) return false;
+  const uint32_t width = mip_extent(desc_.extent.width, level);
+  return stage(pixels) != 0 && copy(true, level, layer, width);
+}
+
+bool VenusImage::read_subresource(uint32_t level, uint32_t layer, ArrayView<uint32_t> out) {
+  if (!transferable(level, layer, out.size()) || is_wide_format(desc_.format) || is_compressed_format(desc_.format) || desc_.format == Format::D32Float) return false;
+  const uint32_t width = mip_extent(desc_.extent.width, level);
+  const uint32_t texel = is_packed32_format(desc_.format) ? bytes_per_pixel(desc_.format) : 4u;
+  if (!device_.staging(out.size() * texel)) return false;
+  return copy(false, level, layer, width) && unstage(out);
+}
+
+bool VenusImage::write_subresource_float(uint32_t level, uint32_t layer, ArrayView<const Vec4> pixels) {
+  if (!transferable(level, layer, pixels.size()) || !is_wide_format(desc_.format)) return false;
+  return stage_wide(pixels) && copy(true, level, layer, mip_extent(desc_.extent.width, level));
+}
+
+bool VenusImage::read_subresource_float(uint32_t level, uint32_t layer, ArrayView<Vec4> out) {
+  if (!transferable(level, layer, out.size()) || !is_wide_format(desc_.format)) return false;
+  if (!device_.staging(out.size() * bytes_per_pixel(desc_.format))) return false;
+  return copy(false, level, layer, mip_extent(desc_.extent.width, level)) && unstage_wide(out);
+}
+
+bool VenusImage::read_pixels(ArrayView<uint32_t> out) { return read_subresource(0, 0, out); }
+bool VenusImage::write_pixels(ArrayView<const uint32_t> pixels) { return write_subresource(0, 0, pixels); }
+bool VenusImage::read_pixels_float(ArrayView<Vec4> out) { return read_subresource_float(0, 0, out); }
+bool VenusImage::write_pixels_float(ArrayView<const Vec4> pixels) { return write_subresource_float(0, 0, pixels); }
+bool VenusImage::write_layer_pixels(uint32_t layer, ArrayView<const uint32_t> pixels) { return desc_.kind != TextureKind::Texture2D && write_subresource(0, layer, pixels); }
+bool VenusImage::read_layer_pixels(uint32_t layer, ArrayView<uint32_t> out) { return desc_.kind != TextureKind::Texture2D && read_subresource(0, layer, out); }
+bool VenusImage::write_layer_pixels_float(uint32_t layer, ArrayView<const Vec4> pixels) {
+  return desc_.kind != TextureKind::Texture2D && write_subresource_float(0, layer, pixels);
+}
+bool VenusImage::read_layer_pixels_float(uint32_t layer, ArrayView<Vec4> out) { return desc_.kind != TextureKind::Texture2D && read_subresource_float(0, layer, out); }
+bool VenusImage::write_mip_pixels(uint32_t level, ArrayView<const uint32_t> pixels) { return desc_.kind == TextureKind::Texture2D && write_subresource(level, 0, pixels); }
+bool VenusImage::read_mip_pixels(uint32_t level, ArrayView<uint32_t> out) { return desc_.kind == TextureKind::Texture2D && read_subresource(level, 0, out); }
+
+bool VenusImage::write_rect(const Rect2D& area, ArrayView<const uint32_t> pixels, uint32_t pitch) {
+  if (area.width == 0 || area.height == 0 || area.x < 0 || area.y < 0 || pitch < area.width || desc_.samples != 1) return false;
+  if (static_cast<uint64_t>(area.x) + area.width > desc_.extent.width || static_cast<uint64_t>(area.y) + area.height > desc_.extent.height) return false;
+  if (is_wide_format(desc_.format) || is_compressed_format(desc_.format) || desc_.format == Format::D32Float) return false;
+  const uint64_t last = uint64_t{area.height - 1} * pitch + area.width;
+  if (pixels.size() < last) return false;
+  const uint32_t texel = is_packed32_format(desc_.format) ? bytes_per_pixel(desc_.format) : 4u;
+  VenusMemory* s = device_.staging(uint64_t{area.width} * area.height * texel);
+  if (!s) return false;
+  // (the rectangle's rows one after another, then one copy)
+  for (uint32_t y = 0; y < area.height; ++y) {
+    ArrayView<const uint32_t> row = pixels.subview(uint64_t{y} * pitch, area.width);
+    ByteWriter out{ByteView(s->map + uint64_t{y} * area.width * texel, uint64_t{area.width} * texel)};
+    for (const uint32_t p : row) {
+      if (texel == 4) out.le32(swap_rb_ ? (p & 0xFF00FF00u) | ((p & 0xFF) << 16) | ((p >> 16) & 0xFF) : p);
+      else if (desc_.format == Format::A8Unorm) out.u8(static_cast<uint8_t>(p >> 24));
+      else if (texel == 1) out.u8(static_cast<uint8_t>(packed32_from_argb(desc_.format, p)));
+      else out.le16(static_cast<uint16_t>(packed32_from_argb(desc_.format, p)));
+    }
+    if (!out.ok()) return false;
+  }
+  VkBufferImageCopy region{};
+  region.bufferRowLength = area.width;
+  region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  region.imageOffset = {area.x, area.y, 0};
+  region.imageExtent = {area.width, area.height, 1};
+  const TcosKernelVulkan& vk = device_.vk();
+  VkImage image = image_;
+  VkBuffer buffer = s->buffer;
+  return device_.run_once([&](VkCommandBuffer cb) {
+    VkMemoryBarrier2 mb = vk_struct<VkMemoryBarrier2>(VK_STRUCTURE_TYPE_MEMORY_BARRIER_2);
+    mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_2_HOST_BIT, mb.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_HOST_WRITE_BIT;
+    mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, mb.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    VkDependencyInfo di = vk_struct<VkDependencyInfo>(VK_STRUCTURE_TYPE_DEPENDENCY_INFO);
+    di.memoryBarrierCount = 1, di.pMemoryBarriers = &mb;
+    vk.CmdPipelineBarrier2(cb, &di);
+    vk.CmdCopyBufferToImage(cb, buffer, image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+  });
+}
+
+bool VenusImage::write_compressed(uint32_t level, uint32_t layer, ConstByteView blocks) {
+  if (!is_compressed_format(desc_.format) || level >= desc_.mip_levels || layer >= level_layers(level)) return false;
+  const uint32_t width = mip_extent(desc_.extent.width, level), height = mip_extent(desc_.extent.height, level);
+  if (blocks.size() != compressed_image_bytes(desc_.format, width, height)) return false;
+  VenusMemory* s = device_.staging(blocks.size());
+  if (!s || !ByteView(s->map, blocks.size()).copy_from(blocks)) return false;
+  return copy(true, level, layer, (width + 3) & ~3u);
+}
+
+// Every level above 0 from the one before it, by linear blits (Vulkan's box filter for a halving): every layer its own chain, a volume's levels from its slices.
+bool VenusImage::generate_mipmaps() {
+  if (desc_.mip_levels < 2 || is_compressed_format(desc_.format) || desc_.format == Format::D32Float || is_integer_format(desc_.format)) return false;
+  if (!device_.format_supports(format_, VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)) return false;
+  const TcosKernelVulkan& vk = device_.vk();
+  const bool volume = desc_.kind == TextureKind::Texture3D;
+  return device_.run_once([&](VkCommandBuffer cb) {
+    for (uint32_t level = 1; level < desc_.mip_levels; ++level) {
+      VkMemoryBarrier2 mb = vk_struct<VkMemoryBarrier2>(VK_STRUCTURE_TYPE_MEMORY_BARRIER_2);
+      mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_2_HOST_BIT, mb.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_HOST_WRITE_BIT;
+      mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, mb.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT;
+      VkDependencyInfo di = vk_struct<VkDependencyInfo>(VK_STRUCTURE_TYPE_DEPENDENCY_INFO);
+      di.memoryBarrierCount = 1, di.pMemoryBarriers = &mb;
+      vk.CmdPipelineBarrier2(cb, &di);
+      VkImageBlit blit{};
+      blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level - 1, 0, volume ? 1u : layers_};
+      blit.srcOffsets[1] = {static_cast<int32_t>(mip_extent(desc_.extent.width, level - 1)), static_cast<int32_t>(mip_extent(desc_.extent.height, level - 1)),
+                            volume ? static_cast<int32_t>(level_layers(level - 1)) : 1};
+      blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, volume ? 1u : layers_};
+      blit.dstOffsets[1] = {static_cast<int32_t>(mip_extent(desc_.extent.width, level)), static_cast<int32_t>(mip_extent(desc_.extent.height, level)),
+                            volume ? static_cast<int32_t>(level_layers(level)) : 1};
+      vk.CmdBlitImage(cb, image_, VK_IMAGE_LAYOUT_GENERAL, image_, VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_LINEAR);
+    }
+  });
+}
+
+// A view of the image for sampling: its kind, levels and layers (made once each). The stencil plane of a depth image reads (0, s, 0, 1); its depth (d, 0, 0, 1);
+// A8Unorm (0, 0, 0, a).
+VkImageView VenusImage::sampled_view(const TextureView& v, bool stencil) {
+  for (const View& c : views_)
+    if (!c.storage && c.stencil == stencil && c.v.kind == v.kind && c.v.base_level == v.base_level && c.v.level_count == v.level_count &&
+        c.v.first_layer == v.first_layer && c.v.layer_count == v.layer_count)
+      return c.view;
+  VkImageViewCreateInfo ci = vk_struct<VkImageViewCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO);
+  ci.image = image_;
+  switch (v.kind) {
+    case TextureKind::Texture3D: ci.viewType = VK_IMAGE_VIEW_TYPE_3D; break;
+    case TextureKind::Texture2DArray: ci.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY; break;
+    case TextureKind::TextureCube: ci.viewType = VK_IMAGE_VIEW_TYPE_CUBE; break;
+    case TextureKind::TextureCubeArray: ci.viewType = VK_IMAGE_VIEW_TYPE_CUBE_ARRAY; break;
+    default: ci.viewType = VK_IMAGE_VIEW_TYPE_2D; break;
+  }
+  ci.format = format_;
+  ci.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
+  VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+  if (desc_.format == Format::D32Float) {
+    aspect = stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
+    if (stencil) ci.components = {VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE};
+    else ci.components = {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE};
+  } else if (desc_.format == Format::A8Unorm) {
+    ci.components = {VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_R};
+  } else if (desc_.format == Format::R8Unorm || desc_.format == Format::R8G8Unorm) {
+    // (the packed 32-bit formats read their missing channels as 0 and alpha as 1, as their 0xAARRGGBB words say)
+    ci.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_ONE};
+  }
+  ci.subresourceRange = {aspect, v.base_level, v.level_count, v.first_layer, v.layer_count};
+  if (desc_.kind == TextureKind::Texture3D) ci.subresourceRange.baseArrayLayer = 0, ci.subresourceRange.layerCount = 1;
+  VkImageView view = nullptr;
+  if (device_.vk().CreateImageView(device_.device(), &ci, nullptr, &view) != VK_SUCCESS) return nullptr;
+  View c;
+  c.v = v, c.stencil = stencil, c.view = view;
+  if (!views_.push_back(c)) {
+    device_.vk().DestroyImageView(device_.device(), view, nullptr);
+    return nullptr;
+  }
+  return view;
+}
+
+// The whole image as its own kind (bind_texture without a view).
+VkImageView VenusImage::whole_view(bool stencil) {
+  TextureView v;
+  v.kind = desc_.kind;
+  v.base_level = 0, v.level_count = desc_.mip_levels;
+  v.first_layer = 0, v.layer_count = desc_.kind == TextureKind::Texture3D ? 1 : layers_;
+  return sampled_view(v, stencil);
+}
+
+// A storage view: one level, a run of layers (a volume's slices: the whole level as a 3D view), in `format` (the image's or a same-size reinterpretation).
+VkImageView VenusImage::storage_view(uint32_t level, uint32_t first_layer, uint32_t layer_count, VkFormat format) {
+  for (const View& c : views_)
+    if (c.storage && c.v.base_level == level && c.v.first_layer == first_layer && c.v.layer_count == layer_count && c.format == format) return c.view;
+  VkImageViewCreateInfo ci = vk_struct<VkImageViewCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO);
+  ci.image = image_;
+  const bool volume = desc_.kind == TextureKind::Texture3D;
+  ci.viewType = volume ? VK_IMAGE_VIEW_TYPE_3D : (desc_.kind == TextureKind::Texture2D ? VK_IMAGE_VIEW_TYPE_2D : VK_IMAGE_VIEW_TYPE_2D_ARRAY);
+  ci.format = format;
+  ci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, 1, volume ? 0u : first_layer, volume ? 1u : layer_count};
+  VkImageView view = nullptr;
+  if (device_.vk().CreateImageView(device_.device(), &ci, nullptr, &view) != VK_SUCCESS) return nullptr;
+  View c;
+  c.storage = true, c.format = format, c.view = view;
+  c.v.base_level = level, c.v.first_layer = first_layer, c.v.layer_count = layer_count;
+  if (!views_.push_back(c)) {
+    device_.vk().DestroyImageView(device_.device(), view, nullptr);
+    return nullptr;
+  }
+  return view;
+}
+
+// An attachment view: one level, a run of layers (a volume's slices through its 2D-array compatibility).
+VkImageView VenusImage::target_view(uint32_t level, uint32_t first_layer, uint32_t layer_count) {
+  for (const Target& t : targets_)
+    if (t.level == level && t.first == first_layer && t.count == layer_count) return t.view;
+  VkImageViewCreateInfo ci = vk_struct<VkImageViewCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO);
+  ci.image = image_;
+  ci.viewType = layer_count > 1 || desc_.kind != TextureKind::Texture2D ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+  ci.format = format_;
+  ci.subresourceRange = {aspect_, level, 1, first_layer, layer_count};
+  VkImageView view = nullptr;
+  if (device_.vk().CreateImageView(device_.device(), &ci, nullptr, &view) != VK_SUCCESS) return nullptr;
+  Target t;
+  t.level = level, t.first = first_layer, t.count = layer_count, t.view = view;
+  if (!targets_.push_back(t)) {
+    device_.vk().DestroyImageView(device_.device(), view, nullptr);
+    return nullptr;
+  }
+  return view;
+}
+
+// ---- presentation ----------------------------------------------------------------------------------------------------------------------------------
+// The image's pixels go to the virtio-gpu's 2D screen (the display driver's own: monitors, layouts, the console's comeback all work as they do for every 2D
+// present). One copy through guest memory per frame.
+bool VenusDevice::present(IImage* image) {
+  if (!image) return false;
+  VenusImage* v = static_cast<VenusImage*>(image);
+  if (!(v->desc().usage & kImagePresent)) return false;
+  const Extent2D e = v->extent();
+  const uint64_t count = uint64_t{e.width} * e.height;
+  VenusMemory* s = staging(count * 4);
+  if (!s) return false;
+  if (!v->copy(false, 0, 0, e.width)) return false;
+  ArrayView<uint32_t> words;   // (B8G8R8A8 rows are 0xAARRGGBB words)
+  if (!ByteView(s->map, count * 4).try_cast<uint32_t>(&words)) return false;
+  if (v->swaps_rb())
+    for (uint32_t& w : words) w = (w & 0xFF00FF00u) | ((w & 0xFF) << 16) | ((w >> 16) & 0xFF);
+  gpu_.blit(0, 0, e.width < gpu_.width() ? e.width : gpu_.width(), e.height < gpu_.height() ? e.height : gpu_.height(), words.data(), e.width);
+  gpu_.present();
+  return true;
+}
+
+}  // namespace graphics

@@ -2654,6 +2654,7 @@ Adapter::Adapter(allocators::IAllocator& allocator, graphics::IGraphicsDevice& d
   auto limit = [](uint32_t value, uint32_t capacity) { return value < capacity ? value : capacity; };
   caps_.max_vertex_attributes = limit(info.limits.vertex_attributes, graphics::kMaxVertexAttributes);
   caps_.max_varyings = limit(info.limits.varyings, graphics::kMaxVaryings);
+  caps_.d3d_sample_order = info.d3d_sample_order;
   caps_.max_texture_units = limit(info.limits.texture_units, graphics::kMaxTextureUnits);
   caps_.max_color_targets = limit(info.limits.color_targets, graphics::kMaxColorTargets);
   caps_.max_vertex_buffers = limit(info.limits.vertex_buffers, graphics::kMaxVertexBuffers);
@@ -2682,7 +2683,7 @@ Adapter::Adapter(allocators::IAllocator& allocator, graphics::IGraphicsDevice& d
   else if (name_has("Radeon") || name_has("AMD")) caps_.vendor_id = 0x1002, caps_.device_id = 0x694C;
   else if (name_has("NVIDIA")) caps_.vendor_id = 0x10DE, caps_.device_id = 1;
   else if (name_has("VMware")) caps_.vendor_id = 0x15AD, caps_.device_id = 0x0405;
-  else if (name_has("virgl")) caps_.vendor_id = 0x1AF4, caps_.device_id = 0x1050;
+  else if (name_has("virgl") || name_has("Venus")) caps_.vendor_id = 0x1AF4, caps_.device_id = 0x1050;   // (both are the virtio-gpu)
   else if (name_has("Raspberry") || name_has("V3D")) caps_.vendor_id = 0x14E4, caps_.device_id = 0x2711;
   else caps_.vendor_id = 0x10005, caps_.device_id = 2;
 
@@ -2776,7 +2777,7 @@ NtStatus Adapter::create_shader(const ShaderDesc& desc, SharedPointer<ShaderObje
       // A shader the text cannot say (see D3d9Tgsi.cpp) is still fine for the interpreter.
       const graphics::ShaderStage stage = program->stage();
       String text(allocator_);
-      const NtStatus t = program->emit_tgsi(&text, caps_.max_varyings, &md.tgsi_bindings);
+      const NtStatus t = program->emit_tgsi(&text, caps_.max_varyings, &md.tgsi_bindings, caps_.d3d_sample_order);
       if (t == status::kNoMemory) return t;
       if (t == status::kSuccess) {
         md.sampler_constants = program->compare_units() != 0;   // (its comparisons read the bound samplers' from the constants)
