@@ -234,6 +234,11 @@ struct Pso {
   SRWLOCK pipe_lock;           /* pipes and retired: lists recorded on several threads share the PSO */
   UINT compute_pipe;
   UINT64 hash;                 /* what its description was (desc_hash_*): what a pipeline library stores it by, and compares a description loaded under its name with */
+  int depth_bounds;            /* DepthBoundsTestEnable (DEPTH_STENCIL1/2): the draws test the depth buffer against OMSetDepthBounds' range */
+  int views_on;                /* view instancing (VIEW_INSTANCING of more than one view, or of one moved or masked): the views each draw makes and D3D12_VIEW_INSTANCING_FLAGS;
+                                * the viewport and layer of each */
+  UINT view_count, view_flags;
+  D3D12_VIEW_INSTANCE_LOCATION view_loc[4];
 };
 
 /* ---- the fingerprint of a pipeline description ----------------------------------------------------------------------------------------------------------------------- */
@@ -496,11 +501,19 @@ typedef struct PsoExtras {
   FLOAT depth_bias;
   int has_back_masks;
   UINT8 back_read_mask, back_write_mask;
+  int depth_bounds;            /* DEPTH_STENCIL1/2's DepthBoundsTestEnable */
+  UINT view_count, view_flags; /* VIEW_INSTANCING: the views (0: none) and D3D12_VIEW_INSTANCING_FLAGS (what of them is view instancing: Pso::views_on) */
+  D3D12_VIEW_INSTANCE_LOCATION views[4];
 } PsoExtras;
 /* (the fingerprint of a description with them) */
 static UINT64 desc_hash_graphics_x(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *d, const PsoExtras *x) {
   UINT64 h = desc_hash_graphics(d);
   if (x && x->has_bias) h = pfnv(pfnv(h, "B", 1), &x->depth_bias, 4);
+  if (x && x->depth_bounds) h = pfnv(h, "Z", 1);
+  if (x && x->view_count >= 1) {
+    h = pfnv(pfnv(pfnv(h, "V", 1), &x->view_count, 4), &x->view_flags, 4);
+    h = pfnv(h, x->views, x->view_count * sizeof x->views[0]);
+  }
   if (x && x->has_back_masks) {
     const UINT8 masks[2] = {x->back_read_mask, x->back_write_mask};
     h = pfnv(pfnv(h, "M", 1), masks, 2);
@@ -544,6 +557,14 @@ static HRESULT pso_create_graphics(Dev *This, const D3D12_GRAPHICS_PIPELINE_STAT
   p->back_read_mask = x && x->has_back_masks ? x->back_read_mask : desc->DepthStencilState.StencilReadMask;
   p->back_write_mask = x && x->has_back_masks ? x->back_write_mask : desc->DepthStencilState.StencilWriteMask;
   p->depth_bias = x && x->has_bias ? x->depth_bias : (FLOAT)desc->RasterizerState.DepthBias;
+  /* (the depth bounds test and the views: what the command list sends with each draw - the kernel's SetDepthBounds and SetViewInstance -, not the kernel pipeline's) */
+  p->depth_bounds = x && x->depth_bounds;
+  /* (one view is view instancing too where its location moves it or the mask may turn it off - on a device that has view instancing; elsewhere it draws as it is) */
+  const int one_moved = x && x->view_count == 1 && (x->views[0].ViewportArrayIndex || x->views[0].RenderTargetArrayIndex || x->view_flags);
+  p->views_on = x && (x->view_count > 1 || one_moved) && (This->caps.features2 & DEV_FEATURE2_VIEW_INSTANCING);
+  p->view_count = p->views_on ? x->view_count : 1;
+  p->view_flags = p->views_on ? x->view_flags : 0;
+  if (p->views_on) memcpy(p->view_loc, x->views, x->view_count * sizeof x->views[0]);
   p->dynamic_bias = (desc->Flags & D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS) != 0;
   {
     const HRESULT rh = raster_state_check(This, &desc->RasterizerState, p->depth_bias, &desc->DepthStencilState, p->back_read_mask, p->back_write_mask, p->dynamic_bias);

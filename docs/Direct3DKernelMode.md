@@ -878,8 +878,9 @@ later stream subobjects, `OPTIONS19` .. `21`, the GPU upload heap, `ID3D12Device
   ending-access resolves), the enhanced barriers (`ID3D12GraphicsCommandList7::Barrier`, `OPTIONS12.EnhancedBarriersSupported`: layouts and accesses need no transition;
   a placed resource whose access after is `NO_ACCESS` goes out of use as with an aliasing barrier - its bytes written to the heap's memory and the allocations sharing
   them marked to take them up), `ID3D12GraphicsCommandList8::OMSetFrontAndBackStencilRef` (one reference for both faces), `List9::RSSetDepthBias` /
-  `IASetIndexBufferStripCutValue` and `List10::SetProgram` / `DispatchGraph` (features at "not supported": left out), and `ClearUnorderedAccessViewUint/Float` of buffer views (raw, structured and typed, each format's conversion). The calls of the features the device reports at
-  the "not supported" tier (depth bounds, sample positions, view instancing, meta commands, raytracing, shading rate, mesh shaders) are calls a program may not make here.
+  `IASetIndexBufferStripCutValue` and `List10::SetProgram` / `DispatchGraph` (features at "not supported": left out), and `ClearUnorderedAccessViewUint/Float` of buffer views (raw, structured and typed, each format's conversion). Depth bounds, sample positions,
+  view instancing and variable-rate shading are below ("Direct3D 12's optional rasterizer features"); the calls of the features the device reports at the "not supported" tier
+  (meta commands, raytracing, mesh shaders; and those four where the adapter lacks them: virgl) are calls a program may not make here.
 - `resource.inc`: textures in custom heaps the CPU sees (`D3D12_CPU_PAGE_PROPERTY_WRITE_BACK` / `WRITE_COMBINE`, the driver's layout), `Map` with no pointer and
   `WriteToSubresource` / `ReadFromSubresource`, which lock the kernel's image of the subresource (a plane of a planar texture's slice, a slice of a packed YUV array; the
   texels of the narrow formats and planes widened into the kernel's pixels and narrowed back). `D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE` (`StandardSwizzle64KBSupported`):
@@ -970,8 +971,8 @@ separate minification and magnification filters (`MIN_POINT_MAG_LINEAR` and the 
 non-normalized coordinates); more than four unordered access buffers; heaps and textures shared across adapters (`D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER`: `DXGI_ERROR_UNSUPPORTED`,
 `CrossAdapterRowMajorTextureSupported` FALSE: an allocation is of one adapter's memory manager, and sharing one needs a backing both adapters' memory managers keep coherent
 at the fences - read back after one adapter's work, uploaded before the other's -, which `VidMm` does not have; fences shared across adapters are done, the kernel's
-synchronization objects being of no adapter); the blend factor on Vega and the other fixed backends; ray tracing, mesh shaders, variable rate shading, view instancing,
-sampler feedback, work graphs, protected sessions and meta commands (reported unsupported - see below); a depth image's average, least and greatest resolves on virgl
+synchronization objects being of no adapter); the blend factor on Vega and the other fixed backends; ray tracing, mesh shaders, depth bounds, sample positions, variable rate
+shading, view instancing and barycentrics on virgl (below), sampler feedback, work graphs, protected sessions and meta commands (reported unsupported - see below); a depth image's average, least and greatest resolves on virgl
 (the host's blit takes sample 0, and its multisampled depth buffers are attachments a shader does not read); typed UAV clears of formats outside `g_uav_formats`
 (R11G11B10, B5G6R5 ...); and all of it on the GPU backends other than virgl.
 
@@ -979,9 +980,63 @@ What the Shader Model 6 features would take (the DXIL front end, `DxilTranslate.
 shaders into Shader Model 5 tokens): **ray tracing** - DXIL libraries of many entry functions and their `RDAT` (the root signature subobjects are read already),
 state objects and shader tables, acceleration structures built on the device (a BVH in a buffer), and `TraceRay` / `ReportHit` / `CallShader` lowered into a compute
 program with a traversal loop and the hit groups called as functions (inline ray queries, `RayQuery`, are the smaller first step); **mesh and amplification shaders** -
-the two stages translated and run as compute dispatches whose output primitives feed an indirect draw; **variable rate shading** - coarse pixel shading in the CPU
-renderer, and nothing on virgl (the host's GL has no shading-rate extension through virglrenderer); **sampler feedback** - `WriteSamplerFeedback` writing MinMip and
+the two stages translated and run as compute dispatches whose output primitives feed an indirect draw; **sampler feedback** - `WriteSamplerFeedback` writing MinMip and
 MipRegionUsed maps (opaque formats) from the sampler's footprint; **work graphs** - node shaders and a scheduler of records between dispatches.
+
+### Direct3D 12's optional rasterizer features: depth bounds, sample positions, view instancing, variable-rate shading, barycentrics
+
+What `OPTIONS2`, `OPTIONS3`, `OPTIONS6` and `OPTIONS10` report above their "not supported" tiers, done on the CPU renderer. Each is a `graphics::DeviceFeature2` bit of the device
+(high bits, apart from the run the other features fill): `kFeature2SamplePositions` (1 << 25), `kFeature2ViewInstancing` (26), `kFeature2Barycentrics` (28),
+`kFeature2SampleCopies` (29), `kFeature2DepthBounds` (30), `kFeature2ShadingRate` (31); d3d12.dll mirrors them as `DEV_FEATURE2_*` and reports a feature only where the adapter has it. virgl has
+none of them: virglrenderer's protocol carries no depth bounds, sample locations or shading rate, the TGSI emitted here has no view id, barycentric or per-vertex pixel inputs,
+and a copy of samples would be a host blit - its tiers stay "not supported" (with the QEMU backend moving to Venus, Vulkan's `depthBounds`, `VK_EXT_sample_locations`,
+`VK_KHR_fragment_shading_rate`, multiview and `VK_KHR_fragment_shader_barycentric` are the way there).
+
+The state is the command stream's, not the pipeline's: four ops numbered apart from the others (`Op::SetDepthBounds` 56, `SetSamplePositions` 57, `SetViewInstance` 58,
+`SetShadingRate` 59; `CommandStream.hpp` has their words), valid inside and outside passes, kept for the stream across passes and command buffers (`StreamRunner::RasterState`,
+given to the device's command buffer before the next draw, `apply_raster`); a stream starts with the defaults. The device interface has the matching `ICommandBuffer` calls
+(`set_depth_bounds`, `set_sample_positions`, `set_view_instance`, `set_shading_rate` / `set_shading_rate_image`, `copy_samples`), recorded by `CommandRecorder`.
+
+- **Depth bounds** (`OMSetDepthBounds`, `DEPTH_STENCIL1/2.DepthBoundsTestEnable`): a sample whose depth buffer value, as it was before the draw, is outside `min .. max`
+  (inclusive) is not drawn - no shader result, depth or stencil write, no occlusion count; triangles, lines and points; a pass without a depth buffer passes everything. The
+  enable is the PSO's, sent with the list's range before each draw that changes them (`send_raster_state`); a range outside 0 .. 1 or with `min > max` is a call left out.
+- **Programmable sample positions** (`SetSamplePositions`, tier 2): 1, 2, 4, 8 or 16 positions in sixteenths of a pixel (-8 .. 7) for one pixel, or for each pixel of a 2 x 2
+  quad aligned to even coordinates (at most 16 in all) - the triangles' coverage and the depth of each sample come from them; a single-sample pass covers a pixel by its one
+  moved sample; positions of another count than the pass's are not used; `(0, 0, NULL)` the standard ones again. Not in bundles (they inherit the caller's). The CPU renderer
+  keeps every sample's depth, so depth is never "compressed": the rules of the interplay with clears, copies and resolves hold by themselves. `ResolveSubresourceRegion` with
+  `D3D12_RESOLVE_MODE_DECOMPRESS` is a copy of every sample of the region (colour, depth and stencil) into another resource of the format and sample count (`ResolveRegion` of
+  mode `kResolveCopySamples` 16 and six words of region, `kFeature2SampleCopies`; one sample: an ordinary copy); in place it does nothing. Centroid interpolation is not done,
+  so the positions' order (the centroid priority) has no effect.
+- **View instancing** (`VIEW_INSTANCING` subobject, `SetViewInstanceMask`, `SV_ViewID`; tier 2): draw-call looping in d3d12.dll (`draw_views`): each draw is made once for each
+  view of the PSO - with `ENABLE_VIEW_INSTANCE_MASKING` those of the list's mask (0 when reset; a bundle starts with 0 and its last mask carries back) -, each after a
+  `SetViewInstance` of the view and its location; the kernel's device gives the view to every stage (`VertexContext` / `GeometryInputData` / `HullInputData` / `HullOutputData` /
+  `FragmentContext::view_id`) and adds the location's viewport and render target array index to the primitive's own (32-bit wrapping; out of range: the first, as for the
+  shaders' own). Every stage runs for every view and counts in the pipeline statistics, which tier 2 allows and tier 3 does not. At most 4 views; a location of viewport 16+
+  or layer 2048+, more than 4 views, no locations or another flag is `E_INVALIDARG`. ExecuteIndirect's draws loop the same way.
+- **Variable-rate shading** (tier 2, `AdditionalShadingRatesSupported`, 16 x 16 tiles, the SUM combiner): `RSSetShadingRate` (the rate and the two combiners),
+  `RSSetShadingRateImage` (an R8_UINT texture of one level and sample, a rate a tile; past its edge 1x1), `SV_ShadingRate` written by a vertex or geometry shader (the
+  primitive's first vertex's) and read by a pixel shader. The rate of a tile is `combiner1(combiner0(rate, primitive's), image's)` per axis (`combine_shading_rate`), made what the
+  pass's samples allow (`sanitize_shading_rate`: with 2+ samples an axis at most 2x but 2x4 with 2, never more than 16 samples a coarse pixel, 4x1 / 1x4 the finer 2x1 / 1x2). The
+  CPU renderer then shades each coarse pixel (on a grid from the target's origin, inside the tile) once at its centre - varyings, `SV_Position` and depth there, derivatives and
+  the level of detail over the 2 x 2 quad of coarse pixels - and writes the colour to every covered sample of its pixels, depth and stencil tested per sample at full
+  resolution; a discard drops the whole coarse pixel. Lines and points are shaded per pixel. The image is read when the list runs (`D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE`
+  is `state::kShadingRateSource`).
+- **Barycentrics and the other SM 6.1+ pixel values** (the DXIL translator, `DxilTranslate.cpp`, with operand types no DXBC shader has, `0xF0` .. `0xF3`, read by `D3d9Dxbc.cpp`):
+  `SV_ViewID` (`dx.op.viewID`, any graphics stage), `SV_Barycentrics` (a system value with no register, perspective-correct or - `noperspective` - linear in the screen: the
+  rasterizer carries each vertex's weights through clipping and interpolates them like a varying, so a clipped triangle keeps the weights of the whole one; derivatives of them
+  through `FragmentContext::quad_bary_fn`), `GetAttributeAtVertex` (`dx.op.attributeAtVertex`: a pixel shader's input as vertex 0, 1 or 2 of the primitive made it, in the draw's
+  vertex order: `FragmentContext::vertex_varyings`), `SV_ShadingRate` (D3D_NAME 24 in and out), `IsHelperLane` (SM 6.6). Barycentrics, attributes at vertices and shading rates make the program
+  need their feature bit, so a device without it is not given the shader (`kNotSupported`), and the TGSI emitter refuses them; `SV_ViewID` needs none - a device without view
+  instancing draws every draw as view 0, as Direct3D 12 has a driver without it do (TGSI: the immediate 0), so such shaders run on virgl too.
+- **Tests**: `DxgkrnlTest` (`test_depth_bounds_kernel`, `test_sample_positions_kernel` with the copies of samples, `test_view_instance_kernel`, `test_shading_rate_kernel`,
+  `test_dxil_sm61_values`, `test_barycentrics_kernel`: pixels through the kernel's stream on the CPU renderer, refusals, a device without each feature; the DXIL fixtures
+  `dxil_vs_view`, `dxil_ps_view`, `dxil_ps_bary`, `dxil_ps_attr`, `dxil_ps_rate`, `dxil_vs_rate`, `dxil_ps_helper` made with dxc, truncated and bit-flipped); `d3d12test`'s
+  `test_raster_features` (the caps, and each feature drawn through d3d12.dll and read back: bands of depth, a resolved edge under three sample patterns and a DECOMPRESS, two
+  layers of views with masks and a bundle, three rate sources, barycentric weights and vertex attributes). The emulator's fixture header now has the `.dxil` blobs too
+  (`dx_<name>_dxil`, as `d3d12_qemu.sh` had).
+- **Not done**: centroid and sample interpolation (and so `EvaluateAttributeSnapped` and per-sample shading at all), `SV_Coverage` in and out, tier 3 view instancing (the
+  stages before the first that reads `SV_ViewID` are run for each view), the shader model the device reports stays 5.1 (`D3D12_FEATURE_SHADER_MODEL`): DXIL shaders of 6.1 - 6.6
+  with these values run, but an application that checks the model first will not use them; wave operations, which 6.0 needs, are not translated.
 
 ### The other GPU backends and feature level 11_0
 

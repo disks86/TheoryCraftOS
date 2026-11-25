@@ -65,7 +65,10 @@ bool resource_kind(uint32_t dimension, graphics::TextureKind* kind) {
   }
 }
 
-enum OperandType : uint32_t { kOpOutputControlPointId = 22, kOpForkInstanceId = 23, kOpJoinInstanceId = 24, kOpInputControlPoint = 25, kOpInputPatchConstant = 27, kOpDomainPoint = 28, kOpUav = 30, kOpThreadId = 32, kOpThreadGroupId = 33, kOpThreadIdInGroup = 34, kOpThreadIdFlat = 36, kOpGsInstanceId = 37, kOpInputPrimitiveId = 11, kOpTgsm = 31, kOpTemp = 0, kOpInput = 1, kOpOutput = 2, kOpImmediate = 4, kOpSampler = 6, kOpResource = 7, kOpConstantBuffer = 8, kOpImmediateConstantBuffer = 9, kOpNull = 13 };
+enum OperandType : uint32_t { kOpOutputControlPointId = 22, kOpForkInstanceId = 23, kOpJoinInstanceId = 24, kOpInputControlPoint = 25, kOpInputPatchConstant = 27, kOpDomainPoint = 28, kOpUav = 30, kOpThreadId = 32, kOpThreadGroupId = 33, kOpThreadIdInGroup = 34, kOpThreadIdFlat = 36, kOpGsInstanceId = 37, kOpInputPrimitiveId = 11, kOpTgsm = 31, kOpTemp = 0, kOpInput = 1, kOpOutput = 2, kOpImmediate = 4, kOpSampler = 6, kOpResource = 7, kOpConstantBuffer = 8, kOpImmediateConstantBuffer = 9, kOpNull = 13,
+                             // (operand types no DXBC shader has, which the DXIL translator writes for what Shader Model 6.1+ added: dx.op.viewID, and SV_Barycentrics - a system value with no
+                             // register - perspective-correct and noperspective; select_1 of a component)
+                             kOpViewIdPrivate = 0xF0, kOpBarycentricsPrivate = 0xF1, kOpBarycentricsLinearPrivate = 0xF2, kOpHelperLanePrivate = 0xF3 /* IsHelperLane */ };
 
 // Where a program made from DXBC keeps what it has no register for: its literals, and the immediate constant buffer (declared in the program) as constants of its own.
 constexpr uint16_t kLiteralBase = 0x4000, kImmediateBufferBase = 0x6000;
@@ -269,7 +272,8 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       // (SV_RenderTargetArrayIndex: the layer of the targets the primitive goes to, which a geometry shader writes - or a vertex or domain shader -; SV_ViewportArrayIndex its viewport)
       const bool layer = names_equal(elements[i].name, "SV_RENDERTARGETARRAYINDEX") && elements[i].index == 0;
       const bool viewport = names_equal(elements[i].name, "SV_VIEWPORTARRAYINDEX") && elements[i].index == 0;
-      merge_slot(&stream_slot[elements[i].stream][elements[i].reg], layer ? kSlotLayer : viewport ? kSlotViewport : signature_slot(elements[i], true));
+      const bool rate = names_equal(elements[i].name, "SV_SHADINGRATE") && elements[i].index == 0;   // (SV_ShadingRate: the primitive's shading rate, of a vertex or geometry shader)
+      merge_slot(&stream_slot[elements[i].stream][elements[i].reg], layer ? kSlotLayer : viewport ? kSlotViewport : rate ? kSlotShadingRate : signature_slot(elements[i], true));
       // (the component each is in: the compiler packs the two integers into one register, o3.x and o3.y, when it can - that register is then the layer's, and the viewport is read
       // from its component of it)
       const uint8_t component = elements[i].mask & 1 ? 0 : elements[i].mask & 2 ? 1 : elements[i].mask & 4 ? 2 : elements[i].mask & 8 ? 3 : 0;
@@ -375,8 +379,33 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         if (o.dims != 1 || o.index[0] >= kMaxTemps) return status::kNotSupported;
         s->type = kTemp, s->number = static_cast<uint16_t>(o.index[0]);
         return status::kSuccess;
+      case kOpViewIdPrivate:   // (SV_ViewID: any graphics stage; a device without view instancing draws every draw as view 0, as Direct3D 12 lets a driver without it do)
+        if (compute || o.dims != 0) return status::kNotSupported;
+        s->type = kSysValue, s->number = kSysViewId;
+        program->uses_system_values_ = true;
+        return status::kSuccess;
+      case kOpHelperLanePrivate:   // (IsHelperLane: a pixel shader's)
+        if (vertex || geometry || patch_stage || compute || o.dims != 0) return status::kNotSupported;
+        s->type = kSysValue, s->number = kSysHelperLane;
+        program->uses_system_values_ = true;
+        return status::kSuccess;
+      case kOpBarycentricsPrivate: case kOpBarycentricsLinearPrivate:   // (SV_Barycentrics: a pixel shader's)
+        if (vertex || geometry || patch_stage || compute || o.dims != 0) return status::kNotSupported;
+        s->type = kSysValue, s->number = o.type == kOpBarycentricsPrivate ? kSysBarycentrics : kSysBarycentricsLinear;
+        program->uses_system_values_ = true;
+        program->extra_features2_ |= graphics::kFeature2Barycentrics;
+        return status::kSuccess;
       case kOpInputControlPoint:
       case kOpInput: {
+        if (!vertex && !geometry && !patch_stage && !compute && o.type == kOpInput && o.dims == 2) {
+          // v[vertex][register] of a pixel shader: the input as vertex 0, 1 or 2 of the primitive made it (GetAttributeAtVertex, from the DXIL translator)
+          if (o.index[0] >= 3 || o.index[1] >= kRegisters || in_slot[o.index[1]] < 0) return status::kNotSupported;
+          s->type = kInput, s->number = static_cast<uint16_t>(o.index[1]), s->slot = in_slot[o.index[1]], s->vertex = static_cast<uint8_t>(o.index[0]);
+          s->at_vertex = true;
+          program->uses_system_values_ = true;
+          program->extra_features2_ |= graphics::kFeature2Barycentrics;
+          return status::kSuccess;
+        }
         if (geometry || patch_stage) {
           // v[vertex][register]: the vertex immediate, or for a hull shader's control point phase the control point being made
           const uint32_t limit = geometry ? geometry_vertices : input_points;
@@ -494,6 +523,13 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
           (slot == kSlotLayer ? program->writes_layer_ : program->writes_viewport_) = true;
           if (slot == kSlotLayer && program->viewport_shares_layer_) program->writes_viewport_ = true;
           if (!geometry) program->layer_before_geometry_ = true;
+          return status::kSuccess;
+        }
+        if (slot == kSlotShadingRate) {
+          if (!geometry && !vertex) return status::kNotSupported;   // (a domain shader's does not reach the rasterizer as a rate: Direct3D says vertex and geometry shaders)
+          d->type = kRastOut, d->slot = slot;
+          d->number = static_cast<uint16_t>(o.index[0]);
+          program->extra_features2_ |= graphics::kFeature2ShadingRate;
           return status::kSuccess;
         }
         if (slot == kSlotPosition) d->type = kRastOut, d->slot = kSlotPosition;
@@ -884,6 +920,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
           if (!vertex && name == 1) sys = kSysPosition;            // SV_Position
           else if (!vertex && name == 9) sys = kSysFrontFacing;    // SV_IsFrontFace
           else if (!vertex && name == 7) sys = kSysPrimitiveId;    // SV_PrimitiveID
+          else if (!vertex && name == 24) sys = kSysShadingRate, program->extra_features2_ |= graphics::kFeature2ShadingRate;   // SV_ShadingRate
           else if (vertex && name == 6) sys = kSysVertexId;        // SV_VertexID
           else if (vertex && name == 8) sys = kSysInstanceId;      // SV_InstanceID
           if (sys < 0) return status::kNotSupported;
@@ -1570,7 +1607,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
           const int8_t slot = stream_slot[stream_after][ins.dst.number];
           if (slot == kSlotNone) continue;   // (a register the stream has no element for: left as the first meaning had it)
           ins.dst.slot = slot;
-          ins.dst.type = slot == kSlotPosition || slot == kSlotLayer || slot == kSlotViewport ? kRastOut : kAttrOut;
+          ins.dst.type = slot == kSlotPosition || slot == kSlotLayer || slot == kSlotViewport || slot == kSlotShadingRate ? kRastOut : kAttrOut;
         }
       }
     }

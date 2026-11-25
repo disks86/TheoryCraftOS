@@ -78,6 +78,8 @@
 //   BindUav          slot, allocation_index, offset, size   (a storage buffer for compute shaders, outside a pass: slot below kMaxStorageBuffers, a kAllocUnorderedAccess buffer, offset and size multiples of 4)
 //   Dispatch         groups_x, groups_y, groups_z   (outside a pass, with a compute pipeline bound by BindPipeline and every storage slot its shader uses bound; each count at most kMaxDispatchGroups)
 //   ResolveRegion    destination_index, source_index   (outside a pass: the samples of a multisampled colour render target averaged into an ordinary image of the same format and size, the adapter's kFeatureMultisample)
+//                    [, mode]: a graphics::ResolveMode; or kResolveCopySamples and then x, y, width, height of the source's region and x, y in the destination: every sample of the region
+//                    copied into an image of the same format and samples (kFeature2SampleCopies; Direct3D 12's DECOMPRESS into another resource, depth and stencil too)
 //   CopyBuffer       dst_index, dst_offset, src_index, src_offset, bytes   (outside a pass: between two buffer allocations (not heaps; a reserved buffer is read and written as the whole it appears to be; the source may be a kAllocQueryResult buffer: the results of the queries ended before); the ranges lie in the buffers, a copy inside one buffer must not overlap)
 //   CopyBufferImage  direction (0 buffer to image, 1 image to buffer), image_index, level, layer, x, y, width, height, buffer_index, buffer_offset, row_pitch   (outside a pass: a rectangle of one level of a colour image
 //                    (any kind: `layer` is the array slice or volume depth, 0 for a 2D image) and rows of the buffer, `row_pitch` bytes apart from `buffer_offset` on (at least width * the bytes of a pixel); a multisampled or depth image is refused)
@@ -138,6 +140,16 @@
 //                    elements of `format` (a graphics::TexelFormat: DXGI_FORMAT's number; a u# view one texel_format_storable says) from element `first_element` of a kAllocUnorderedAccess buffer,
 //                    within it. Outside a pass, and in one with kFeature2StorageImagesInDraws; kNoAllocation: none. The counter of an append, consume or counter view u<n> is BindUav's slot
 //                    kCounterSlotBase + n: a word of a kAllocUnorderedAccess buffer)
+//   SetDepthBounds   enable, min, max   (the floats as bits, each 0 .. 1: the depth bounds test of the draws that follow - the adapter's kFeature2DepthBounds -, inside or outside a pass;
+//                    the stream starts with it off)
+//   SetSamplePositions samples, pixels, then samples * pixels words of x | y << 8 (signed bytes, -8 .. 7: sixteenths of a pixel from the centre)   (kFeature2SamplePositions: the positions of
+//                    the samples of the draws that follow, one pattern - pixels 1 - or one for each pixel of a 2 x 2 quad - pixels 4, at most 4 samples; pixels 0 with no positions: the
+//                    standard ones again, as the stream starts with)
+//   SetViewInstance  view, viewport_offset, layer_offset   (kFeature2ViewInstancing: the SV_ViewID of the draws that follow, below kMaxViewInstances, and what is added to the viewport (below 16)
+//                    and the render target array index (below 2048) of each primitive; the stream starts with 0, 0, 0)
+//   SetShadingRate   rate, primitive_combiner, image_combiner, allocation_index   (kFeature2ShadingRate: coarse pixel shading of the draws that follow - a D3D12_SHADING_RATE, two
+//                    D3D12_SHADING_RATE_COMBINERs, and the shading-rate image, an R8Uint texture of one level, layer and sample (kNoAllocation: none); the stream starts with 1x1,
+//                    passthrough, passthrough, none)
 //   EndQuery         [allocation_index, offset]   (ends the open query that writes there - with no words, the one begun last that is still open -; what it counted since its BeginQuery (for an
 //                    occlusion query the fragments that passed the depth and stencil tests: a little-endian 64-bit number a value) is written there once the stream has run)
 #pragma once
@@ -191,7 +203,14 @@ enum class Op : uint16_t {
   ResolveEncoderMetadata,
   BindUavImage,   // (37)
   BindTexelBuffer,   // (38)
+  // (the optional rasterizer features of Direct3D 12, numbered apart from the ops other changes add after 38)
+  SetDepthBounds = 56,
+  SetSamplePositions = 57,
+  SetViewInstance = 58,
+  SetShadingRate = 59,
 };
+constexpr uint32_t kMaxViewInstances = 4;   // D3D12_MAX_VIEW_INSTANCE_COUNT
+constexpr uint32_t kResolveCopySamples = 16;   // ResolveRegion's mode word for a copy of samples (past the graphics::ResolveMode values)
 constexpr uint32_t kVideoProcessStreamWords = 15;
 constexpr uint32_t kVideoProcessExtension = 0x31585056;   // 'VPX1': VideoProcess's optional part follows
 constexpr uint32_t kVideoProcessStreamExtWords = 25;
@@ -388,6 +407,15 @@ class CommandWriter {
   void bind_texel_buffer(uint32_t slot, uint32_t allocation, uint32_t first_element, uint32_t element_count, graphics::TexelFormat format) {
     packet(Op::BindTexelBuffer, {slot, allocation, first_element, element_count, static_cast<uint32_t>(format)});
   }
+  void set_depth_bounds(bool enable, float min, float max) { packet(Op::SetDepthBounds, {enable ? 1u : 0u, float_bits(min), float_bits(max)}); }
+  void set_sample_positions(uint32_t samples, uint32_t pixels, ArrayView<const graphics::SamplePosition> positions) {
+    ok_ &= bytes_.put32(static_cast<uint32_t>(Op::SetSamplePositions) | ((3 + static_cast<uint32_t>(positions.size())) << 16)) && bytes_.put32(samples) && bytes_.put32(pixels);
+    for (const graphics::SamplePosition& at : positions) ok_ &= bytes_.put32(static_cast<uint8_t>(at.x) | static_cast<uint32_t>(static_cast<uint8_t>(at.y)) << 8);
+  }
+  void set_view_instance(uint32_t view, uint32_t viewport_offset, uint32_t layer_offset) { packet(Op::SetViewInstance, {view, viewport_offset, layer_offset}); }
+  void set_shading_rate(uint32_t rate, uint32_t primitive_combiner, uint32_t image_combiner, uint32_t image = kNoAllocation) {
+    packet(Op::SetShadingRate, {rate, primitive_combiner, image_combiner, image});
+  }
   struct DecodeArgs {
     Handle decoder = 0;
     uint32_t buffer = kNoAllocation, picture_offset = 0, picture_bytes = 0, matrix_offset = 0, matrix_bytes = 0, slices_offset = 0, slices_bytes = 0;
@@ -407,6 +435,9 @@ class CommandWriter {
   void resolve_region(uint32_t destination, uint32_t source, uint32_t mode = 0) {
     if (mode == 0) packet(Op::ResolveRegion, {destination, source});
     else packet(Op::ResolveRegion, {destination, source, mode});
+  }
+  void copy_samples(uint32_t destination, uint32_t source, const graphics::Rect2D& region, uint32_t x, uint32_t y) {
+    packet(Op::ResolveRegion, {destination, source, kResolveCopySamples, static_cast<uint32_t>(region.x), static_cast<uint32_t>(region.y), region.width, region.height, x, y});
   }
 
  private:

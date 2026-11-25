@@ -85,6 +85,7 @@ struct D3d9Program::State {
   const graphics::IStorageImages* images = nullptr;   // the storage images (compute and pixel shaders)
   Q layer = {{0, 0, 0, 0}};             // a geometry shader's SV_RenderTargetArrayIndex output (the integer in x)
   Q viewport = {{0, 0, 0, 0}};          // ... and its SV_ViewportArrayIndex (of a vertex or domain shader too)
+  Q shading_rate = {{0, 0, 0, 0}};      // ... and a vertex or geometry shader's SV_ShadingRate (the integer in x)
   const graphics::GeometryInputData* geometry_in = nullptr;
   const graphics::HullInputData* hull_in = nullptr;        // a hull shader's input control points
   const graphics::HullOutputData* patch_in = nullptr;      // a domain shader's patch (control points and constants)
@@ -156,7 +157,7 @@ uint32_t D3d9Program::required_features2() const {
   if (writes_layer_) needed |= graphics::kFeature2LayeredTargets;
   if (writes_viewport_) needed |= graphics::kFeature2Viewports;
   if (layer_before_geometry_) needed |= graphics::kFeature2LayerFromAnyStage;
-  return needed;
+  return needed | extra_features2_;
 }
 
 uint32_t D3d9Program::required_features() const {
@@ -535,6 +536,14 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
           }
           break;
         }
+        if (src.at_vertex) {   // (a pixel shader's input at one vertex of the primitive: GetAttributeAtVertex)
+          const graphics::Vec4* at = s.fragment && src.vertex < 3 ? s.fragment->vertex_varyings[src.vertex] : nullptr;
+          if (src.slot >= 0 && src.slot < static_cast<int8_t>(graphics::kMaxVaryings)) {
+            const graphics::Vec4 a = at ? at[src.slot] : s.varyings[src.slot];
+            v = {{a.x, a.y, a.z, a.w}};
+          }
+          break;
+        }
         if (src.slot >= 0) {
           const graphics::Vec4 a = s.attributes ? s.attributes[src.slot] : s.varyings[src.slot];
           v = {{a.x, a.y, a.z, a.w}};
@@ -595,7 +604,7 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
       case kTemp: target = &s.r[d.number]; break;
       case kAddrTex: target = &s.a0; break;
       case kPatchOut: target = d.number < graphics::kMaxPatchRegisters ? &s.patch_out[d.number] : nullptr; break;
-      case kRastOut: target = d.slot == kSlotLayer ? &s.layer : d.slot == kSlotViewport ? &s.viewport : &s.pos; break;
+      case kRastOut: target = d.slot == kSlotLayer ? &s.layer : d.slot == kSlotViewport ? &s.viewport : d.slot == kSlotShadingRate ? &s.shading_rate : &s.pos; break;
       case kAttrOut:
       case kTexCrdOut: target = d.slot == kSlotPosition ? &s.pos : d.slot >= 0 ? &s.var[d.slot] : nullptr; break;
       case kColorOut: target = d.slot >= 0 && d.slot < static_cast<int8_t>(graphics::kMaxColorTargets) ? &s.color[d.slot] : nullptr; break;
@@ -647,6 +656,12 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
       other.no_stores = true;
       for (uint32_t n = 0; n < kSysValueCount; ++n) other.sys[n] = s.sys[n];
       other.sys[kSysPosition] = {{position.x, position.y, position.z, position.w}};
+      if (f->quad_bary_fn) {   // (the corner's barycentrics)
+        graphics::Vec4 bary[2] = {};
+        f->quad_bary_fn(f->quad_user, corner[k], bary);
+        other.sys[kSysBarycentrics] = {{bary[0].x, bary[0].y, bary[0].z, 0.0f}};
+        other.sys[kSysBarycentricsLinear] = {{bary[1].x, bary[1].y, bary[1].z, 0.0f}};
+      }
       other.fragment = f;
       other.derivative_depth = s.derivative_depth + 1;
       other.capture_at = at;
@@ -746,6 +761,7 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) v.varying[i] = {s.var[i].f[0], s.var[i].f[1], s.var[i].f[2], s.var[i].f[3]};
         v.layer = layer_out(s.layer.f, s.viewport.f);
         v.viewport = viewport_out(s.layer.f, s.viewport.f);
+        v.shading_rate = bits_of(s.shading_rate.f[0]);
         const uint32_t stream = ins.control < graphics::kMaxGeometryStreams ? ins.control : 0;
         out->restart[out->count] = s.geometry_cut[stream];
         out->stream[out->count] = static_cast<uint8_t>(stream);
@@ -1278,6 +1294,7 @@ void D3d9Program::run_vertex_ex(const graphics::Vec4* attributes, const uint8_t*
   s.constants = constants;
   s.sys[kSysVertexId].f[0] = from_bits(context.vertex_id);
   s.sys[kSysInstanceId].f[0] = from_bits(context.instance_id);
+  s.sys[kSysViewId].f[0] = from_bits(context.view_id);
   s.storage = context.storage;
   s.images = context.images;
   s.textures = context.textures;
@@ -1286,6 +1303,7 @@ void D3d9Program::run_vertex_ex(const graphics::Vec4* attributes, const uint8_t*
   for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) out->varying[i] = {s.var[i].f[0], s.var[i].f[1], s.var[i].f[2], s.var[i].f[3]};
   out->layer = layer_out(s.layer.f, s.viewport.f);         // (SV_RenderTargetArrayIndex and SV_ViewportArrayIndex of a vertex shader: 0 when it writes neither)
   out->viewport = viewport_out(s.layer.f, s.viewport.f);
+  out->shading_rate = bits_of(s.shading_rate.f[0]);
 }
 
 bool D3d9Program::run_fragment(const graphics::Vec4* varyings, const uint8_t* constants, const graphics::ITextureSet* textures, graphics::Vec4* color) const {
@@ -1301,6 +1319,11 @@ bool D3d9Program::run_fragment_ex(const graphics::Vec4* varyings, const graphics
   s.sys[kSysPosition] = {{context.position.x, context.position.y, context.position.z, context.position.w}};
   s.sys[kSysFrontFacing].f[0] = from_bits(context.front_facing ? 0xFFFFFFFFu : 0u);
   s.sys[kSysPrimitiveId].f[0] = from_bits(context.primitive_id);
+  s.sys[kSysViewId].f[0] = from_bits(context.view_id);
+  s.sys[kSysShadingRate].f[0] = from_bits(context.shading_rate);
+  s.sys[kSysHelperLane].f[0] = from_bits(context.helper ? 0xFFFFFFFFu : 0u);
+  s.sys[kSysBarycentrics] = {{context.barycentrics.x, context.barycentrics.y, context.barycentrics.z, 0.0f}};
+  s.sys[kSysBarycentricsLinear] = {{context.barycentrics_linear.x, context.barycentrics_linear.y, context.barycentrics_linear.z, 0.0f}};
   s.fragment = &context;
   s.storage = context.storage;
   s.images = context.images;
@@ -1319,6 +1342,7 @@ void D3d9Program::run_hull(const graphics::HullInputData& input, const uint8_t* 
   graphics::HullInputData upright = input;
   for (uint32_t k = 0; k < upright.control_points && k < graphics::kMaxPatchControlPoints; ++k) upright.position[k].y = -upright.position[k].y;
   s.hull_in = &upright;
+  s.sys[kSysViewId].f[0] = from_bits(input.view_id);
   s.storage = input.storage;
   s.images = input.images;
   // The control point phase once for each output control point, then the fork and join phases (which make the patch constants).
@@ -1346,6 +1370,7 @@ void D3d9Program::run_domain(const graphics::HullOutputData& patch, float u, flo
   s.storage = patch.storage;
   s.images = patch.images;
   s.sys[kSysDomainLocation] = {{u, v, w, 0.0f}};
+  s.sys[kSysViewId].f[0] = from_bits(patch.view_id);
   execute(s);
   out->position = {s.pos.f[0], -s.pos.f[1], s.pos.f[2], s.pos.f[3]};
   for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) out->varying[i] = {s.var[i].f[0], s.var[i].f[1], s.var[i].f[2], s.var[i].f[3]};
@@ -1364,6 +1389,7 @@ void D3d9Program::run_geometry(const graphics::GeometryInputData& input, const u
   s.storage = input.storage;
   s.images = input.images;
   s.sys[kSysGsInstanceId].f[0] = from_bits(input.instance_id);
+  s.sys[kSysViewId].f[0] = from_bits(input.view_id);
   s.sys[kSysPrimitiveId].f[0] = from_bits(input.primitive_id);
   s.geometry_out = output;
   output->count = 0;

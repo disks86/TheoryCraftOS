@@ -39,8 +39,12 @@
  *   - tiled resources at tier 1 only, heaps shared across adapters (DXGI_ERROR_UNSUPPORTED; shared handles of one adapter's resources and heaps, and of fences of any
  *     adapter, are made: device.inc), resource state validation (barriers are accepted and not looked at, except aliasing), the debug layer
  *   - of the later interfaces (ID3D12Device1 .. 14, ID3D12GraphicsCommandList1 .. 10: device1.inc, cmdlist1.inc, library.inc, rootsig.inc; what mingw lacks of them is in
- *     d3d12_types.h), the features reported at their "not supported" tier: ray tracing, mesh shaders, variable-rate shading, view instancing, depth bounds, sample
- *     positions, sampler feedback, work graphs, protected sessions, meta commands, D3D12_SAMPLER_DESC2, a strip cut set by the command list (OPTIONS15)
+ *     d3d12_types.h), the features reported at their "not supported" tier: ray tracing, mesh shaders, sampler feedback, work graphs, protected sessions, meta commands,
+ *     D3D12_SAMPLER_DESC2, a strip cut set by the command list (OPTIONS15); and on virgl (the CPU renderer has them: cmdlist1.inc) the depth bounds test, programmable
+ *     sample positions, view instancing, variable-rate shading and barycentrics
+ *   - of those: view instancing is tier 2 (draw-call looping; every stage runs for every view), no centroid or sample interpolation (EvaluateAttributeSnapped, per-sample
+ *     shading) or SV_Coverage, and HighestShaderModel stays 5.1 (DXIL of 6.1 - 6.6 with SV_ViewID, SV_Barycentrics, GetAttributeAtVertex, SV_ShadingRate and IsHelperLane is
+ *     taken, but the wave operations of 6.0 are not translated)
  *   - vertex elements: every Direct3D 11 input-assembler format and instance step rates (pso.inc vertex_format) where the device reads them (the CPU renderer and virgl)
  *     (queries are occlusion, binary occlusion, pipeline statistics (and 1), stream output statistics and timestamps (also on copy queues), several open at once, at
  *     most 64 per list; the size of a stream output buffer view is not looked at; ExecuteIndirect is made when the list is executed; bundles replay their calls: extras.inc)

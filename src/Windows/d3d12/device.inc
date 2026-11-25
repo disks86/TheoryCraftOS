@@ -440,7 +440,13 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
       a->IsolatedMMU = TRUE;      /* (the device's addresses are its own: the kernel's allocations, not the process's) */
       return S_OK;
     }
-    case D3D12_FEATURE_D3D12_OPTIONS2: { FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS2, o); memset(o, 0, sizeof *o); return S_OK; }
+    case D3D12_FEATURE_D3D12_OPTIONS2: {
+      /* (the depth bounds test and programmable sample positions - one pattern, or one for each pixel of a 2 x 2 quad: tier 2 - where the kernel's device has them: the CPU renderer) */
+      FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS2, o);
+      o->DepthBoundsTestSupported = (This->caps.features2 & DEV_FEATURE2_DEPTH_BOUNDS) ? TRUE : FALSE;
+      o->ProgrammableSamplePositionsTier = (This->caps.features2 & DEV_FEATURE2_SAMPLE_POSITIONS) ? D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_2 : D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED;
+      return S_OK;
+    }
     case D3D12_FEATURE_SHADER_CACHE: {
       FEATURE(D3D12_FEATURE_DATA_SHADER_CACHE, c);
       /* (CachedPSO blobs, pipeline libraries, and the sessions' ShaderCacheControl clear and SetDeleteOnDestroy) */
@@ -453,7 +459,10 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
       memset(o, 0, sizeof *o);
       o->WriteBufferImmediateSupportFlags = D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT | D3D12_COMMAND_LIST_SUPPORT_FLAG_COMPUTE | D3D12_COMMAND_LIST_SUPPORT_FLAG_COPY;
       o->CopyQueueTimestampQueriesSupported = (This->caps.features & DEV_FEATURE_TIMESTAMP_QUERIES) ? TRUE : FALSE;      /* (EndQuery of a timestamp on a copy list: extras.inc) */
-      o->ViewInstancingTier = D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
+      /* (view instancing is draw-call looping - cmdlist.inc draw_views -: every stage of every view runs and counts in the statistics, which tiers 1 and 2 allow and tier 3 does not;
+       * tier 2 is tier 1 with the shaders' own array indices added to the locations, which the kernel's SetViewInstance does. Barycentrics: SV_Barycentrics and GetAttributeAtVertex.) */
+      o->ViewInstancingTier = (This->caps.features2 & DEV_FEATURE2_VIEW_INSTANCING) ? D3D12_VIEW_INSTANCING_TIER_2 : D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
+      o->BarycentricsSupported = (This->caps.features2 & DEV_FEATURE2_BARYCENTRICS) ? TRUE : FALSE;
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS4: {
@@ -490,7 +499,13 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
     case D3D12_FEATURE_D3D12_OPTIONS6: {
       FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS6, o);
       memset(o, 0, sizeof *o);
-      o->VariableShadingRateTier = D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED;
+      /* (coarse pixel shading on the CPU renderer: tier 2 with the 2x4, 4x2 and 4x4 rates, per-primitive rates with any viewport, 16 x 16 tiles; nothing runs in the background) */
+      const BOOL vrs = (This->caps.features2 & DEV_FEATURE2_SHADING_RATE) != 0;
+      o->VariableShadingRateTier = vrs ? D3D12_VARIABLE_SHADING_RATE_TIER_2 : D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED;
+      o->AdditionalShadingRatesSupported = vrs;
+      o->PerPrimitiveShadingRateSupportedWithViewportIndexing = vrs;
+      o->ShadingRateImageTileSize = vrs ? SHADING_RATE_TILE : 0;
+      o->BackgroundProcessingSupported = FALSE;
       return S_OK;
     }
     case D3D12_FEATURE_QUERY_META_COMMAND: {
@@ -529,7 +544,13 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
       o->WaveMMATier = D3D12_WAVE_MMA_TIER_NOT_SUPPORTED;
       return S_OK;
     }
-    case D3D12_FEATURE_D3D12_OPTIONS10: { FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS10, o); memset(o, 0, sizeof *o); return S_OK; }
+    case D3D12_FEATURE_D3D12_OPTIONS10: {
+      /* (the SUM combiner of variable-rate shading; no mesh shaders to give a primitive's rate) */
+      FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS10, o);
+      o->VariableRateShadingSumCombinerSupported = (This->caps.features2 & DEV_FEATURE2_SHADING_RATE) ? TRUE : FALSE;
+      o->MeshShaderPerPrimitiveShadingRateSupported = FALSE;
+      return S_OK;
+    }
     case D3D12_FEATURE_D3D12_OPTIONS11: { FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS11, o); memset(o, 0, sizeof *o); return S_OK; }
     case D3D12_FEATURE_D3D12_OPTIONS12: {
       FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS12, o);

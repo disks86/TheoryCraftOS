@@ -72,7 +72,11 @@ enum DxOp : uint32_t {
   kFMax = 35, kFMin = 36, kIMax = 37, kIMin = 38, kUMax = 39, kUMin = 40, kIMul = 41, kUMul = 42, kFMad = 46, kIMad = 48, kUMad = 49, kDot2 = 54, kDot3 = 55, kDot4 = 56, kCreateHandle = 57,
   kCBufferLoadLegacy = 59, kCalculateLod = 81, kSample = 60, kSampleBias = 61, kSampleLevel = 62, kSampleGrad = 63, kSampleCmp = 64, kSampleCmpLevelZero = 65, kTextureGather = 73, kTextureGatherCmp = 74, kTextureLoad = 66, kBufferLoad = 68, kBufferStore = 69, kAtomicBinOp = 78, kBarrier = 80, kDiscard = 82,
   kDerivCoarseX = 83, kDerivCoarseY = 84, kDerivFineX = 85, kDerivFineY = 86, kFma = 47, kMakeDouble = 101, kSplitDouble = 102, kThreadId = 93, kGroupId = 94, kThreadIdInGroup = 95, kFlattenedThreadIdInGroup = 96,
+  kAttributeAtVertex = 137, kViewId = 138, kIsHelperLane = 221,
 };
+// (the operand types D3d9Dxbc.cpp takes for what DXBC has no register of: SV_ViewID, SV_Barycentrics perspective-correct and noperspective, IsHelperLane)
+constexpr uint32_t kOperandViewId = 0xF0, kOperandBarycentrics = 0xF1, kOperandBarycentricsLinear = 0xF2, kOperandHelperLane = 0xF3;
+constexpr uint32_t kSysvalBarycentrics = 23, kSysvalShadingRate = 24;   // (D3D_NAME_BARYCENTRICS, D3D_NAME_SHADINGRATE in a signature)
 
 class Translator {
  public:
@@ -2616,6 +2620,13 @@ bool Translator::dx_call(const Instruction& ins) {
       uint64_t id = 0, row = 0, col = 0;
       if (ins.arg_count < 4 || !constant_int(ins.args[1], &id) || !constant_int(ins.args[2], &row) || !constant_int(ins.args[3], &col) || id >= input_count_) return error(status::kNotSupported);
       const SigElement& e = inputs_[id];
+      if (e.sysval == kSysvalBarycentrics) {
+        // (a pixel shader's SV_Barycentrics: no register; noperspective by its interpolation mode - 4, 5 and 7 are DXIL's noperspective ones)
+        if (kind_ != 0 || row != 0 || col > 2) return error(status::kNotSupported);
+        Val v;
+        v.kind = VK::Sys, v.a = e.interp == 4 || e.interp == 5 || e.interp == 7 ? kOperandBarycentricsLinear : kOperandBarycentrics, v.b = static_cast<uint32_t>(col);
+        return define(ins.result, v);
+      }
       uint32_t first = 0;
       while (first < 4 && !(e.mask >> first & 1)) ++first;
       Val v;
@@ -2652,6 +2663,33 @@ bool Translator::dx_call(const Instruction& ins) {
       src(v);
       finish(at);
       return true;
+    }
+    case kAttributeAtVertex: {   // (a pixel shader's nointerpolation input as vertex 0, 1 or 2 of the primitive made it: v[vertex][register])
+      uint64_t id = 0, row = 0, col = 0, vertex = 0;
+      if (kind_ != 0 || ins.arg_count < 5 || !constant_int(ins.args[1], &id) || !constant_int(ins.args[2], &row) || !constant_int(ins.args[3], &col) || !constant_int(ins.args[4], &vertex) ||
+          id >= input_count_ || vertex > 2)
+        return error(status::kNotSupported);
+      const SigElement& e = inputs_[id];
+      if (e.sysval != 0) return error(status::kNotSupported);
+      uint32_t first = 0;
+      while (first < 4 && !(e.mask >> first & 1)) ++first;
+      Val v;
+      v.kind = VK::Input, v.a = e.reg + static_cast<uint32_t>(row), v.b = first + static_cast<uint32_t>(col), v.c = static_cast<uint32_t>(vertex) + 1;
+      if (v.b >= 4 || v.a >= 16) return error(status::kInvalidParameter);
+      return define(ins.result, v);
+    }
+    case kViewId: {   // (SV_ViewID of any graphics stage)
+      if (kind_ == 5) return error(status::kNotSupported);
+      Val v;
+      v.kind = VK::Sys, v.a = kOperandViewId, v.b = 0;
+      return define(ins.result, v);
+    }
+    case kIsHelperLane: {   // (a pixel shader's: whether this run is for a neighbour's sake; the other stages have no helpers: 0)
+      Val v;
+      v.kind = VK::Sys, v.a = kOperandHelperLane, v.b = 0;
+      if (kind_ != 0) v.kind = VK::Imm, v.a = 0;
+      v.is_mask = true;
+      return define(ins.result, v);
     }
     case 8: case 9: case 10: return classify(ins, static_cast<uint32_t>(opcode));
     case 14: case 18: case 19: case 20: return trig(ins, static_cast<uint32_t>(opcode));
@@ -2953,7 +2991,7 @@ NtStatus Translator::read_signature(ConstByteView chunk, SigElement* out, uint32
     out[i].component_type = e.le32();
     out[i].reg = e.le32();
     out[i].mask = e.u8();
-    if (out[i].reg >= 16) return status::kNotSupported;
+    if (out[i].reg >= 16 && !(out[i].sysval == kSysvalBarycentrics && out[i].reg == 0xFFFFFFFFu)) return status::kNotSupported;   // (SV_Barycentrics has no register)
   }
   *count = n;
   return status::kSuccess;
@@ -3204,7 +3242,8 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
     } else {
       if (e.sysval == 0) word(98u | (e.interp << 11) | (3u << 24)), word(operand), word(e.reg);
       else if (e.sysval == 1) word(100u | (4u << 11) | (4u << 24)), word(operand), word(e.reg), word(1);
-      else if (e.sysval == 7 || e.sysval == 9) word(99u | (1u << 11) | (4u << 24)), word(operand), word(e.reg), word(e.sysval);
+      else if (e.sysval == 7 || e.sysval == 9 || e.sysval == kSysvalShadingRate) word(99u | (1u << 11) | (4u << 24)), word(operand), word(e.reg), word(e.sysval);
+      else if (e.sysval == kSysvalBarycentrics) continue;   // (no register: the loads name it)
       else return status::kNotSupported;
     }
   }
@@ -3213,6 +3252,7 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
     const uint32_t operand = 2u | ((e.mask & 0xF) << 4) | (2u << 12) | (1u << 20);
     if (e.sysval == 0 || (pixel && e.sysval == 64)) word(101u | (3u << 24)), word(operand), word(e.reg);
     else if ((vertex || geometry || domain) && e.sysval == 1) word(103u | (4u << 24)), word(operand), word(e.reg), word(1);
+    else if ((vertex || geometry) && e.sysval == kSysvalShadingRate) word(103u | (4u << 24)), word(operand), word(e.reg), word(kSysvalShadingRate);   // (SV_ShadingRate)
     else return status::kNotSupported;
   }
   word(104u | (2u << 24)), word(temps_);
