@@ -7572,7 +7572,17 @@ static void test_tiled_loads(Scene *c) {
                                                 D3D12_DESCRIPTOR_RANGE_TYPE_UAV};
   const UINT regs[5] = {0, 1, 0, 1, 2};
   ID3D12RootSignature *rs = ranges_signature(dev, 5, types, regs, NULL, 0);
-  ID3D12PipelineState *pso = rs ? compute_pso(dev, rs, dx_cs_tiled_loads_dxbc, sizeof dx_cs_tiled_loads_dxbc) : NULL;
+  ID3D12PipelineState *pso = NULL;
+  if (rs && opts.TiledResourcesTier >= D3D12_TILED_RESOURCES_TIER_2) {
+    pso = compute_pso(dev, rs, dx_cs_tiled_loads_dxbc, sizeof dx_cs_tiled_loads_dxbc);
+  } else if (rs) {
+    D3D12_COMPUTE_PIPELINE_STATE_DESC cd;      /* (made by hand: compute_pso checks that it is made) */
+    memset(&cd, 0, sizeof cd);
+    cd.pRootSignature = rs;
+    cd.CS.pShaderBytecode = dx_cs_tiled_loads_dxbc;
+    cd.CS.BytecodeLength = sizeof dx_cs_tiled_loads_dxbc;
+    ID3D12Device_CreateComputePipelineState(dev, &cd, &IID_ID3D12PipelineState, (void **)&pso);
+  }
   printf("tiled loads: tier %d, pipeline %s\n", (int)opts.TiledResourcesTier, pso ? "made" : "refused");
   if (opts.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_2) {
     CHECK(!pso);      /* (no residency feedback there) */
