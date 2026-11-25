@@ -69,7 +69,8 @@
 __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 
 #define OBJ(x) ((DxObj *)(x))
-#define TEXTURE_SLOTS 8u              /* t0 .. t7 and s0 .. s7 of the pixel shader */
+#define TEXTURE_SLOTS 8u              /* s0 .. s7, and the shader resources of a draw whose shaders declare none above t7 (the narrow table) */
+#define SRV_SLOTS 128u                /* t0 .. t127 (D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT): the wide table, for shaders that declare one above t7 */
 #define CONSTANT_SLOTS 14u            /* b0 .. b13 a stage */
 #define CONSTANT_BLOCK 4096u          /* the bytes of constants a draw has in all (the kernel's limit) */
 #define RING_BYTES (1u << 20)         /* the upload memory the constant blocks of one command list go into */
@@ -199,7 +200,9 @@ typedef struct View {
   UINT64 offset, size;
   UINT stride;
   DXGI_FORMAT format;          /* a typed buffer view's format (DXGI_FORMAT_UNKNOWN for raw and structured ones) */
-  UINT counter;                /* an append or counter view's hidden count (D3D11_BUFFER_UAV_FLAG_APPEND / COUNTER) */
+  UINT counter;                /* an append or counter view's hidden count (D3D11_BUFFER_UAV_FLAG_APPEND / COUNTER) as it was last set ... */
+  BOOL counter_dirty;          /* ... and not yet written into counter_buf (made, or set by CSSetUnorderedAccessViews / OMSetRenderTargetsAndUnorderedAccessViews since) */
+  struct Buf *counter_buf;     /* where the hidden count is: the counter of the Direct3D 12 view, which the shaders' IncrementCounter / Append / Consume change */
   UINT width, height;          /* a render target view: the size of the level it names */
   /* a render target view of a shadowed texture (rtshadow.inc): the target that is drawn into, the buffer the copies go through, the subresource (level, layer
    * or slice) it is of, whether the target holds what the texture does not have yet, and the texture's version it was last loaded from */
@@ -220,7 +223,8 @@ typedef struct Shader {
   SIZE_T bytes;
   UINT cb_registers[CONSTANT_SLOTS];      /* the size each constant buffer is declared with, in 16-byte registers (0: not used) */
   UINT registers;                         /* ... and all of them together */
-  BYTE tex_kind[TEXTURE_SLOTS];           /* what each t<n> is declared as (Tex.kind, KIND_BUFFER; 0xFF: not declared) */
+  BYTE tex_kind[SRV_SLOTS];               /* what each t<n> is declared as (Tex.kind, KIND_BUFFER; 0xFF: not declared) */
+  BOOL wide;                              /* it declares a shader resource above t7: its draws and dispatches take the wide table (SRV_SLOTS) */
   UINT uav_mask;                          /* the u<n> it declares */
   UINT group[3];                          /* a compute shader's threads in a group (dcl_thread_group) */
   UINT gs_instances;                      /* a geometry shader's instances (dcl_gs_instance_count; 0: one) */
@@ -301,18 +305,18 @@ typedef struct Ctx {
   Buf *vb[VERTEX_SLOTS];
   Buf *ib;
   Buf *vs_cb[CONSTANT_SLOTS], *ps_cb[CONSTANT_SLOTS];
-  View *srv[TEXTURE_SLOTS];
+  View *srv[SRV_SLOTS];
   Sampler *sampler[TEXTURE_SLOTS];
   /* The geometry, hull and domain stages (STAGE_GS ...), and the textures and samplers of the stages but the pixel shader's (STAGE_VS ..., which share the table:
    * a slot the pixel shader has nothing bound to takes the first of the others that has). */
   Shader *gs, *hs, *ds;
   Buf *stage_cb[3][CONSTANT_SLOTS];
-  View *stage_srv[4][TEXTURE_SLOTS];
+  View *stage_srv[4][SRV_SLOTS];
   Sampler *stage_sampler[4][TEXTURE_SLOTS];
   /* the compute stage, and the unordered access views of the pixel shader (OMSetRenderTargetsAndUnorderedAccessViews: u<n> for n from the first after the targets) */
   Shader *cs;
   Buf *cs_cb[CONSTANT_SLOTS];
-  View *cs_srv[TEXTURE_SLOTS];
+  View *cs_srv[SRV_SLOTS];
   Sampler *cs_sampler[TEXTURE_SLOTS];
   View *cs_uav[UAV_SLOTS];
   View *ps_uav[UAV_SLOTS];
@@ -381,6 +385,8 @@ struct Dev {
   ID3D12CommandAllocator *allocator;
   ID3D12GraphicsCommandList *list;
   ID3D12RootSignature *root;
+  ID3D12RootSignature *bound_root;         /* the graphics root signature the list has now (draw_prepare: the narrow or the wide one) */
+  ID3D12RootSignature *root_wide;          /* the same with a table of SRV_SLOTS shader resources: for the draws and dispatches whose shaders declare one above t7 */
   ID3D12CommandSignature *sig_draw, *sig_draw_indexed, *sig_dispatch;      /* the indirect draws and dispatches (ExecuteIndirect of one command) */
   ID3D12DescriptorHeap *rtv_heap, *dsv_heap, *view_heap, *sampler_heap;
   UINT rtv_free[RTV_SLOTS], rtv_free_count, dsv_free[DSV_SLOTS], dsv_free_count;
@@ -395,7 +401,8 @@ struct Dev {
   UINT ring_used, ring_last, ring_last_bytes;
   UINT view_used, sampler_used;            /* descriptors of the two heaps the list's draws have taken */
   UINT64 table_views, table_samplers;      /* the GPU handles of the tables the last draw used ... */
-  UINT table_view_ids[TEXTURE_SLOTS], table_sampler_ids[TEXTURE_SLOTS];      /* ... and what was in them */
+  UINT table_view_ids[SRV_SLOTS], table_sampler_ids[TEXTURE_SLOTS];      /* ... and what was in them */
+  UINT table_view_count;                   /* ... and how many views the view table has (TEXTURE_SLOTS, or SRV_SLOTS for the wide root signature) */
   int tables_valid;
   Tex *blank;                              /* a white pixel: what a texture slot with nothing bound samples */
   Tex *blank_kind[4];                      /* ... a white volume, array and cube (by Tex.kind, made when a shader that declares one has nothing bound to it) */
@@ -1412,7 +1419,11 @@ static void srv_destroy(DxObj *o) {
   view_release_resource(v);
   child_destroy(o);
 }
-static void uav_destroy(DxObj *o) { srv_destroy(o); }
+static void uav_destroy(DxObj *o) {
+  View *v = (View *)o;
+  if (v->counter_buf) dx_Release(OBJ(v->counter_buf));
+  srv_destroy(o);
+}
 static void STDMETHODCALLTYPE rtv_GetDesc(View *v, D3D11_RENDER_TARGET_VIEW_DESC *desc) { if (desc) *desc = v->desc.rtv; }
 static void STDMETHODCALLTYPE dsv_GetDesc(View *v, D3D11_DEPTH_STENCIL_VIEW_DESC *desc) { if (desc) *desc = v->desc.dsv; }
 static void STDMETHODCALLTYPE srv_GetDesc(View *v, D3D11_SHADER_RESOURCE_VIEW_DESC *desc) { if (desc) *desc = v->desc.srv; }
@@ -1440,6 +1451,26 @@ static UINT buffer_format_bytes(DXGI_FORMAT format) {
 }
 /* The bytes a buffer view names: `first` and `count` elements; the stride by the view's kind (raw: 4, structured: the buffer's structure, typed: the format's).
  * FALSE for a view Direct3D 11 does not make of that buffer. */
+/* Whether the kernel has typed views of buffers of a format (graphics::TexelFormat, DXGI's numbering): 1 for one a shader resource view may have, 2 for one an unordered access
+ * view may have too (D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW: not the three-channel 32-bit ones, the B8G8R8 and 16-bit packed ones, A8); 0 for none. */
+static UINT texel_buffer_format(DXGI_FORMAT f) {
+  switch (f) {
+    case DXGI_FORMAT_R32G32B32_FLOAT: case DXGI_FORMAT_R32G32B32_UINT: case DXGI_FORMAT_R32G32B32_SINT: case DXGI_FORMAT_A8_UNORM: case DXGI_FORMAT_B5G6R5_UNORM:
+    case DXGI_FORMAT_B5G5R5A1_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8X8_UNORM: case DXGI_FORMAT_B4G4R4A4_UNORM:
+      return 1;
+    case DXGI_FORMAT_R32G32B32A32_FLOAT: case DXGI_FORMAT_R32G32B32A32_UINT: case DXGI_FORMAT_R32G32B32A32_SINT: case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R16G16B16A16_UNORM:
+    case DXGI_FORMAT_R16G16B16A16_UINT: case DXGI_FORMAT_R16G16B16A16_SNORM: case DXGI_FORMAT_R16G16B16A16_SINT: case DXGI_FORMAT_R32G32_FLOAT: case DXGI_FORMAT_R32G32_UINT:
+    case DXGI_FORMAT_R32G32_SINT: case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R10G10B10A2_UINT: case DXGI_FORMAT_R11G11B10_FLOAT: case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UINT: case DXGI_FORMAT_R8G8B8A8_SNORM: case DXGI_FORMAT_R8G8B8A8_SINT: case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R16G16_UNORM:
+    case DXGI_FORMAT_R16G16_UINT: case DXGI_FORMAT_R16G16_SNORM: case DXGI_FORMAT_R16G16_SINT: case DXGI_FORMAT_R32_FLOAT: case DXGI_FORMAT_R32_UINT: case DXGI_FORMAT_R32_SINT:
+    case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R8G8_UINT: case DXGI_FORMAT_R8G8_SNORM: case DXGI_FORMAT_R8G8_SINT: case DXGI_FORMAT_R16_FLOAT: case DXGI_FORMAT_R16_UNORM:
+    case DXGI_FORMAT_R16_UINT: case DXGI_FORMAT_R16_SNORM: case DXGI_FORMAT_R16_SINT: case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_R8_UINT: case DXGI_FORMAT_R8_SNORM:
+    case DXGI_FORMAT_R8_SINT:
+      return 2;
+    default: return 0;
+  }
+}
+
 static BOOL buffer_view_range(const Buf *b, DXGI_FORMAT format, BOOL raw, UINT first, UINT count, View *v) {
   const BOOL structured = (b->desc.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) != 0;
   UINT stride;
@@ -1645,6 +1676,7 @@ static HRESULT srv_of_buffer(Dev *d, Buf *b, const D3D11_SHADER_RESOURCE_VIEW_DE
         !buffer_view_range(b, desc->Format, (desc->BufferEx.Flags & D3D11_BUFFEREX_SRV_FLAG_RAW) != 0, desc->BufferEx.FirstElement, desc->BufferEx.NumElements, &probe))
       return E_INVALIDARG;
   } else return E_INVALIDARG;
+  if (probe.format != DXGI_FORMAT_UNKNOWN && !texel_buffer_format(probe.format)) return E_INVALIDARG;      /* (a typed view of a format buffers have no views of) */
   if (!out) return S_FALSE;
   View *v = child_new(sizeof *v, d, &srv_vtbl, g_srv_iids, srv_destroy);
   if (!v) return E_OUTOFMEMORY;
@@ -1773,6 +1805,7 @@ static HRESULT uav_create(Dev *d, ID3D11Resource *resource, const D3D11_UNORDERE
     if ((flags & D3D11_BUFFER_UAV_FLAG_APPEND) && (flags & D3D11_BUFFER_UAV_FLAG_COUNTER)) return E_INVALIDARG;
     if ((flags & (D3D11_BUFFER_UAV_FLAG_APPEND | D3D11_BUFFER_UAV_FLAG_COUNTER)) && !(b->desc.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED)) return E_INVALIDARG;
     if (!buffer_view_range(b, desc->Format, (flags & D3D11_BUFFER_UAV_FLAG_RAW) != 0, desc->Buffer.FirstElement, desc->Buffer.NumElements, &probe)) return E_INVALIDARG;
+    if (probe.format != DXGI_FORMAT_UNKNOWN && texel_buffer_format(probe.format) != 2) return E_INVALIDARG;      /* (a format typed unordered access views cannot have) */
   } else if (t->planar) {
     /* (a plane of a slice, as the other views of a planar texture) */
     if (!(t->desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS) || !desc || (desc->ViewDimension != D3D11_UAV_DIMENSION_TEXTURE2D && desc->ViewDimension != D3D11_UAV_DIMENSION_TEXTURE2DARRAY))
@@ -1807,6 +1840,13 @@ static HRESULT uav_create(Dev *d, ID3D11Resource *resource, const D3D11_UNORDERE
   if (!v) return E_OUTOFMEMORY;
   if (b) { hold(b); v->buf = b; }
   else { hold(t); v->tex = t; }
+  if (b && (desc->Buffer.Flags & (D3D11_BUFFER_UAV_FLAG_APPEND | D3D11_BUFFER_UAV_FLAG_COUNTER))) {
+    /* (an append or counter view's hidden count: a word of a buffer of its own, the Direct3D 12 view's counter; 0 to begin with) */
+    static const D3D11_BUFFER_DESC word = {16, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS, 0, 0, 0};
+    if (FAILED(dev_CreateBuffer(d, &word, NULL, (ID3D11Buffer **)&v->counter_buf)) || !v->counter_buf) { v->counter_buf = NULL; dx_Release(OBJ(v)); return E_OUTOFMEMORY; }
+    v->counter = 0;
+    v->counter_dirty = TRUE;
+  }
   v->offset = probe.offset;
   v->size = probe.size;
   v->stride = probe.stride;
@@ -1866,7 +1906,10 @@ static void shader_constants(Shader *s) {
         if (k < w + length && ((operand >> 20) & 3) == 1) {      /* (one immediate index: SM 4 / 5.0) */
           memcpy(&slot, code + 4 * k, 4);
           if (op >= 156 && op <= 158) { if (slot < UAV_SLOTS) s->uav_mask |= 1u << slot; }
-          else if (slot < TEXTURE_SLOTS) s->tex_kind[slot] = op != 88 || dimension == 1 ? KIND_BUFFER : dimension == 5 ? 1 : (dimension == 8 || dimension == 7) ? 2 : dimension == 6 ? 3 : 0;
+          else if (slot < SRV_SLOTS) {
+            s->tex_kind[slot] = op != 88 || dimension == 1 ? KIND_BUFFER : dimension == 5 ? 1 : (dimension == 8 || dimension == 7) ? 2 : dimension == 6 ? 3 : 0;
+            if (slot >= TEXTURE_SLOTS) s->wide = TRUE;
+          }
         }
       }
       if (op == 155 /* dcl_thread_group x, y, z */ && length >= 4) for (UINT k = 0; k < 3; ++k) memcpy(&s->group[k], code + 4 * (w + 1 + k), 4);

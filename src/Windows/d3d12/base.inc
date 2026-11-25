@@ -265,6 +265,10 @@ struct Dev {
   /* The colour targets of passes that have a depth buffer and no render target (cmdlist.inc depth_companion): one for each depth buffer drawn into that way, until it is destroyed. */
   struct Companion { UINT depth, color; } *companions;
   UINT companion_count, companion_capacity;
+  /* The colour targets of passes with no render target and no depth buffer (draws that write unordered access views only: cmdlist.inc uav_only_target), of the sizes and sample
+   * counts asked for; kept until the device is destroyed (lists recorded with one may still be executed). */
+  struct UavOnlyTarget { UINT color, width, height, samples; } *uav_targets;
+  UINT uav_target_count, uav_target_capacity;
   SRWLOCK companion_lock;
   struct SharedShader *shared;      /* the kernel's shaders the pipelines have, each once (pso.inc) */
   UINT shared_count, shared_capacity;
@@ -281,6 +285,7 @@ struct Dev {
   ID3D12VideoDevice4 video;        /* the same object as ID3D12VideoDevice .. 4 (video.inc) */
 };
 #define DEV_FEATURE_STREAM_OUTPUT (1u << 21)      /* graphics::kFeatureStreamOutput in KmtCaps.features */
+#define DEV_FEATURE_COMPUTE (1u << 10)            /* graphics::kFeatureCompute: storage buffers (KA_UAV), which shader resource views of buffers are too */
 #define DEV_FEATURE_DEPTH_RESOLVE (1u << 19)      /* graphics::kFeatureDepthResolve */
 #define DEV_FEATURE_RESOLVE_MODES (1u << 20)      /* graphics::kFeatureResolveModes: resolves of the least, greatest (and a depth image's mean) samples */
 #define DEV_FEATURE_VERTEX_FORMATS (1u << 29)     /* graphics::kFeatureVertexFormats: vertex elements other than 32-bit floats */
@@ -292,6 +297,8 @@ struct Dev {
 #define DEV_FEATURE2_CONSERVATIVE_RASTER (1u << 4)       /* conservative rasterization (the CreatePipeline cull word's KCULL_CONSERVATIVE) */
 #define KCULL_CONSERVATIVE 0x100u
 #define DEV_FEATURE2_DEPTH_TEXTURES (1u << 16)           /* depth buffers read by shaders (KA_DEPTH | KA_TEXTURE): their depth, a D24S8's stencil, SampleCmp */
+#define DEV_FEATURE2_TEXEL_BUFFERS (1u << 5)             /* typed views of buffers (Buffer<>, RWBuffer<>): the kernel's BindTexelBuffer, a descriptor's element format */
+#define DEV_FEATURE2_STORAGE_ALL_STAGES (1u << 6)        /* storage images and typed views of buffers in vertex, geometry, hull and domain shaders too */
 
 static const GUID *const g_device_iids[] = {&IID_ID3D12Object, &IID_ID3D12Device, &IID_ID3D12Device1, &IID_ID3D12Device2, &IID_ID3D12Device3, &IID_ID3D12Device4,
                                             &IID_ID3D12Device5, &IID_ID3D12Device6, &IID_ID3D12Device7, &IID_ID3D12Device8, &IID_ID3D12Device9, &IID_ID3D12Device10, NULL};

@@ -630,6 +630,19 @@ static HRESULT STDMETHODCALLTYPE dev_CreateGraphicsPipelineState(Dev *This, cons
   p->depth = desc->DepthStencilState;
   p->render_targets = desc->NumRenderTargets;
   p->samples = desc->SampleDesc.Count > 1 ? desc->SampleDesc.Count : 1;
+  {
+    /* ForcedSampleCount (UAV-only rendering): 0 or 1 is not forced; 4, 8 or 16 rasterizes with that many samples a pixel, which goes only with no render target and no depth buffer
+     * (and a sample count of 1), and needs the count among the device's */
+    const UINT forced = desc->RasterizerState.ForcedSampleCount;
+    if (forced > 1) {
+      if ((forced != 4 && forced != 8 && forced != 16) || desc->NumRenderTargets || desc->DSVFormat != DXGI_FORMAT_UNKNOWN || desc->SampleDesc.Count > 1 ||
+          !((This->caps.sample_counts >> forced) & 1)) {
+        dx_Release(OBJ(p));
+        return E_INVALIDARG;
+      }
+      p->samples = forced;
+    }
+  }
   memcpy(p->rtv_formats, desc->RTVFormats, sizeof p->rtv_formats);
   p->dsv_format = desc->DSVFormat;
   p->topology_type = desc->PrimitiveTopologyType;

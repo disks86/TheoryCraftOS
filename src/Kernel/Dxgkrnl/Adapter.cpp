@@ -233,6 +233,7 @@ class Adapter::StreamRunner {
         return s == status::kSuccess ? write_back_images() : s;
       }
       case Op::BindUavImage: return bind_uav_image(p);
+      case Op::BindTexelBuffer: return bind_texel_buffer(p);
       case Op::BindPipeline: return bind_pipeline(p);
       case Op::BindVertexBuffer: return bind_vertex_buffer(p);
       case Op::BindIndexBuffer: return bind_index_buffer(p);
@@ -500,12 +501,12 @@ class Adapter::StreamRunner {
 
   NtStatus bind_uav(ByteReader& p) {
     const uint32_t slot = p.le32(), index = p.le32(), offset = p.le32(), size = p.le32();
-    const bool view = slot >= graphics::kMaxUavBuffers;   // (a shader resource view of a buffer: read-only, also by the shaders of a draw, and it may change between draws)
+    const bool view = !graphics::storage_slot_writable(slot);   // (a shader resource view of a buffer: read-only, also by the shaders of a draw, and it may change between draws)
     const bool draws_write = (adapter_.caps_.features & (graphics::kFeatureFragmentStores | graphics::kFeatureVertexStores | graphics::kFeatureGeometryStores | graphics::kFeatureTessellationStores)) != 0;   // (pixel shaders write the unordered access ones: they are bound between draws too)
     if (!exact(p) || slot >= graphics::kMaxStorageBuffers || (in_pass_ && !view && !draws_write) || !(adapter_.caps_.features & (graphics::kFeatureCompute | (view ? graphics::kFeatureStorageInDraws : graphics::kFeatureFragmentStores | graphics::kFeatureVertexStores | graphics::kFeatureGeometryStores | graphics::kFeatureTessellationStores)))) return kBad;
     Allocation* a = alloc(index);
-    const bool read_only = slot >= graphics::kMaxUavBuffers;   // (the slots after u3 are shader resource views of buffers)
-    if (!a || !(a->desc().flags & kAllocUnorderedAccess) || !use(a, read_only ? state::kNonPixelShaderResource : state::kUnorderedAccess) || size == 0 || offset % 4 || size % 4 || offset > a->desc().size || size > a->desc().size - offset) return kBad;
+    const bool read_only = view;   // (the slots after the u# ones are shader resource views of buffers; after those the counters of the u# ones, written)
+    if (!a || !(a->desc().flags & kAllocUnorderedAccess) || !use(a, read_only ? state::kNonPixelShaderResource | state::kPixelShaderResource : state::kUnorderedAccess) || size == 0 || offset % 4 || size % 4 || offset > a->desc().size || size > a->desc().size - offset) return kBad;
     uav_bound_[slot] = true;
     uav_alloc_[slot] = a;
     if (!exec_) return status::kSuccess;
@@ -524,7 +525,7 @@ class Adapter::StreamRunner {
     const uint64_t per_group = uint64_t{compute_->thread_group(0)} * compute_->thread_group(1) * compute_->thread_group(2);
     if (uint64_t{x} * y * z * per_group > graphics::kMaxDispatchThreads) return kBad;
     for (uint32_t slot = 0; slot < graphics::kMaxStorageBuffers; ++slot)
-      if ((compute_->storage_mask() >> slot & 1) && !uav_bound_[slot]) return kBad;
+      if (compute_->storage_mask().test(slot) && !uav_bound_[slot]) return kBad;
     for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u)   // (the textures the shader reads: bound, and of the kind it declared)
       if ((compute_->texture_mask() >> u & 1) && (!texture_bound_[u] || (texture_alloc_[u]->desc().samples > 1 ? graphics::TextureKind::Texture2DMS : texture_alloc_[u]->texture_kind()) != compute_->texture_kind(u)))
         return kBad;
@@ -536,7 +537,7 @@ class Adapter::StreamRunner {
     align_planes(compute_->texture_mask(), graphics::kMaxTextureUnits);
     cb_->dispatch(x, y, z);
     for (uint32_t slot = 0; slot < graphics::kMaxStorageBuffers; ++slot)
-      if (uav_bound_[slot] && slot < graphics::kMaxUavBuffers) mm_.note_gpu_write(*uav_alloc_[slot]);
+      if (uav_bound_[slot] && graphics::storage_slot_writable(slot)) mm_.note_gpu_write(*uav_alloc_[slot]);
     note_images_written(*compute_);
     return write_back_images();
   }
@@ -705,8 +706,8 @@ class Adapter::StreamRunner {
     if (both_planes(pipeline_->declared_units())) return refuse(__LINE__);   // (a depth buffer's two planes at once, read by the shaders)
     if (pipeline_->color_target_count() > pass_target_count_) return refuse(__LINE__);
     for (uint32_t slot = 0; slot < graphics::kMaxStorageBuffers; ++slot)
-      if ((pipeline_->storage_mask() >> slot & 1) && !uav_bound_[slot]) return refuse(__LINE__);   // (a buffer the shaders read must be bound)
-    if (!images_fit(*pipeline_)) return refuse(__LINE__);   // (the storage images the pixel shader declares)
+      if (pipeline_->storage_mask().test(slot) && !uav_bound_[slot]) return refuse(__LINE__);   // (a buffer the shaders read must be bound)
+    if (!images_fit(*pipeline_)) return refuse(__LINE__);   // (the storage images the shaders declare)
     if (pipeline_->blends()) {   // (an integer target takes no blending)
       if (is_integer(pass_color_->desc().format)) return refuse(__LINE__);
       for (uint32_t n = 0; n + 1 < pass_target_count_; ++n)
@@ -790,8 +791,8 @@ class Adapter::StreamRunner {
   void note_storage_written() {
     note_images_written(*pipeline_);   // (and the storage images the pixel shader declares)
     if (!pipeline_->writes_storage()) return;
-    for (uint32_t slot = 0; slot < graphics::kMaxUavBuffers; ++slot)
-      if ((pipeline_->storage_mask() >> slot & 1) && uav_bound_[slot]) mm_.note_gpu_write(*uav_alloc_[slot]);
+    for (uint32_t slot = 0; slot < graphics::kMaxStorageBuffers; ++slot)
+      if (graphics::storage_slot_writable(slot) && pipeline_->storage_mask().test(slot) && uav_bound_[slot]) mm_.note_gpu_write(*uav_alloc_[slot]);
   }
 
   void set_device_topology(graphics::PrimitiveTopology topology) {
@@ -1879,9 +1880,11 @@ class Adapter::StreamRunner {
   }
   Allocation* image_write_back_[graphics::kMaxStorageImages] = {};   // the storage images written since that are mirrors that write back
   // Whether the image bound to storage slot `slot` is what a shader that declared it as `dim` with `ret` values may be given: a plain image (or one layer of an array) for a 1D or 2D one,
-  // an array or a plain image for an array one, a volume for a 3D one; float values for a format that is not an integer one, integers for one that is.
+  // an array or a plain image for an array one, a volume for a 3D one, a typed view of a buffer for a buffer; float values for a format that is not an integer one, integers for one that is.
   bool image_fits(uint32_t slot, D3d9Program::ImageDim dim, D3d9Program::ImageReturn ret) const {
-    if (slot >= graphics::kMaxStorageImages || !image_bound_[slot]) return false;
+    if (slot >= graphics::kMaxImageSlots || !image_bound_[slot]) return false;
+    if (texel_bound_[slot] != (dim == D3d9Program::ImageDim::Buffer)) return false;
+    if (texel_bound_[slot]) return (ret != D3d9Program::ImageReturn::Float) == graphics::texel_is_integer(texel_format_[slot]);
     const Allocation* a = image_alloc_[slot];
     const graphics::TextureKind kind = a->texture_kind();
     const bool integer = is_integer(image_format_[slot]);   // (the view's format)
@@ -1895,15 +1898,16 @@ class Adapter::StreamRunner {
   }
   // The storage images a pipeline's shader declares: each bound and of what it declared.
   bool images_fit(const PipelineObject& p) const {
-    for (uint32_t slot = 0; slot < graphics::kMaxStorageImages; ++slot)
-      if ((p.image_mask() >> slot & 1) && !image_fits(slot, p.image_dim(slot), p.image_return(slot))) return false;
+    for (uint32_t slot = 0; slot < graphics::kMaxImageSlots; ++slot)
+      if (p.image_mask().test(slot) && !image_fits(slot, p.image_dim(slot), p.image_return(slot))) return false;
     return true;
   }
   // After a dispatch or a draw: the storage images its shader declares have newer contents on the device; those that are mirrors that write back are noted to give them back.
   void note_images_written(const PipelineObject& p) {
-    for (uint32_t slot = 0; slot < graphics::kMaxStorageImages; ++slot) {
-      if (!(p.image_mask() >> slot & 1) || !image_bound_[slot]) continue;
+    for (uint32_t slot = 0; slot < graphics::kMaxStorageImages; ++slot) {   // (the u# ones: the views of t# are read)
+      if (!p.image_mask().test(slot) || !image_bound_[slot]) continue;
       mm_.note_gpu_write(*image_alloc_[slot]);
+      if (texel_bound_[slot]) continue;
       if (image_alloc_[slot]->writes_back()) image_write_back_[slot] = image_alloc_[slot];
     }
   }
@@ -1915,6 +1919,7 @@ class Adapter::StreamRunner {
     if (!exact(p) || slot >= graphics::kMaxStorageImages || !(features2 & graphics::kFeature2StorageImages) || (in_pass_ && !(features2 & graphics::kFeature2StorageImagesInDraws))) return refuse(__LINE__);
     if (index == kNoAllocation) {
       image_bound_[slot] = false;
+      texel_bound_[slot] = false;
       image_alloc_[slot] = nullptr;
       if (!exec_) return status::kSuccess;
       const NtStatus s = ensure_cb();
@@ -1928,6 +1933,7 @@ class Adapter::StreamRunner {
         view_format > static_cast<uint32_t>(Format::R32Float) || !storage_view_format(a->desc().format, static_cast<Format>(view_format), &view) || !use(a, state::kUnorderedAccess))
       return refuse(__LINE__);
     image_bound_[slot] = true;
+    texel_bound_[slot] = false;
     image_alloc_[slot] = a;
     image_view_[slot] = graphics::StorageImageView{level, first, count, view};
     image_format_[slot] = view_format ? static_cast<Format>(view_format) : a->desc().format;
@@ -1939,6 +1945,49 @@ class Adapter::StreamRunner {
     if (s != status::kSuccess) return s;
     cb_->bind_storage_image(slot, a->image(), image_view_[slot]);
     return status::kSuccess;
+  }
+
+  // BindTexelBuffer: a typed view of a buffer in image slot `slot` (a u# one, read and written, or a t# one from kTexelBufferSlotBase, read).
+  NtStatus bind_texel_buffer(ByteReader& p) {
+    const uint32_t slot = p.le32(), index = p.le32(), first = p.le32(), count = p.le32(), format_word = p.le32();
+    const uint32_t features2 = adapter_.caps_.features2;
+    if (!exact(p) || slot >= graphics::kMaxImageSlots || !(features2 & graphics::kFeature2TexelBuffers) || (in_pass_ && !(features2 & graphics::kFeature2StorageImagesInDraws))) return refuse(__LINE__);
+    const bool writable = slot < graphics::kMaxStorageImages;
+    if (index == kNoAllocation) {
+      image_bound_[slot] = texel_bound_[slot] = false;
+      image_alloc_[slot] = nullptr;
+      if (!exec_) return status::kSuccess;
+      const NtStatus s = ensure_cb();
+      if (s != status::kSuccess) return s;
+      cb_->bind_storage_texel_buffer(slot, nullptr, graphics::TexelBufferView());
+      return status::kSuccess;
+    }
+    const graphics::TexelFormat format = static_cast<graphics::TexelFormat>(format_word);
+    Allocation* a = alloc(index);
+    const uint64_t bytes = graphics::texel_bytes(format);
+    // (a format the slot takes, and elements that lie in the buffer: first * bytes + count * bytes within its size, worked out so that nothing wraps)
+    if (!a || !a->is_buffer() || !(a->desc().flags & kAllocUnorderedAccess) || !graphics::texel_format_valid(format) || (writable && !graphics::texel_format_storable(format)) || count == 0 ||
+        uint64_t{first} > a->desc().size / bytes || uint64_t{count} > a->desc().size / bytes - first || !use(a, writable ? state::kUnorderedAccess : state::kNonPixelShaderResource | state::kPixelShaderResource))
+      return refuse(__LINE__);
+    image_bound_[slot] = texel_bound_[slot] = true;
+    image_alloc_[slot] = a;
+    texel_format_[slot] = format;
+    if (!exec_) return status::kSuccess;
+    NtStatus s = resident(*a);
+    if (s == status::kSuccess) s = ensure_cb();
+    if (s != status::kSuccess) return s;
+    cb_->bind_storage_texel_buffer(slot, a->buffer(), graphics::TexelBufferView{uint64_t{first} * bytes, count, format});
+    return status::kSuccess;
+  }
+
+  NtStatus lower_texel_buffer(uint32_t slot, Allocation* a, uint64_t offset, uint64_t size, uint32_t format) {
+    uint32_t index = 0;
+    const uint32_t bytes = graphics::texel_bytes(static_cast<graphics::TexelFormat>(format));
+    if (!a || !index_of(a, &index) || bytes == 0 || offset % bytes || size % bytes || offset / bytes > 0xFFFFFFFFu || size / bytes > 0xFFFFFFFFu) return refuse(__LINE__);
+    ByteBuffer packet(adapter_.allocator_);
+    for (uint32_t w : {slot, index, static_cast<uint32_t>(offset / bytes), static_cast<uint32_t>(size / bytes), format}) packet.put32(w);
+    ByteReader reader(packet.view());
+    return bind_texel_buffer(reader);
   }
 
   NtStatus lower_uav_image(uint32_t slot, Allocation* a, const graphics::StorageImageView& v, uint32_t view_format) {
@@ -2075,15 +2124,22 @@ class Adapter::StreamRunner {
             const Descriptor& d = view_heap_->at(at);
             const uint32_t reg = range.base_register + static_cast<uint32_t>(k);
             if (d.kind == DescriptorKind::None) continue;   // (a descriptor that was never written: not used by a shader that is right)
+            const PipelineObject* reads = compute ? compute_ : pipeline_;
             if (range.type == RangeType::Srv && d.kind == DescriptorKind::Srv && d.allocation->is_buffer()) {
               if (reg >= graphics::kMaxSrvBuffers) return refuse(__LINE__);
+              // (a typed view where a shader declares t<reg> a typed buffer; the bytes of a buffer where it declares a raw or structured one)
+              if (reads && reg < graphics::kMaxTexelBufferViews && reads->image_mask().test(graphics::kTexelBufferSlotBase + reg)) {
+                if (!d.texel_format) return refuse(__LINE__);
+                const NtStatus s = lower_texel_buffer(graphics::kTexelBufferSlotBase + reg, d.allocation.get(), d.offset, d.size, d.texel_format);
+                if (s != status::kSuccess) return s;
+                continue;
+              }
               const NtStatus s = lower_uav(graphics::kMaxUavBuffers + reg, d.allocation.get(), d.offset, d.size);
               if (s != status::kSuccess) return s;
             } else if (range.type == RangeType::Srv && d.kind == DescriptorKind::Srv) {
               if (reg >= adapter_.caps_.max_texture_units) return refuse(__LINE__);
               // (t<reg> goes to every unit the shaders read it through - its own, and those of its pairs with other samplers -, each with the sampler of its pair; a unit a
               // pair of another texture has is that pair's)
-              const PipelineObject* reads = compute ? compute_ : pipeline_;
               for (uint32_t unit = 0; unit < adapter_.caps_.max_texture_units; ++unit) {
                 if ((reads ? reads->unit_texture(unit) : unit) != reg) continue;
                 Allocation* image = view_image(d, reads ? reads->texture_kind(unit) : graphics::TextureKind::Texture2D);
@@ -2095,12 +2151,22 @@ class Adapter::StreamRunner {
               }
             } else if (range.type == RangeType::Uav && d.kind == DescriptorKind::Uav) {
               if (reg >= graphics::kMaxUavBuffers) return refuse(__LINE__);
-              const NtStatus s = lower_uav(reg, d.allocation.get(), d.offset, d.size);
+              // (a typed view where a shader declares u<reg> a typed buffer, the bytes where it declares a raw or structured one; and the view's counter where a shader counts with it)
+              if (reads && reg < graphics::kMaxStorageImages && reads->image_mask().test(reg)) {
+                if (!d.texel_format) return refuse(__LINE__);
+                const NtStatus s = lower_texel_buffer(reg, d.allocation.get(), d.offset, d.size, d.texel_format);
+                if (s != status::kSuccess) return s;
+                continue;
+              }
+              NtStatus s = lower_uav(reg, d.allocation.get(), d.offset, d.size);
+              if (s == status::kSuccess && reads && reads->storage_mask().test(graphics::kCounterSlotBase + reg)) {
+                if (!d.counter) return refuse(__LINE__);   // (imm_atomic_alloc / consume on a view without a counter)
+                s = lower_uav(graphics::kCounterSlotBase + reg, d.counter.get(), d.counter_offset, 4);
+              }
               if (s != status::kSuccess) return s;
             } else if (range.type == RangeType::Uav && d.kind == DescriptorKind::UavTexture) {
-              // (a storage image: bound where a shader of the pipeline - the compute shader, a pixel shader in a pass - declares u<reg> a typed view of a texture)
-              const PipelineObject* reads = compute ? compute_ : pipeline_;
-              if (reg >= graphics::kMaxStorageImages || !reads || !(reads->image_mask() >> reg & 1)) continue;
+              // (a storage image: bound where a shader of the pipeline declares u<reg> a typed view of a texture)
+              if (reg >= graphics::kMaxStorageImages || !reads || !reads->image_mask().test(reg)) continue;
               const NtStatus s = lower_uav_image(reg, d.allocation.get(), d.image, d.view_format);
               if (s != status::kSuccess) return s;
             } else if (range.type == RangeType::Cbv && d.kind == DescriptorKind::Cbv) {
@@ -2208,10 +2274,12 @@ class Adapter::StreamRunner {
   Allocation* so_alloc_[graphics::kMaxStreamOutputBuffers] = {};
   bool uav_bound_[graphics::kMaxStorageBuffers] = {};
   Allocation* uav_alloc_[graphics::kMaxStorageBuffers] = {};
-  bool image_bound_[graphics::kMaxStorageImages] = {};
-  Allocation* image_alloc_[graphics::kMaxStorageImages] = {};
-  graphics::StorageImageView image_view_[graphics::kMaxStorageImages];
-  Format image_format_[graphics::kMaxStorageImages] = {};   // the format of each image's view
+  bool image_bound_[graphics::kMaxImageSlots] = {};
+  bool texel_bound_[graphics::kMaxImageSlots] = {};   // ... a typed view of a buffer (BindTexelBuffer), not a texture's
+  Allocation* image_alloc_[graphics::kMaxImageSlots] = {};
+  graphics::StorageImageView image_view_[graphics::kMaxImageSlots];
+  Format image_format_[graphics::kMaxImageSlots] = {};   // the format of each image's view
+  graphics::TexelFormat texel_format_[graphics::kMaxImageSlots] = {};   // ... and of each typed view of a buffer
   Allocation* vertex_[graphics::kMaxVertexBuffers] = {};
   uint64_t vertex_offset_[graphics::kMaxVertexBuffers] = {};
   Allocation* index_ = nullptr;
@@ -2370,7 +2438,7 @@ NtStatus Adapter::create_shader(const ShaderDesc& desc, SharedPointer<ShaderObje
       // A shader the text cannot say (see D3d9Tgsi.cpp) is still fine for the interpreter.
       const graphics::ShaderStage stage = program->stage();
       String text(allocator_);
-      const NtStatus t = program->emit_tgsi(&text, caps_.max_varyings);
+      const NtStatus t = program->emit_tgsi(&text, caps_.max_varyings, &md.tgsi_bindings);
       if (t == status::kNoMemory) return t;
       if (t == status::kSuccess) {
         md.sampler_constants = program->compare_units() != 0;   // (its comparisons read the bound samplers' from the constants)
@@ -2440,13 +2508,13 @@ NtStatus Adapter::create_shader(const ShaderDesc& desc, SharedPointer<ShaderObje
       shader->tess_output_points_ = program->tess_output_points();
       shader->tess_domain_ = program->tess_domain();
       for (uint32_t u = 0; u < graphics::kMaxStorageBuffers; ++u)
-        if (program->storage_kind(u) != D3d9Program::BufferKind::None) shader->storage_mask_ |= 1u << u;
+        if (program->storage_kind(u) != D3d9Program::BufferKind::None) shader->storage_mask_.set(u);
       shader->fragment_stores_ = program->uses_fragment_stores();
       shader->vertex_stores_ = program->uses_vertex_stores();
       shader->geometry_stores_ = program->uses_geometry_stores();
       shader->tessellation_stores_ = program->uses_tessellation_stores();
       shader->image_mask_ = program->image_mask();
-      for (uint32_t u = 0; u < graphics::kMaxStorageImages; ++u) shader->image_dims_[u] = program->image_dim(u), shader->image_returns_[u] = program->image_return(u);
+      for (uint32_t u = 0; u < graphics::kMaxImageSlots; ++u) shader->image_dims_[u] = program->image_dim(u), shader->image_returns_[u] = program->image_return(u);
       shader->writes_layer_ = program->writes_layer();
       const NtStatus b = shader->d3d9_.bind(util::move(program), &md);
       if (b != status::kSuccess && !md.tgsi) return b;
@@ -2480,7 +2548,7 @@ NtStatus Adapter::create_compute_pipeline(const SharedPointer<ShaderObject>& sha
     pipeline->unit_sampler_[u] = shader->unit_sampler_[u];
   }
   pipeline->image_mask_ = shader->image_mask_;
-  for (uint32_t u = 0; u < graphics::kMaxStorageImages; ++u) pipeline->image_dims_[u] = shader->image_dims_[u], pipeline->image_returns_[u] = shader->image_returns_[u];
+  for (uint32_t u = 0; u < graphics::kMaxImageSlots; ++u) pipeline->image_dims_[u] = shader->image_dims_[u], pipeline->image_returns_[u] = shader->image_returns_[u];
   pipeline->vertex_ = shader;   // (kept alive for as long as the pipeline is)
   *out = pipeline;
   return status::kSuccess;
@@ -2581,7 +2649,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   for (uint32_t i = 0; i < d.attribute_count; ++i) pd.attributes[i] = d.attributes[i];
   pd.varying_count = d.varying_count;
   pd.texture_count = texture_count;
-  pd.fragment_stores = fragment->fragment_stores_ || fragment->image_mask_ != 0;   // (a pixel shader that writes images runs for every fragment too)
+  pd.fragment_stores = fragment->fragment_stores_ || fragment->image_mask_.any();   // (a pixel shader that writes images runs for every fragment too)
   pd.vertex_stores = vertex->vertex_stores_;
   pd.geometry_stores = geometry && geometry->geometry_stores_;
   pd.tessellation_stores = (hull && hull->tessellation_stores_) || (domain && domain->tessellation_stores_);
@@ -2643,12 +2711,21 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   pipeline->color_target_count_ = d.color_target_count;
   pipeline->declared_units_ = vertex->texture_mask_ | fragment->texture_mask_ | (geometry ? geometry->texture_mask_ : 0u) | (hull ? hull->texture_mask_ : 0u) | (domain ? domain->texture_mask_ : 0u);
   pipeline->fragment_stores_ = fragment->fragment_stores_;
-  pipeline->image_mask_ = fragment->image_mask_;
-  for (uint32_t u = 0; u < graphics::kMaxStorageImages; ++u) pipeline->image_dims_[u] = fragment->image_dims_[u], pipeline->image_returns_[u] = fragment->image_returns_[u];
+  // (the images of every stage: a slot two stages declare must be the same thing to both)
+  for (const ShaderObject* stage : {vertex.get(), fragment.get(), geometry.get(), hull.get(), domain.get()}) {
+    if (!stage) continue;
+    for (uint32_t u = 0; u < graphics::kMaxImageSlots; ++u) {
+      if (!stage->image_mask_.test(u)) continue;
+      if (pipeline->image_mask_.test(u) && (pipeline->image_dims_[u] != stage->image_dims_[u] || pipeline->image_returns_[u] != stage->image_returns_[u])) return status::kInvalidParameter;
+      pipeline->image_mask_.set(u);
+      pipeline->image_dims_[u] = stage->image_dims_[u], pipeline->image_returns_[u] = stage->image_returns_[u];
+    }
+  }
   pipeline->vertex_stores_ = vertex->vertex_stores_;
   pipeline->geometry_stores_ = geometry && geometry->geometry_stores_;
   pipeline->tessellation_stores_ = (hull && hull->tessellation_stores_) || (domain && domain->tessellation_stores_);
-  pipeline->storage_mask_ = vertex->storage_mask_ | fragment->storage_mask_ | (geometry ? geometry->storage_mask_ : 0u) | (hull ? hull->storage_mask_ : 0u) | (domain ? domain->storage_mask_ : 0u);   // (the views of buffers their shaders read)
+  for (const ShaderObject* stage : {vertex.get(), fragment.get(), geometry.get(), hull.get(), domain.get()})   // (the buffers their shaders read and write)
+    if (stage) pipeline->storage_mask_ |= stage->storage_mask_;
   *out = pipeline;
   return status::kSuccess;
 }

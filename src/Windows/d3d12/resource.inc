@@ -580,6 +580,9 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
   if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
     if (desc->Width == 0 || desc->Width > 256ull * 1024 * 1024) { hr = E_INVALIDARG; goto fail; }
     ad.flags = KA_VERTEX | KA_INDEX | ((desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ? KA_UAV : 0);
+    /* (a shader resource view of a buffer is a storage buffer of the kernel's - read only - or a typed view of one: any buffer of an adapter that has them may be one, as in
+     * Direct3D 12; an unordered access view still needs the flag: dev_CreateUnorderedAccessView) */
+    if (dev->caps.features & DEV_FEATURE_COMPUTE) ad.flags |= KA_UAV;
     /* (any buffer of the GPU's may be a stream output target: Direct3D 12 has no flag for it) */
     if (!cpu && (dev->caps.features & DEV_FEATURE_STREAM_OUTPUT)) ad.flags |= KA_STREAM_OUTPUT;
     ad.size = KALIGN(desc->Width, 16);

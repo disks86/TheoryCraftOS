@@ -122,6 +122,11 @@ struct DescriptorDesc {
   graphics::StorageImageView image;   // UavTexture: the level and the layers (an array's layers, a volume's slices)
   uint32_t view_format = 0;           // ... and the format of the view (a dxgk::Format; 0: the allocation's own - another for a wide one: storage_view_format)
   bool stencil = false;               // Srv of a depth buffer with a stencil plane (D24S8): the view reads the stencil (X24_TYPELESS_G8_UINT), not the depth
+  // A view of a buffer (Srv, Uav): typed - the graphics::TexelFormat of its elements (DXGI_FORMAT's number; 0: raw or structured, the bytes) -, and an unordered access view's
+  // counter (append, consume and counter views: the word at `counter_offset` of the kAllocUnorderedAccess buffer `counter`; 0: none).
+  uint32_t texel_format = 0;
+  Handle counter = 0;
+  uint64_t counter_offset = 0;
 };
 
 struct Descriptor {
@@ -132,6 +137,9 @@ struct Descriptor {
   graphics::StorageImageView image;   // UavTexture (its format the device's)
   uint32_t view_format = 0;           // ... the view's dxgk::Format (0: the allocation's)
   bool stencil = false;               // Srv of a depth buffer: of its stencil plane (DescriptorDesc::stencil)
+  uint32_t texel_format = 0;          // a typed view of a buffer: its elements' graphics::TexelFormat (0: raw or structured)
+  SharedPointer<Allocation> counter;  // an unordered access view of a buffer: its counter's buffer (none: no counter) ...
+  uint64_t counter_offset = 0;        // ... and the word's offset
   // A view that is both a 2D image and an array of them (Direct3D's Texture2DArray view of one plane of a planar texture's slices: the slice's own image, and a mirror of the
   // slices, VidMm::set_mirror): the array, read by shaders that declare one.
   SharedPointer<Allocation> alternate;

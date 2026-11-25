@@ -80,6 +80,8 @@ class TgsiEmitter {
   struct Imm {
     uint32_t bits[4];
     bool integer = false;   // (used by an integer instruction: declared UINT32 whatever the bits look like)
+    uint8_t mark = 0;       // a number the device writes in (1 IMGOFS, 2 IMGLEN, 3 TBOFS, 4 TBLEN; graphics::TgsiBindings), in all four components ...
+    uint8_t mark_index = 0; // ... of IMAGE[k] or the texel view k
   };
 
   // --- text
@@ -139,7 +141,7 @@ class TgsiEmitter {
     im.integer = force_integer_;
     for (uint32_t k = 0; k < 4; ++k) im.bits[k] = __builtin_bit_cast(uint32_t, v[k]);
     for (uint64_t i = 0; i < imms_.count(); ++i) {
-      bool same = imms_[i].integer == im.integer;
+      bool same = imms_[i].integer == im.integer && imms_[i].mark == 0;
       for (uint32_t k = 0; k < 4; ++k) same = same && imms_[i].bits[k] == im.bits[k];
       if (same) return static_cast<uint32_t>(i);
     }
@@ -166,6 +168,35 @@ class TgsiEmitter {
     return imm_text(v, ".xxxx");
   }
   String zero() { return splat(0.0f); }
+  // The immediate the device writes a number of the bindings into (Imm::mark), as an operand of four of it.
+  String mark_imm(uint8_t mark, uint32_t index) {
+    uint64_t at = imms_.count();
+    for (uint64_t i = 0; i < imms_.count(); ++i)
+      if (imms_[i].mark == mark && imms_[i].mark_index == index) at = i;
+    if (at == imms_.count()) {
+      Imm im;
+      for (uint32_t& b : im.bits) b = 0;
+      im.integer = true;
+      im.mark = mark;
+      im.mark_index = static_cast<uint8_t>(index);
+      if (!imms_.push_back(im)) oom_ = true;
+    }
+    String s = str();
+    add(s, "IMM[");
+    add_uint(s, at);
+    add(s, "].xxxx");
+    return s;
+  }
+  String uint_imm(uint32_t v) {
+    const bool saved = force_integer_;
+    force_integer_ = true;
+    String s = str();
+    add(s, "IMM[");
+    add_uint(s, imm4_bits(v, v, v, v));
+    add(s, "].xxxx");
+    force_integer_ = saved;
+    return s;
+  }
 
   // --- instructions
   // The same with any number of parts (a memory instruction's operands, then its texture target and format).
@@ -295,16 +326,24 @@ class TgsiEmitter {
   int relative_key_ = -2;   // the address register's source in the instruction being emitted (-2: none yet, -1: a0, else the integer register and component)
   bool in_used_[16] = {};
   bool sys_used_[kSysValueCount] = {};
-  bool buffer_used_[graphics::kMaxStorageBuffers] = {};
-  bool image_used_[graphics::kMaxStorageImages] = {};   // the storage images the instructions name (IMAGE[n])
+  // The host's binding points (graphics::TgsiBindings): the storage the program declares, densely numbered in slot order - BUFFER[storage_host_[slot]], IMAGE[image_host_[slot]] for a u#
+  // image, SVIEW[kTgsiTexelViewBase + image_host_[slot]] for a typed view of a buffer of t#; -1 for none.
+  int16_t storage_host_[graphics::kMaxStorageBuffers] = {};
+  int16_t image_host_[graphics::kMaxImageSlots] = {};
+  graphics::TgsiBindings bindings_;
+  bool assign_bindings();
   // A storage image's TGSI texture target: one-dimensional images are two-dimensional ones a texel high here (and their arrays arrays of those).
   const char* image_target(uint32_t slot) const {
     switch (p_.image_dim(slot)) {
       case D3d9Program::ImageDim::Texture1DArray: case D3d9Program::ImageDim::Texture2DArray: return "2D_ARRAY";
       case D3d9Program::ImageDim::Texture3D: return "3D";
+      case D3d9Program::ImageDim::Buffer: return "BUFFER";
       default: return "2D";
     }
   }
+ public:
+  const graphics::TgsiBindings& bindings() const { return bindings_; }
+ private:
   bool shared_used_ = false;   // group-shared memory is used (MEMORY[0]), barriers too
   bool compute_ = false;
   bool geometry_ = false, hull_ = false, domain_ = false;
@@ -929,19 +968,47 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       // Storage images: TGSI's LOAD / STORE / ATOM* / RESQ on IMAGE[n] (the unit is the slot), at integer coordinates - x, y and the layer or slice, a 1D image's y 0, its array's layer
       // in z. The format is the bound image's: the text names it IMGFMT<n>, which the device puts the format of what it binds there in place of (ShaderModuleDesc::tgsi).
       const uint32_t slot = ins.uav;
-      if (slot >= graphics::kMaxStorageImages || p_.image_dim(slot) == D3d9Program::ImageDim::None) {
+      if (slot >= graphics::kMaxImageSlots || p_.image_dim(slot) == D3d9Program::ImageDim::None || image_host_[slot] < 0) {
         unsupported_ = true;
         break;
       }
-      image_used_[slot] = true;
+      const uint32_t host = static_cast<uint32_t>(image_host_[slot]);
+      const D3d9Program::ImageDim dim = p_.image_dim(slot);
+      if (slot >= graphics::kTexelBufferSlotBase) {
+        // A typed view of a buffer of t# (Buffer<>): TXF on the host's buffer view SVIEW[kTgsiTexelViewBase + k], at the element plus the elements the host's view starts before the view's
+        // first (TBOFS<k>); an element past the view's count (TBLEN<k>) reads as zero.
+        if (op != kImgLoad) {
+          unsupported_ = true;
+          break;
+        }
+        t = begin_result(ins, true, &direct);
+        String sampler = str();
+        add(sampler, "SAMP[");
+        add_uint(sampler, graphics::kTgsiTexelViewBase + host);
+        add(sampler, "]");
+        String dim_name = str();
+        add(dim_name, "BUFFER");
+        const String coordinate = temp(kWork3), z0 = zero(), cx = temp(kWork3, ".x"), x = component(ins.src[0], 0, 0);
+        line("MOV", &coordinate, &z0);
+        const String first_mark = mark_imm(3, host), count_mark = mark_imm(4, host);
+        line("UADD", &cx, &x, &first_mark);
+        const String inside = temp(kScratch + 3, ".x"), inside_all = temp(kScratch + 3, ".xxxx");
+        line("USLT", &inside, &x, &count_mark);
+        const String texel = temp(kWork2), w = temp(kWork);
+        line("TXF", &texel, &coordinate, &sampler, &dim_name);
+        line("UCMP", &texel, &inside_all, &texel, &z0);
+        String picked = temp(kWork2, ".");
+        for (uint32_t c = 0; c < 4; ++c) add(picked, StringView(&"xyzw"[ins.tex_swizzle[c] & 3], 1));
+        line("MOV", &w, &picked);
+        break;
+      }
       String image = str(), target = str(), format = str();
       add(image, "IMAGE[");
-      add_uint(image, slot);
+      add_uint(image, host);
       add(image, "]");
       add(target, image_target(slot));
       add(format, "IMGFMT");
-      add_uint(format, slot);
-      const D3d9Program::ImageDim dim = p_.image_dim(slot);
+      add_uint(format, host);
       if (op == kImgSize) {
         // RESQ: (width, height, layers or depth) of the view; resinfo's components as the dimension has them, the levels 1
         t = begin_result(ins, true, &direct);
@@ -985,8 +1052,20 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       const String coordinate = temp(kWork3), z0 = zero();
       line("MOV", &coordinate, &z0);
       const String cx = temp(kWork3, ".x"), x = component(ins.src[0], 0, 0);
-      line("MOV", &cx, &x);
-      if (dim == D3d9Program::ImageDim::Texture1DArray) {
+      if (dim == D3d9Program::ImageDim::Buffer) {
+        // (a view of a buffer: the host's image is the whole buffer, so the element is the view's first (IMGOFS<k>) plus x, and one past the view's count (IMGLEN<k>) is made one outside
+        // the image - which reads zero and takes no store)
+        const String inside = temp(kScratch + 3, ".x"), shifted = temp(kScratch + 3, ".y"), inside_x = temp(kScratch + 3, ".xxxx"), shifted_x = temp(kScratch + 3, ".yyyy");
+        const String first_mark = mark_imm(1, host), count_mark = mark_imm(2, host), outside = uint_imm(0xFFFFFFFFu);
+        line("USLT", &inside, &x, &count_mark);
+        line("UADD", &shifted, &x, &first_mark);
+        line("UCMP", &cx, &inside_x, &shifted_x, &outside);
+      } else {
+        line("MOV", &cx, &x);
+      }
+      if (dim == D3d9Program::ImageDim::Buffer) {
+        // (x alone)
+      } else if (dim == D3d9Program::ImageDim::Texture1DArray) {
         const String cz = temp(kWork3, ".z"), layer = component(ins.src[0], 1, 0);
         line("MOV", &cz, &layer);
       } else if (dim != D3d9Program::ImageDim::Texture1D) {
@@ -1044,10 +1123,13 @@ bool TgsiEmitter::instruction(const Instr& ins) {
         add(buffer, "MEMORY[0]");
         shared_used_ = true;
       } else {
+        if (storage_host_[ins.uav] < 0) {
+          unsupported_ = true;
+          break;
+        }
         add(buffer, "BUFFER[");
-        add_uint(buffer, compute_ ? ins.uav : ins.uav >= graphics::kMaxUavBuffers ? ins.uav - graphics::kMaxUavBuffers : ins.uav + graphics::kMaxSrvBuffers);   // (the other stages number the views from 0 and the unordered access buffers after them)
+        add_uint(buffer, static_cast<uint32_t>(storage_host_[ins.uav]));
         add(buffer, "]");
-        buffer_used_[ins.uav] = true;
       }
       const String address = temp(kWork3, ".x"), address_source = temp(kWork3, ".xxxx");
       const String index = operand(ins.src[0], 0, 0, nullptr, true);
@@ -1110,6 +1192,52 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       t = begin_result(ins, true, &direct);
       const String w = temp(kWork), old_all = temp(kWork2, ".xxxx");
       line("MOV", &w, &old_all);
+      break;
+    }
+    case kBufCounter: {
+      // The hidden counter of an append, consume or counter view: ATOMUADD of 1 (the count before) or of -1 (the count before, less one: the count after) on its word, BUFFER[k] at 0
+      if (ins.uav >= graphics::kMaxStorageBuffers || storage_host_[ins.uav] < 0) {
+        unsupported_ = true;
+        break;
+      }
+      String buffer = str();
+      add(buffer, "BUFFER[");
+      add_uint(buffer, static_cast<uint32_t>(storage_host_[ins.uav]));
+      add(buffer, "]");
+      const String old = temp(kWork2, ".x"), zero_address = uint_imm(0), step = uint_imm(ins.control == 0 ? 1u : 0xFFFFFFFFu);
+      line("ATOMUADD", &old, &buffer, &zero_address, &step);
+      const String old_source = temp(kWork2, ".xxxx");   // (a source has four components)
+      if (ins.control == 1) line("UADD", &old, &old_source, &step);
+      t = begin_result(ins, true, &direct);
+      const String w = temp(kWork), old_all = temp(kWork2, ".xxxx");
+      line("MOV", &w, &old_all);
+      break;
+    }
+    case kBufInfo: {
+      // bufinfo: a buffer's bytes (RESQ), divided by the stride of a structured one; a typed view's element count (the IMGLEN / TBLEN of its binding)
+      t = begin_result(ins, true, &direct);
+      const String w = temp(kWork), size = temp(kWork2, ".x"), size_all = temp(kWork2, ".xxxx");
+      if (ins.control == 0) {
+        if (ins.uav >= graphics::kMaxStorageBuffers || storage_host_[ins.uav] < 0) {
+          unsupported_ = true;
+          break;
+        }
+        String buffer = str();
+        add(buffer, "BUFFER[");
+        add_uint(buffer, static_cast<uint32_t>(storage_host_[ins.uav]));
+        add(buffer, "]");
+        line_parts("RESQ", {&size, &buffer});
+        const String stride = uint_imm(ins.stride);
+        if (ins.stride) line("UDIV", &size, &size_all, &stride);
+      } else {
+        if (ins.uav >= graphics::kMaxImageSlots || image_host_[ins.uav] < 0) {
+          unsupported_ = true;
+          break;
+        }
+        const String count = mark_imm(ins.uav >= graphics::kTexelBufferSlotBase ? 4 : 2, static_cast<uint32_t>(image_host_[ins.uav]));
+        line("MOV", &size, &count);
+      }
+      line("MOV", &w, &size_all);
       break;
     }
     case kF32ToF16: case kF16ToF32: {
@@ -1754,12 +1882,6 @@ void TgsiEmitter::assemble(String* out) {
     add(*out, "\nPROPERTY CS_FIXED_BLOCK_DEPTH ");
     add_uint(*out, p_.thread_group_[2]);
     add(*out, "\nDCL SV[0], BLOCK_ID\nDCL SV[1], THREAD_ID\n");
-    for (uint32_t i = 0; i < graphics::kMaxStorageBuffers; ++i) {
-      if (!buffer_used_[i]) continue;
-      add(*out, "DCL BUFFER[");
-      add_uint(*out, i);
-      add(*out, "]\n");
-    }
     if (shared_used_) add(*out, "DCL MEMORY[0], SHARED\n");
   } else if (vertex_) {
     for (uint32_t i = 0; i <= max_attribute_; ++i) {
@@ -1815,31 +1937,32 @@ void TgsiEmitter::assemble(String* out) {
     add(*out, dimension_name(p_.texture_kind(i)));
     add(*out, ", FLOAT\n");
   }
-  if (!compute_) {   // (the buffers a vertex, geometry, tessellation or pixel shader reads and writes: all the numbers up to the last, so that the host's binding points are the numbers)
-    uint32_t last = 0;
-    bool any = false;
-    for (uint32_t i = 0; i < graphics::kMaxStorageBuffers; ++i) {
-      if (!buffer_used_[i]) continue;
-      const uint32_t index = i >= graphics::kMaxUavBuffers ? i - graphics::kMaxUavBuffers : i + graphics::kMaxSrvBuffers;
-      last = any && last > index ? last : index;
-      any = true;
-    }
-    for (uint32_t index = 0; any && index <= last; ++index) {
-      add(*out, "DCL BUFFER[");
-      add_uint(*out, index);
-      add(*out, "]\n");
-    }
+  // (the buffers the program declares, numbered as bindings_ says: BUFFER[k] is storage slot bindings_.storage[k])
+  for (uint32_t k = 0; k < bindings_.storage_count; ++k) {
+    add(*out, "DCL BUFFER[");
+    add_uint(*out, k);
+    add(*out, "]\n");
   }
-  // (the storage images: each with its target, the format of what is bound there - IMGFMT<n>, the device's to fill in -, written)
-  for (uint32_t i = 0; i < graphics::kMaxStorageImages; ++i) {
-    if (!image_used_[i] && !(p_.image_mask() >> i & 1)) continue;
+  // (the storage images: each with its target, the format of what is bound there - IMGFMT<k>, the device's to fill in -, written; and the typed views of buffers of t#, the host's
+  // buffer views SVIEW[kTgsiTexelViewBase + k] of the values the shader declared)
+  for (uint32_t k = 0; k < bindings_.image_count; ++k) {
     add(*out, "DCL IMAGE[");
-    add_uint(*out, i);
+    add_uint(*out, k);
     add(*out, "], ");
-    add(*out, image_target(i));
+    add(*out, image_target(bindings_.images[k]));
     add(*out, ", IMGFMT");
-    add_uint(*out, i);
+    add_uint(*out, k);
     add(*out, ", WR\n");
+  }
+  for (uint32_t k = 0; k < bindings_.texel_count; ++k) {
+    const D3d9Program::ImageReturn ret = p_.image_return(bindings_.texels[k]);
+    add(*out, "DCL SAMP[");
+    add_uint(*out, graphics::kTgsiTexelViewBase + k);
+    add(*out, "]\nDCL SVIEW[");
+    add_uint(*out, graphics::kTgsiTexelViewBase + k);
+    add(*out, "], BUFFER, ");
+    add(*out, ret == D3d9Program::ImageReturn::Uint ? "UINT" : ret == D3d9Program::ImageReturn::Sint ? "SINT" : "FLOAT");
+    add(*out, "\n");
   }
   add(*out, "DCL CONST[0..");
   add_uint(*out, p_.constant_registers_ - 1);
@@ -1859,6 +1982,18 @@ void TgsiEmitter::assemble(String* out) {
     add(*out, "IMM[");
     add_uint(*out, i);
     // A value that is no ordinary float (an integer literal: a denormal, or all ones, or a large one) is written as its bits.
+    if (imms_[i].mark) {
+      // (a number of the bindings: the device's to write)
+      static const char* const kMarks[] = {"", "IMGOFS", "IMGLEN", "TBOFS", "TBLEN"};
+      add(*out, "] UINT32 {");
+      for (uint32_t k = 0; k < 4; ++k) {
+        if (k) add(*out, ", ");
+        add(*out, kMarks[imms_[i].mark < 5 ? imms_[i].mark : 0]);
+        add_uint(*out, imms_[i].mark_index);
+      }
+      add(*out, "}\n");
+      continue;
+    }
     bool integer = imms_[i].integer;
     for (uint32_t k = 0; k < 4; ++k) {
       const uint32_t exponent = (imms_[i].bits[k] >> 23) & 0xFF, mantissa = imms_[i].bits[k] & 0x7FFFFF;
@@ -1907,12 +2042,39 @@ if (vertex_ || domain_) {
   }
 }
 
+// The host's binding points of the storage the program declares: buffers, u# images and t# views of buffers, each kind numbered from 0 in slot order. False when there are more than the
+// host takes.
+bool TgsiEmitter::assign_bindings() {
+  for (int16_t& h : storage_host_) h = -1;
+  for (int16_t& h : image_host_) h = -1;
+  for (uint32_t slot = 0; slot < graphics::kMaxStorageBuffers; ++slot) {
+    if (p_.storage_kind(slot) == D3d9Program::BufferKind::None) continue;
+    if (bindings_.storage_count == graphics::kTgsiMaxBuffers) return false;
+    storage_host_[slot] = static_cast<int16_t>(bindings_.storage_count);
+    bindings_.storage[bindings_.storage_count++] = static_cast<uint16_t>(slot);
+  }
+  for (uint32_t slot = 0; slot < graphics::kMaxImageSlots; ++slot) {
+    if (!p_.image_mask().test(slot)) continue;
+    if (slot < graphics::kTexelBufferSlotBase) {
+      if (bindings_.image_count == graphics::kTgsiMaxImages) return false;
+      image_host_[slot] = static_cast<int16_t>(bindings_.image_count);
+      bindings_.images[bindings_.image_count++] = static_cast<uint16_t>(slot);
+    } else {
+      if (bindings_.texel_count == graphics::kTgsiMaxTexelViews) return false;
+      image_host_[slot] = static_cast<int16_t>(bindings_.texel_count);
+      bindings_.texels[bindings_.texel_count++] = static_cast<uint16_t>(slot);
+    }
+  }
+  return true;
+}
+
 NtStatus TgsiEmitter::run(String* out) {
   vertex_ = p_.stage_ == graphics::ShaderStage::Vertex;
   compute_ = p_.stage_ == graphics::ShaderStage::Compute;
   geometry_ = p_.stage_ == graphics::ShaderStage::Geometry;
   hull_ = p_.stage_ == graphics::ShaderStage::Hull;
   domain_ = p_.stage_ == graphics::ShaderStage::Domain;
+  if (!assign_bindings()) return status::kNotSupported;   // (more buffers, images or views of buffers than the host binds in a stage)
   for (const Instr& ins : p_.code_.view()) {
     if (ins.dst.type == kAddrTex) addr_used_ = true;
     for (uint32_t k = 0; k < ins.src_count; ++k) {
@@ -2151,9 +2313,11 @@ NtStatus TgsiEmitter::run(String* out) {
   return status::kSuccess;
 }
 
-NtStatus D3d9Program::emit_tgsi(String* out, uint32_t varyings) const {
+NtStatus D3d9Program::emit_tgsi(String* out, uint32_t varyings, graphics::TgsiBindings* bindings) const {
   TgsiEmitter emitter(*this, allocator_, varyings < graphics::kMaxVaryings ? varyings : graphics::kMaxVaryings);
-  return emitter.run(out);
+  const NtStatus s = emitter.run(out);
+  if (s == status::kSuccess && bindings) *bindings = emitter.bindings();
+  return s;
 }
 
 }  // namespace dxgk

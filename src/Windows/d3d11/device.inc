@@ -449,6 +449,7 @@ static void dev_destroy(DxObj *o) {
   for (UINT k = 0; k < 4; ++k) if (d->blank_kind[k]) dx_Release(OBJ(d->blank_kind[k]));
   if (d->blank_buffer) dx_Release(OBJ(d->blank_buffer));
   if (d->blank_uav) dx_Release(OBJ(d->blank_uav));
+  if (d->root_wide) ID3D12RootSignature_Release(d->root_wide);
   for (UINT i = 0; i < d->pipeline_count; ++i) if (d->pipelines[i].state) ID3D12PipelineState_Release(d->pipelines[i].state);
   if (d->ring) ID3D12Resource_Release(d->ring);
   spares_release(d);
@@ -520,6 +521,15 @@ static HRESULT dev_start(Dev *d) {
     hr = ID3D12Device_CreateRootSignature(d->d12, 0, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, (void **)&d->root);
   if (blob) ID3D10Blob_Release(blob);
   if (FAILED(hr) || !d->root) return FAILED(hr) ? hr : E_FAIL;
+  /* (and the wide one: t0 .. t127) */
+  views.NumDescriptors = SRV_SLOTS;
+  blob = error = NULL;
+  hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1_0, &blob, &error);
+  if (error) ID3D10Blob_Release(error);
+  if (SUCCEEDED(hr) && blob)
+    hr = ID3D12Device_CreateRootSignature(d->d12, 0, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, (void **)&d->root_wide);
+  if (blob) ID3D10Blob_Release(blob);
+  if (FAILED(hr) || !d->root_wide) return FAILED(hr) ? hr : E_FAIL;
 
   /* (the indirect draws and dispatches: one command each, whose arguments are Direct3D 11's) */
   static const D3D12_INDIRECT_ARGUMENT_TYPE kinds[3] = {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW, D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED, D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH};

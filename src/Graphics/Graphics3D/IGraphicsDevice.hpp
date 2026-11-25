@@ -34,6 +34,7 @@
 #pragma once
 #include "Graphics/GraphicsTypes.hpp"
 #include "Graphics/Graphics3D/Mipmaps.hpp"
+#include "Graphics/Graphics3D/TexelBuffer.hpp"
 
 namespace graphics {
 
@@ -366,7 +367,18 @@ struct ShaderIo {
 // The images shaders read and write texel by texel (Direct3D's unordered access views of textures, RWTexture1D / 2D / 2DArray / 3D): slots 0 .. kMaxStorageImages - 1, the u# registers a
 // shader declares as typed views of textures (a register is a storage buffer or a storage image by its declaration). A slot shows one level of the image and a run of its layers (an array's
 // layers, a volume's slices), and the format is the image's own.
-constexpr uint32_t kMaxStorageImages = 8;
+constexpr uint32_t kMaxStorageImages = 64;
+// Typed views of buffers (kFeature2TexelBuffers; TexelBuffer.hpp): an unordered access view of a buffer (RWBuffer<>) is a storage image of the u# slot space (bind_storage_texel_buffer
+// with a slot below kMaxStorageImages); a typed shader resource view of a buffer (Buffer<>, t#) is one in the slots after them (kTexelBufferSlotBase + n), read only. Such an image is one row
+// of `elements` texels (size: width elements, height 1, one layer), the texel x the element.
+constexpr uint32_t kMaxTexelBufferViews = 128;
+constexpr uint32_t kTexelBufferSlotBase = kMaxStorageImages;
+constexpr uint32_t kMaxImageSlots = kMaxStorageImages + kMaxTexelBufferViews;
+struct TexelBufferView {
+  uint64_t offset = 0;      // the first element's byte (a multiple of the element's size)
+  uint32_t elements = 0;    // how many elements the view has
+  TexelFormat format = TexelFormat::Undefined;
+};
 struct StorageImageView {
   uint32_t level = 0;         // the mip level (a mipmapped 2D image; 0 for the others, which have one)
   uint32_t first_layer = 0;   // the first layer (an array, a volume's first slice) ...
@@ -381,7 +393,7 @@ constexpr bool storage_view_compatible(Format image, Format view) {
          (image == Format::R8G8B8A8Unorm && view == Format::R8G8B8A8Uint) || (image == Format::R8G8B8A8Uint && view == Format::R8G8B8A8Unorm);
 }
 enum class ImageAtomic : uint8_t { Add, And, Or, Xor, IMax, IMin, UMax, UMin, Exchange, CompareExchange };
-// What a software shader reads and writes the bound storage images through. Values travel as the textures' do: floats for the normalised and float formats (what the format keeps of a stored
+// What a software shader reads and writes the bound storage images (and the typed views of buffers: slots up to kMaxImageSlots) through. Values travel as the textures' do: floats for the normalised and float formats (what the format keeps of a stored
 // value: clamped and rounded to its steps), the bits of the integers in the Vec4's components for the integer formats; a component the format does not have reads as 0, the alpha as 1 (the
 // integer 1 for an integer format). A texel outside the view (or a slot with nothing bound) reads as zero, and a write there is dropped.
 class IStorageImages {
@@ -454,6 +466,7 @@ struct StreamOutputEntry {
 };
 struct GeometryInputData {
   const ByteView* storage = nullptr;   // the views of buffers the draw can read (kFeatureStorageInDraws), as for the vertex shader
+  const IStorageImages* images = nullptr;   // the storage images of the draw (kFeature2StorageImagesAllStages)
   Vec4 position[kMaxGeometryInputVertices];
   Vec4 varying[kMaxGeometryInputVertices][kMaxVaryings];
   uint32_t primitive_id = 0;   // the number of the primitive in the draw
@@ -479,6 +492,7 @@ enum class TessPartitioning : uint8_t { Integer, Pow2, FractionalOdd, Fractional
 enum class TessOutput : uint8_t { TriangleCw, TriangleCcw, Point, Line };
 struct HullInputData {
   const ByteView* storage = nullptr;
+  const IStorageImages* images = nullptr;   // (kFeature2StorageImagesAllStages)
   uint32_t control_points = 0;
   uint32_t primitive_id = 0;
   Vec4 position[kMaxPatchControlPoints];
@@ -486,6 +500,7 @@ struct HullInputData {
 };
 struct HullOutputData {
   const ByteView* storage = nullptr;                // (the domain shader's views of buffers: the draw's)
+  const IStorageImages* images = nullptr;           // (and its storage images, kFeature2StorageImagesAllStages)
   ShaderIo control_point[kMaxPatchControlPoints];   // the output control points
   Vec4 patch[kMaxPatchRegisters];                   // the patch constant registers (the tessellation factors are in the x of theirs)
   float outer[4] = {};                              // edge factors (triangle: the u = 0, v = 0 and w = 0 edges; quad: u = 0, v = 0, u = 1, v = 1; isoline: line density, line detail)
@@ -497,9 +512,32 @@ using DomainShaderFn = void (*)(const HullOutputData& patch, float u, float v, f
 // Compute shaders (kFeatureCompute). A software compute shader is called once per thread; the device runs the groups of a dispatch one after the other and the threads of a group
 // in order (no barriers or group-shared memory: a module that needs them is not given a function). `buffers` are the storage buffers bound at the time (empty views for slots
 // that are not bound); a read or write outside a buffer must be dropped or read as zero by the shader.
-constexpr uint32_t kMaxUavBuffers = 4;                            // u0 .. u3: storage buffers shaders read and write
-constexpr uint32_t kMaxSrvBuffers = 4;                            // t0 .. t3 of a buffer: read-only storage buffers, in the slots after the u# ones (slot kMaxUavBuffers + n)
-constexpr uint32_t kMaxStorageBuffers = kMaxUavBuffers + kMaxSrvBuffers;
+constexpr uint32_t kMaxUavBuffers = 64;                           // u0 .. u63: storage buffers shaders read and write (Direct3D 11.1's 64 unordered access views)
+constexpr uint32_t kMaxSrvBuffers = 128;                          // t0 .. t127 of a buffer: read-only storage buffers, in the slots after the u# ones (slot kMaxUavBuffers + n)
+// The hidden counters of u0 .. u63 (append and consume buffers, counter views: imm_atomic_alloc / imm_atomic_consume): one 32-bit word each, a storage buffer bound like the others in
+// slot kCounterSlotBase + n (read and written by the shaders that have the counter of u<n>).
+constexpr uint32_t kCounterSlotBase = kMaxUavBuffers + kMaxSrvBuffers;
+constexpr uint32_t kMaxStorageBuffers = kCounterSlotBase + kMaxUavBuffers;
+// Whether storage slot `slot` is written by shaders (an unordered access view or a counter) or only read (a shader resource view of a buffer).
+constexpr bool storage_slot_writable(uint32_t slot) { return slot < kMaxUavBuffers || (slot >= kCounterSlotBase && slot < kMaxStorageBuffers); }
+// A set of slot numbers (bit n: slot n), for the slot spaces above 32.
+template <uint32_t N>
+struct SlotMask {
+  uint64_t words[(N + 63) / 64] = {};
+  constexpr bool test(uint32_t n) const { return n < N && ((words[n / 64] >> (n % 64)) & 1) != 0; }
+  constexpr void set(uint32_t n) {
+    if (n < N) words[n / 64] |= uint64_t{1} << (n % 64);
+  }
+  constexpr bool any() const {
+    for (uint64_t w : words)
+      if (w) return true;
+    return false;
+  }
+  constexpr SlotMask& operator|=(const SlotMask& o) {
+    for (uint32_t i = 0; i < (N + 63) / 64; ++i) words[i] |= o.words[i];
+    return *this;
+  }
+};
 constexpr uint32_t kMaxSharedMemories = 4;     // group-shared memories (g0 .. g3) of a compute shader (the group runner makes them: a context's `shared`)
 constexpr uint32_t kMaxSharedBytes = 32768;   // all of them together (Direct3D's limit)
 constexpr uint32_t kMaxBarrierThreads = 256;  // threads of a group that uses barriers (each has its own registers while it waits)
@@ -528,6 +566,18 @@ enum class QpuProgram : uint8_t { None, ColoredVertex, ColoredFragment };
 
 // The pixel kernels the Intel Gen9 device has for the built-in shaders (there is no shader compiler for the EUs either).
 enum class EuProgram : uint8_t { None, ColoredVertex, ColoredFragment, TexturedVertex, TexturedFragment };
+
+// The host's binding points of a TGSI shader's storage (virgl), numbered densely: BUFFER[k] is storage slot storage[k], IMAGE[k] image slot images[k] (a u# one: a texture's view or a
+// buffer's), SVIEW[kTgsiTexelViewBase + k] (with SAMP of the same number) the typed view of a buffer in image slot texels[k] (a t# one). In the text, IMGFMT<k> stands for the format of
+// what is bound to IMAGE[k], IMGOFS<k> / IMGLEN<k> for the first element and the element count of a view of a buffer bound there, TBOFS<k> / TBLEN<k> for the elements the device's view of
+// SVIEW[kTgsiTexelViewBase + k] starts before the view's first (0 when the host's view starts there) and the view's element count: the device writes the numbers in their places.
+constexpr uint32_t kTgsiMaxBuffers = 32, kTgsiMaxImages = 32, kTgsiMaxTexelViews = 16, kTgsiTexelViewBase = kMaxTextureUnits;
+struct TgsiBindings {
+  uint16_t storage[kTgsiMaxBuffers] = {};
+  uint16_t images[kTgsiMaxImages] = {};
+  uint16_t texels[kTgsiMaxTexelViews] = {};
+  uint32_t storage_count = 0, image_count = 0, texel_count = 0;
+};
 
 struct ShaderModuleDesc {
   ShaderStage stage = ShaderStage::Vertex;
@@ -565,6 +615,7 @@ struct ShaderModuleDesc {
   // The text reads the comparison of the sampler bound to each texture unit u it compares with (SampleCmp, GatherCmp) at CONST[kSamplerCompareRegister + u]: (1 if reference < texel passes,
   // 1 if reference == texel passes, 1 if reference > texel passes, 1 for a linear filter, else 0 each) - the device puts them there from the bound SamplerDescs (sampler_compare_constant).
   bool sampler_constants = false;
+  TgsiBindings tgsi_bindings;   // (the storage the text names, and where the device binds it)
   // Direct3D 9 shader bytecode (vs_2_0 / ps_2_0 token stream) for the VMware SVGA3D device. A vertex shader writes clip space with +Y up (Direct3D's)
   // when it takes the c31 constant (1, -1, 1, 1) as a factor of the position; the device supplies it, so that Vulkan's +Y down comes out right.
   const uint32_t* d3d9_tokens = nullptr;
@@ -805,6 +856,9 @@ class ICommandBuffer {
   // Storage images (kFeature2StorageImages; inside a pass kFeature2StorageImagesInDraws, for pixel shaders): makes `view` of `image` (a kImageStorage image; nullptr unbinds) slot
   // 0 .. kMaxStorageImages - 1 for the dispatches and draws that follow. What the shaders write is in the image after the submit. A device without the feature ignores it.
   virtual void bind_storage_image(uint32_t slot, IImage* image, const StorageImageView& view) { (void)slot, (void)image, (void)view; }
+  // Typed views of buffers (kFeature2TexelBuffers): makes `view` of `buffer` (kBufferStorage; nullptr unbinds) image slot `slot` (below kMaxImageSlots: the u# ones below kMaxStorageImages,
+  // read and written, and the t# ones from kTexelBufferSlotBase, read) for the dispatches and draws that follow. The view lies in the buffer and its offset is a multiple of the element.
+  virtual void bind_storage_texel_buffer(uint32_t slot, IBuffer* buffer, const TexelBufferView& view) { (void)slot, (void)buffer, (void)view; }
   // Occlusion queries (kFeatureOcclusionQueries), inside a render pass: from begin to end, the fragments that pass the stencil and depth tests (and that the shader did not
   // discard) are counted - one per pixel, however many targets the pipeline writes and whatever the blending or write masks do. `slot` (below kMaxOcclusionQueries) names the result; one query is open at a time and
   // it ends before the pass does. A device without the feature ignores both.
@@ -886,6 +940,8 @@ enum DeviceFeature2 : uint32_t {
   // ... and the depth and the stencil plane of one of them read in one draw or dispatch (two units bound to it, one with SamplerDesc::stencil). A device without it (virgl: the host's
   // texture reads one plane at a time, GL_DEPTH_STENCIL_TEXTURE_MODE) is not given such a draw: the kernel refuses it.
   kFeature2DepthAndStencilPlanes = 1u << 17,
+  kFeature2TexelBuffers = 1u << 5,          // typed views of buffers (bind_storage_texel_buffer, TexelBuffer.hpp): in the shaders that take storage images
+  kFeature2StorageImagesAllStages = 1u << 6,   // storage images and typed views of buffers in vertex, geometry, hull and domain shaders too (VertexContext / GeometryInputData / HullInputData::images)
 };
 
 
