@@ -199,6 +199,7 @@ enum AllocationFlags : uint32_t {
 
 constexpr uint32_t kTileTexels = 128;   // ... a reserved texture of 4-byte texels has tiles of kTileTexels x kTileTexels (so 64 KiB; the rows of a tile follow one another in the heap)
 constexpr uint32_t kTileBytes = 65536;   // the size of a tile of a reserved resource
+constexpr uint32_t kTileStandardSwizzle = 1u << 8;   // AllocationDesc::tile_narrow: the standard swizzle inside the tiles (its low 8 bits the NarrowLayout)
 // The shape of a 64 KiB tile of a reserved texture, in its elements - texels, or the 4 x 4 blocks of a block-compressed format - of `element_bytes` each in the heaps: Direct3D's
 // standard tile shapes. A 2D texture, an array or a cube (depth 1): 8 bits 256 x 256, 16 bits 256 x 128, 32 bits 128 x 128, 64 bits 128 x 64 (BC1 / BC4 blocks: 512 x 256 texels),
 // 128 bits 64 x 64 (the other BC blocks: 256 x 256 texels). A volume (Texture3D): 8 bits 64 x 32 x 32, 16 bits 32 x 32 x 32, 32 bits 32 x 32 x 16, 64 bits 32 x 16 x 16 (BC1 / BC4:
@@ -245,7 +246,8 @@ struct AllocationDesc {
   uint32_t initial_state = 0;        // kAllocTrackState: the resource state it starts in (D3d12.hpp ResourceState)
   uint32_t layers = 1;               // Texture3D: the depth; Texture2DArray: the array size (1 .. graphics::kMaxTextureLayers); TextureCube: 6 (width equals height)
   uint32_t tile_narrow = 0;          // a reserved texture: the NarrowLayout (CommandStream.hpp) of its texels in the heaps' tiles - Direct3D's R8 / R8G8 (of an A8B8G8R8 / X8B8G8R8
-                                     //   image) or R16 / R16G16 (of A16B16G16R16 / A16B16G16R16Sint), which the image keeps widened; 0: the tiles hold the image's own pixels
+                                     //   image) or R16 / R16G16 (of A16B16G16R16 / A16B16G16R16Sint), which the image keeps widened; 0: the tiles hold the image's own pixels.
+                                     //   With kTileStandardSwizzle: the elements of a standard level's tile are in Direct3D's 64 KiB standard swizzle (D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE), not row by row
 };
 
 struct AllocationInfo {

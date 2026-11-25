@@ -7173,6 +7173,55 @@ void test_dxil() {
     return st == status::kSuccess && *program;
   };
   DxilTextures textures;
+  // Residency feedback and the lookups' clamps (tiled resources tier 2): dxc's DXIL of ps_tiled / ps_tiled_clamp (dxil_ps_tiled*.hlsl) does what fxc's DXBC does, with textures whose
+  // lookups report texels at u above one half unmapped and show the clamp they were given.
+  {
+    struct FeedbackTextures final : graphics::ITextureSet {
+      mutable bool on = false, unmapped = false;
+      mutable float clamp = -1e30f;
+      void note(float u) const {
+        if (on && u > 0.5f) unmapped = true;
+      }
+      float shown() const { return clamp > -1e29f ? clamp : 0.25f; }
+      graphics::Vec4 sample(uint32_t, float u, float v) const override { return note(u), graphics::Vec4{u, v, shown(), 1.0f}; }
+      graphics::Vec4 sample_lod(uint32_t, float u, float v, float lod) const override { return note(u), graphics::Vec4{u * 0.5f, v * 0.5f, (lod > clamp ? lod : clamp) * 0.125f, 0.5f}; }
+      graphics::Vec4 fetch(uint32_t, int32_t x, int32_t y, uint32_t level) const override {
+        return note(static_cast<float>(x) / 8.0f), graphics::Vec4{x * 0.0625f, y * 0.125f, static_cast<float>(level) * 0.25f, 0.75f};
+      }
+      bool size(uint32_t, uint32_t level, uint32_t* width, uint32_t* height, uint32_t* levels) const override {
+        *width = 8u >> level, *height = 8u >> level, *levels = 3;
+        return level < 3;
+      }
+      void begin_feedback(float min_lod) const override { on = true, unmapped = false, clamp = min_lod; }
+      bool end_feedback() const override {
+        const bool mapped = !unmapped;
+        on = unmapped = false, clamp = -1e30f;
+        return mapped;
+      }
+    } feedback_textures;
+    const char* const pairs[2][2] = {{"ps_tiled.dxbc", "dxil_ps_tiled.dxil"}, {"ps_tiled_clamp.dxbc", "dxil_ps_tiled_clamp.dxil"}};
+    unsigned unmapped_seen = 0, mapped_seen = 0;
+    for (const auto& pair : pairs) {
+      UniquePointer<D3d9Program> reference, translated;
+      CHECK(load(pair[0], &reference) && load(pair[1], &translated));
+      if (!reference || !translated) continue;
+      CHECK(reference->uses_feedback() && translated->uses_feedback());
+      for (uint32_t n = 0; n < 100; ++n) {
+        graphics::Vec4 varyings[16] = {};
+        varyings[2] = {random(0, 1), random(0, 1), 0, 0};
+        graphics::FragmentContext context;
+        context.position = {random(0, 32), random(0, 32), random(0, 1), 1};
+        graphics::Vec4 a_room[graphics::kMaxColorTargets] = {}, b_room[graphics::kMaxColorTargets] = {};
+        uint8_t constants[128] = {};
+        CHECK(reference->run_fragment_ex(varyings, context, constants, &feedback_textures, a_room) && translated->run_fragment_ex(varyings, context, constants, &feedback_textures, b_room));
+        const bool same = close_to(a_room[0].x, b_room[0].x) && close_to(a_room[0].y, b_room[0].y) && close_to(a_room[0].z, b_room[0].z) && close_to(a_room[0].w, b_room[0].w);
+        if (!same && n < 3) printf("  %s #%u: %g %g %g %g vs %g %g %g %g\n", pair[1], n, a_room[0].x, a_room[0].y, a_room[0].z, a_room[0].w, b_room[0].x, b_room[0].y, b_room[0].z, b_room[0].w);
+        CHECK(same);
+        if (&pair == &pairs[0]) (a_room[0].w == 1.0f ? mapped_seen : unmapped_seen) += 1;
+      }
+    }
+    CHECK(mapped_seen > 10 && unmapped_seen > 10);   // (both outcomes of the status were seen)
+  }
   // The pixel shaders: the same varyings, the same colour (and the same pixel killed).
   for (const char* name : {"dxil_ps_math", "dxil_ps_tex", "dxil_ps_flow", "dxil_ps_loop", "dxil_ps_loop2"}) {
     UniquePointer<D3d9Program> reference, translated;

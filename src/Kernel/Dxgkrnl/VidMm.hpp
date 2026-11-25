@@ -47,6 +47,9 @@ struct ReservedLayout {
   uint32_t image_bytes = 0;      // ... and in the backing
   uint32_t block = 1;            // texels per element across and down: 4 for a block-compressed format
   bool volume = false;
+  // The standard swizzle (kTileStandardSwizzle): where an element (x, y, z) of a standard level's tile is in it - the bits of x * element_bytes, y and z deposited into these masks of
+  // the 16 bits of the offset (Direct3D's patterns, as src/Windows/tcos_swizzle.h has them); 0: rows. The packed levels stay rows of elements (their layout is the adapter's).
+  uint32_t swizzle_x = 0, swizzle_y = 0, swizzle_z = 0;
   TileShape shape;               // in elements
   uint32_t mips = 0, slices = 1, standard = 0;
   uint64_t first[kMaxReservedLevels] = {}, columns[kMaxReservedLevels] = {}, rows[kMaxReservedLevels] = {}, deep[kMaxReservedLevels] = {};   // a standard level's tiles in one slice

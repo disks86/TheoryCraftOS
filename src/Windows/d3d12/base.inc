@@ -48,6 +48,7 @@ enum {
 enum { KFC_SAMPLED = 1, KFC_FILTERED = 2, KFC_RENDER_TARGET = 4, KFC_BLENDABLE = 8, KFC_STORAGE = 16, KFC_MIPMAPS = 32, KFC_MULTISAMPLE = 64, KFC_NATIVE = 128 };
 #define KMAX_TEXTURE_DIMENSION 4096      /* (the video surfaces' limit; textures: the adapter's KmtCaps::max_texture_dimension, up to 16384) */
 #define KTILE_BYTES 65536
+#define KTILE_STANDARD_SWIZZLE (1u << 8)   /* AllocationDesc::tile_narrow: Direct3D's standard swizzle inside the tiles (the kernel's kTileStandardSwizzle) */
 
 typedef struct FormatInfo {
   DXGI_FORMAT dxgi;
@@ -337,7 +338,7 @@ struct Dev {
 #define DEV_FEATURE2_SAMPLER_STATE (1u << 11)            /* anisotropy, border colours of any value */
 #define DEV_FEATURE2_VIEWPORTS (1u << 12)                /* sixteen viewports and scissor rectangles, SV_ViewportArrayIndex from geometry shaders */
 #define DEV_FEATURE2_LAYER_ANY_STAGE (1u << 13)          /* SV_RenderTargetArrayIndex and SV_ViewportArrayIndex from vertex and domain shaders */
-#define DEV_FEATURE2_TILE_RESIDENCY (1u << 24)           /* graphics::kFeature2TileResidency: residency feedback (CheckAccessFullyMapped) and lookup clamps - tiled resources tier 2 and up */
+#define DEV_FEATURE2_TILE_RESIDENCY (1u << 27)           /* graphics::kFeature2TileResidency: residency feedback (CheckAccessFullyMapped) and lookup clamps - tiled resources tier 2 and up */
 #define DEV_FEATURE_TEXTURE_KINDS (1u << 8)              /* graphics::kFeatureTextureKinds: volumes, arrays, cubes */
 /* What allocations of a kernel format numbered from KF_FIRST_EXTRA may be on the device's adapter (KFC_* bits; 0 for any other format, or from a kernel that has no table) */
 static UINT dev_format_caps(const Dev *d, UINT kf) {

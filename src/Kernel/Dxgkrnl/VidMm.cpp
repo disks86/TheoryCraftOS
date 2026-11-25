@@ -170,8 +170,24 @@ bool reserved_layout(const AllocationDesc& d, ReservedLayout* out) {
   l.volume = d.kind == graphics::TextureKind::Texture3D;
   l.block = compressed ? 4 : 1;
   l.image_bytes = compressed ? block_bytes(d.format) : pixel_bytes(d.format);
-  l.element_bytes = d.tile_narrow ? narrow_pixel_bytes(static_cast<NarrowLayout>(d.tile_narrow)) : l.image_bytes;
+  const uint32_t narrow = d.tile_narrow & 0xFFu;
+  l.element_bytes = narrow ? narrow_pixel_bytes(static_cast<NarrowLayout>(narrow)) : l.image_bytes;
   l.shape = tile_shape(l.element_bytes, l.volume);
+  if (d.tile_narrow & kTileStandardSwizzle) {
+    // (Direct3D's 64 KiB standard swizzle: each pattern names, from bit 15 down, which coordinate's next bit goes there - X of the byte offset across, '-' the bytes of an element)
+    static const char* const kFlat[5] = {"XYXYXYXYYYYYXXXX", "XYXYXYXYXYYYXXX-", "XYXYXYXYXYYYXX--", "XYXYXYXYXXYYX---", "XYXYXYXYXXYY----"};
+    static const char* const kVolume[5] = {"XYZXYZYZZZYYXXXX", "XYZXYZYZZZYYXXX-", "XYZXYZXYZZYYXX--", "XYZXYZXXZZYYX---", "XYZXYZXXZZYY----"};
+    const uint32_t e = l.element_bytes;
+    const int index = e == 1 ? 0 : e == 2 ? 1 : e == 4 ? 2 : e == 8 ? 3 : e == 16 ? 4 : -1;
+    if (index < 0) return false;
+    const char* pattern = l.volume ? kVolume[index] : kFlat[index];
+    for (uint32_t i = 0; i < 16; ++i) {
+      const uint32_t bit = 1u << (15 - i);
+      if (pattern[i] == 'X' || pattern[i] == '-') l.swizzle_x |= bit;
+      else if (pattern[i] == 'Y') l.swizzle_y |= bit;
+      else if (pattern[i] == 'Z') l.swizzle_z |= bit;
+    }
+  }
   if (!l.shape.width || d.width == 0 || d.height == 0 || d.mip_levels == 0 || d.mip_levels > kMaxReservedLevels) return false;
   l.mips = d.mip_levels;
   l.slices = l.volume ? 1 : graphics::image_layer_count(d.kind, d.layers);
@@ -200,6 +216,16 @@ uint32_t reserved_elements_y(const ReservedLayout& l, const AllocationDesc& d, u
 uint32_t reserved_depth(const AllocationDesc& d, uint32_t level) { return d.kind == graphics::TextureKind::Texture3D ? graphics::level_layer_count(d.kind, d.layers, level) : 1; }
 
 namespace {
+// The bits of v deposited, lowest first, into the set bits of mask (the standard swizzle's interleaving).
+uint32_t deposit(uint32_t v, uint32_t mask) {
+  uint32_t out = 0;
+  for (uint32_t bit = 1; mask; bit <<= 1) {
+    const uint32_t lowest = mask & (0u - mask);
+    if (v & bit) out |= lowest;
+    mask &= mask - 1;
+  }
+  return out;
+}
 struct TileSpot {
   uint32_t slice = 0, level = 0;
   uint64_t x = 0, y = 0, z = 0;       // a standard level's tile: its column, row and depth in the level
@@ -275,19 +301,28 @@ void for_tile_runs(const Allocation& a, const ReservedLayout& l, uint64_t tile, 
   for (uint64_t z = 0; z < deep; ++z)
     for (uint64_t row = 0; row < down; ++row) {
       ByteView run;
-      if (row_of(spot.level, static_cast<uint32_t>(z0 + z), y0 + row, x0, across, &run))
+      if (!row_of(spot.level, static_cast<uint32_t>(z0 + z), y0 + row, x0, across, &run)) continue;
+      if (!l.swizzle_x) {
         use(run, (z * l.shape.height + row) * l.shape.width * l.element_bytes, static_cast<uint32_t>(across));
+        continue;
+      }
+      // (the standard swizzle: each element on its own place of the tile)
+      for (uint64_t x = 0; x < across; ++x) {
+        ByteView one;
+        if (!run.try_subview(x * l.image_bytes, l.image_bytes, &one)) break;
+        use(one, deposit(static_cast<uint32_t>(x * l.element_bytes), l.swizzle_x) | deposit(static_cast<uint32_t>(row), l.swizzle_y) | deposit(static_cast<uint32_t>(z), l.swizzle_z), 1u);
+      }
     }
 }
 // A run of `texels` of a reserved texture between its image's pixels and the heap's texels: the same bytes, or - a narrow layout - the first channels of each pixel, widened back
 // to (r, g or 0, 0, the maximum; 1 for an integer image) as CopyBufferImage widens. An empty `heap` (a tile mapped nowhere) gives zero texels.
 void image_from_heap(const AllocationDesc& d, ByteView image, ConstByteView heap, uint32_t texels) {
-  if (!d.tile_narrow) {
+  if (!(d.tile_narrow & 0xFFu)) {
     if (heap.empty()) image.fill(0);
     else image.copy_from(heap);
     return;
   }
-  const NarrowLayout narrow = static_cast<NarrowLayout>(d.tile_narrow);
+  const NarrowLayout narrow = static_cast<NarrowLayout>(d.tile_narrow & 0xFFu);
   const bool sixteen = narrow == NarrowLayout::R16 || narrow == NarrowLayout::R16G16, integer = d.format == Format::A16B16G16R16Sint;
   const uint32_t sample = sixteen ? 2 : 1, pixel = 4 * sample, texel = narrow_pixel_bytes(narrow);
   for (uint32_t i = 0; i < texels; ++i) {
@@ -302,8 +337,8 @@ void image_from_heap(const AllocationDesc& d, ByteView image, ConstByteView heap
 }
 // Whether a run of a reserved texture's pixels differs from the texels the heap holds for it (what heap_from_image would write).
 bool image_differs_from_heap(const AllocationDesc& d, ConstByteView image, ConstByteView heap, uint32_t texels) {
-  if (!d.tile_narrow) return !image.equals(heap);
-  const NarrowLayout narrow = static_cast<NarrowLayout>(d.tile_narrow);
+  if (!(d.tile_narrow & 0xFFu)) return !image.equals(heap);
+  const NarrowLayout narrow = static_cast<NarrowLayout>(d.tile_narrow & 0xFFu);
   const uint32_t sample = narrow == NarrowLayout::R16 || narrow == NarrowLayout::R16G16 ? 2 : 1, pixel = 4 * sample, texel = narrow_pixel_bytes(narrow);
   for (uint32_t i = 0; i < texels; ++i) {
     ConstByteView from, to;
@@ -313,11 +348,11 @@ bool image_differs_from_heap(const AllocationDesc& d, ConstByteView image, Const
   return false;
 }
 void heap_from_image(const AllocationDesc& d, ByteView heap, ConstByteView image, uint32_t texels) {
-  if (!d.tile_narrow) {
+  if (!(d.tile_narrow & 0xFFu)) {
     heap.copy_from(image);
     return;
   }
-  const NarrowLayout narrow = static_cast<NarrowLayout>(d.tile_narrow);
+  const NarrowLayout narrow = static_cast<NarrowLayout>(d.tile_narrow & 0xFFu);
   const uint32_t sample = narrow == NarrowLayout::R16 || narrow == NarrowLayout::R16G16 ? 2 : 1, pixel = 4 * sample, texel = narrow_pixel_bytes(narrow);
   for (uint32_t i = 0; i < texels; ++i) {
     ConstByteView from;
@@ -340,9 +375,11 @@ NtStatus VidMm::create(const AllocationDesc& requested, SharedPointer<Allocation
   const bool reserved_texture = reserved && (desc.flags & kAllocTexture) && !(desc.flags & ~(kAllocTexture | kAllocRenderTarget | kAllocStorageImage));
   if (reserved && (heap || requested.heap || (desc.flags & (kAllocQueryResult | kAllocConstantBuffer | kAllocHeap | kAllocShared))) ) return status::kInvalidParameter;
   if (reserved && !reserved_texture && (!(desc.flags & (kAllocVertexBuffer | kAllocIndexBuffer | kAllocUnorderedAccess | kAllocStreamOutput)) || desc.size == 0 || desc.size % kTileBytes)) return status::kInvalidParameter;
-  if (desc.tile_narrow != 0) {
+  if (desc.tile_narrow & ~(0xFFu | kTileStandardSwizzle)) return status::kInvalidParameter;
+  if ((desc.tile_narrow & kTileStandardSwizzle) && !reserved_texture) return status::kInvalidParameter;
+  if (desc.tile_narrow & 0xFFu) {
     // (a narrow layout: of an 8-bit four-channel image for R8 / R8G8, of a 16-bit one for R16 / R16G16 - what CopyBufferImage widens into)
-    const uint32_t n = desc.tile_narrow;
+    const uint32_t n = desc.tile_narrow & 0xFFu;
     const bool eight = n == static_cast<uint32_t>(NarrowLayout::R8) || n == static_cast<uint32_t>(NarrowLayout::R8G8);
     const bool sixteen = n == static_cast<uint32_t>(NarrowLayout::R16) || n == static_cast<uint32_t>(NarrowLayout::R16G16);
     if (!reserved_texture || (!eight && !sixteen) || (eight && desc.format != Format::A8B8G8R8 && desc.format != Format::X8B8G8R8) ||

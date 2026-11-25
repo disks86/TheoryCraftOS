@@ -3078,9 +3078,7 @@ static void test_tiled_formats(Scene *c) {
     const UINT across = (300 + shapes[i].w - 1) / shapes[i].w, down = (200 + shapes[i].h - 1) / shapes[i].h;
     const int standard = 300 >= shapes[i].w && 200 >= shapes[i].h;
     printf("tiled format %d: %ux%u tiles of %ux%u, %u in all\n", (int)shapes[i].f, tiling.WidthInTiles, tiling.HeightInTiles, shape.WidthInTexels, shape.HeightInTexels, total);
-    /* (a resource whose levels are all packed has no tile shape: GetResourceTiling gives zeros) */
-    if (standard) CHECK(shape.WidthInTexels == shapes[i].w && shape.HeightInTexels == shapes[i].h && shape.DepthInTexels == 1);
-    else CHECK(shape.WidthInTexels == 0 && shape.HeightInTexels == 0 && shape.DepthInTexels == 0);
+    CHECK(shape.WidthInTexels == shapes[i].w && shape.HeightInTexels == shapes[i].h && shape.DepthInTexels == 1);
     if (standard) CHECK(tiling.WidthInTiles == across && tiling.HeightInTiles == down && total == across * down && packed.NumPackedMips == 0);
     else CHECK(packed.NumPackedMips == 1 && packed.NumStandardMips == 0 && total == packed.NumTilesForPackedMips && total >= 1);
     ID3D12Resource_Release(r);
@@ -3144,7 +3142,7 @@ static void test_tiled_formats(Scene *c) {
   printf("R8 4096x64x7: %u tiles, %u standard + %u packed levels in %u tiles from %u\n", total, packed.NumStandardMips, packed.NumPackedMips, packed.NumTilesForPackedMips,
          packed.StartTileIndexInOverallResource);
   CHECK(total == 6 && packed.NumStandardMips == 0 && packed.NumPackedMips == 7 && packed.NumTilesForPackedMips == 6 && packed.StartTileIndexInOverallResource == 0);
-  CHECK(nsub == 7 && tilings[0].StartTileIndexInOverallResource == 0xFFFFFFFFu && shape.WidthInTexels == 0 && shape.HeightInTexels == 0);      /* (all packed: no shape) */
+  CHECK(nsub == 7 && tilings[0].StartTileIndexInOverallResource == 0xFFFFFFFFu && shape.WidthInTexels == 256 && shape.HeightInTexels == 256);
   {
     /* the six tiles to heap tiles 1 .. 6; CopyTiles of a pattern in; level 1 (2048 x 32, from byte 262144 of the packed run: tile 4) copied out as R8 */
     D3D12_TILED_RESOURCE_COORDINATE start = {0, 0, 0, 0};
@@ -6627,6 +6625,33 @@ static void test_tiled_tiers(Scene *c) {
       CHECK(sub_copy(c, bc, 0, level0, 1));
       CHECK(level0[8] == (BYTE)(8 * 7 + 3) && level0[256 * 8 + 3] == (BYTE)((128 * 8 + 3) * 7 + 3) && level0[128 * 8] == 0 && level0[256 * 8 * 64] == 0);
       ID3D12Resource_Release(bc);
+    }
+  }
+  {
+    /* --- 64KB_STANDARD_SWIZZLE: a 128 x 128 B8G8R8A8 tile whose words are their own byte offsets in it; texel (x, y) is at Direct3D's swizzle of x bytes 0xAA8F, y 0x5570 */
+    D3D12_RESOURCE_DESC sd = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 128, 128, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE,
+                              D3D12_RESOURCE_FLAG_NONE};
+    ID3D12Resource *sw = NULL;
+    CHECK_HR(ID3D12Device_CreateReservedResource(dev, &sd, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&sw));
+    if (sw) {
+      tt_map(c, sw, (D3D12_TILED_RESOURCE_COORDINATE){0, 0, 0, 0}, 1, heap, 13);
+      UINT32 *p = NULL;
+      CHECK_HR(ID3D12Resource_Map(upload, 0, NULL, (void **)&p));
+      if (p) { for (UINT i = 0; i < 65536 / 4; ++i) p[i] = i * 4; ID3D12Resource_Unmap(upload, 0, NULL); }
+      const D3D12_TILE_REGION_SIZE one = {1, FALSE, 0, 0, 0};
+      tt_copy(c, sw, (D3D12_TILED_RESOURCE_COORDINATE){0, 0, 0, 0}, one, upload, 0, D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE);
+      static UINT32 texels[128 * 128];
+      int same = texture_read(c, sw, 0, texels, 4);
+      for (UINT y = 0; same && y < 128; ++y)
+        for (UINT x = 0; x < 128; ++x) {
+          UINT off = 0;
+          for (UINT m = 0xAA8Fu, b = 1, v = x * 4; m; b <<= 1) { const UINT low = m & (0u - m); if (v & b) off |= low; m &= m - 1; }
+          for (UINT m = 0x5570u, b = 1; m; b <<= 1) { const UINT low = m & (0u - m); if (y & b) off |= low; m &= m - 1; }
+          same &= texels[y * 128 + x] == off;
+        }
+      printf("reserved texture of the standard swizzle: %s\n", same ? "texels where the swizzle puts them" : "wrong");
+      CHECK(same);
+      ID3D12Resource_Release(sw);
     }
   }
   {

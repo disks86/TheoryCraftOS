@@ -1179,7 +1179,7 @@ enum DeviceFeature2 : uint32_t {
   kFeature2LayerFromAnyStage = 1u << 13,    // ShaderIo::layer and ShaderIo::viewport written by vertex and domain shaders (Direct3D 11.3's VPAndRTArrayIndexFromAnyShaderFeedingRasterizer)
   // Residency feedback of tiled images (IImage::set_residency; Direct3D's tiled resources tier 2): a lookup reports whether every texel it read was mapped (ITextureSet::begin_feedback /
   // end_feedback), and lookups take a per-lookup minimum level of detail (Direct3D's SampleClamp). (A high bit, apart from the ones other work is adding.)
-  kFeature2TileResidency = 1u << 24,
+  kFeature2TileResidency = 1u << 27,
 };
 constexpr uint32_t kMaxViewports = 16;
 

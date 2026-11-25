@@ -786,12 +786,13 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
     if (uav && !r->planes && !fi->narrow) ad.flags |= KA_STORAGE_IMAGE;
     if (reserved) {
       /* (the kernel's reserved textures (VidMm ReservedLayout, tile_layout): of the formats tiling is a support of (format_tiled: not the video formats, whose tiles Direct3D
-       * does not define, nor depth ones), in the 64 KiB layout whose swizzle is the driver's (64KB_UNDEFINED_SWIZZLE); 2D textures, arrays and cubes, volumes from tier 3 (no 1D
+       * does not define, nor depth ones), in a 64 KiB layout (64KB_UNDEFINED_SWIZZLE: tiles of rows of elements; 64KB_STANDARD_SWIZZLE: Direct3D's swizzle in the tiles); 2D textures, arrays and cubes, volumes from tier 3 (no 1D
        * ones: Direct3D has no tiles for them), sampled, drawn into and unordered access - of the formats the kernel's storage images have: a narrow one is written through a
        * mirror, which cannot be of a reserved image -, one sample (no D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE level). An array of more than one slice may have
        * packed levels - each slice its own - from tier 4; at tiers 2 and 3 all its levels must be at least a tile, at tier 1 whole tiles (D3D12_TILED_RESOURCES_TIER)) */
       const D3D12_TILED_RESOURCES_TIER tier = dev_tiled_tier(dev);
-      if (!format_tiled(fi) || r->planes || desc->Layout != D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE || desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D || want_depth ||
+      const int standard_swizzle = desc->Layout == D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE;
+      if (!format_tiled(fi) || r->planes || (desc->Layout != D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE && !standard_swizzle) || desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D || want_depth ||
           (r->kind == 1 && tier < D3D12_TILED_RESOURCES_TIER_3)) { hr = E_INVALIDARG; goto fail; }
       if (uav && fi->narrow) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }      /* (see above: no mirror of a reserved image) */
       if (r->mips > 1 && !device_format_levels(dev, fi->kernel)) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
@@ -805,7 +806,9 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
         for (UINT l = 0; l < tl.mips; ++l)
           if (mip_extent((UINT)desc->Width, l) % tl.tile_w || mip_extent(desc->Height, l) % tl.tile_h) { hr = E_INVALIDARG; goto fail; }
       ad.flags = KA_TEXTURE | KA_RESERVED | (target ? KA_RENDER_TARGET : 0) | (uav ? KA_STORAGE_IMAGE : 0);
-      ad.tile_narrow = fi->narrow;      /* (NARROW_* is the kernel's NarrowLayout) */
+      /* (NARROW_* is the kernel's NarrowLayout; 64KB_STANDARD_SWIZZLE: the elements of a standard level's tile are in Direct3D's standard swizzle - kTileStandardSwizzle -,
+       * so CopyTiles moves them so; the packed levels' layout is the driver's either way) */
+      ad.tile_narrow = fi->narrow | (standard_swizzle ? KTILE_STANDARD_SWIZZLE : 0u);
       r->reserved = 1;
     }
     ad.format = fi->kernel;

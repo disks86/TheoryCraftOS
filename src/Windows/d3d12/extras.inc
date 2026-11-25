@@ -542,8 +542,8 @@ static HRESULT STDMETHODCALLTYPE dev_CreateReservedResource(Dev *This, const D3D
 
 /* GetResourceTiling: the numbering tile_layout gives (the kernel's). A buffer is one subresource of 64 KiB x 1 x 1 tiles; a texture has a subresource per level and slice (a
  * volume's levels), the standard ones with their tiles in x, y and z and the first tile's number, the packed ones D3D12_PACKED_TILE with the rest zero - D3D12_PACKED_MIP_INFO
- * says where the packed tiles of the first slice start (each slice's are that far into its tiles) and how many each slice has. The tile shape is the standard levels' (zero
- * when every level is packed). `*count` in: how many subresource tilings fit from `first` on; out: how many were written. A resource that is not reserved has no tiles: zeros. */
+ * says where the packed tiles of the first slice start (each slice's are that far into its tiles) and how many each slice has. The tile shape is the format's standard one
+ * (as drivers give it, even when every level is packed). `*count` in: how many subresource tilings fit from `first` on; out: how many were written. A resource that is not reserved has no tiles: zeros. */
 static void STDMETHODCALLTYPE dev_GetResourceTiling(Dev *This, ID3D12Resource *resource, UINT *total, D3D12_PACKED_MIP_INFO *packed, D3D12_TILE_SHAPE *shape, UINT *count, UINT first,
                                                     D3D12_SUBRESOURCE_TILING *tilings) {
   const Resource *r = (const Resource *)resource;
@@ -564,7 +564,8 @@ static void STDMETHODCALLTYPE dev_GetResourceTiling(Dev *This, ID3D12Resource *r
   if (shape) {
     memset(shape, 0, sizeof *shape);
     if (reserved && t.buffer) { shape->WidthInTexels = KTILE_BYTES; shape->HeightInTexels = 1; shape->DepthInTexels = 1; }
-    else if (reserved && t.standard) { shape->WidthInTexels = t.tile_w; shape->HeightInTexels = t.tile_h; shape->DepthInTexels = t.tile_d; }
+    /* (the standard tile shape also when every level is packed: the documentation says zeros, the drivers - and vkd3d-proton's conformance test of them - give the shape) */
+    else if (reserved && t.tile_w) { shape->WidthInTexels = t.tile_w; shape->HeightInTexels = t.tile_h; shape->DepthInTexels = t.tile_d; }
   }
   if (count) {
     const UINT subresources = reserved ? t.mips * t.slices : 0;

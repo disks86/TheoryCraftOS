@@ -2722,12 +2722,12 @@ static void test_device5(void) {
         o.MapNoOverwriteOnDynamicConstantBuffer && o.OutputMergerLogicOp && !o.ExtendedDoublesShaderInstructions, "D3D11_FEATURE_D3D11_OPTIONS");
   D3D11_FEATURE_DATA_D3D11_OPTIONS2 o2;
   memset(&o2, 0xCC, sizeof o2);
-  check(SUCCEEDED(ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_D3D11_OPTIONS2, &o2, sizeof o2)) && o2.TiledResourcesTier == D3D11_TILED_RESOURCES_TIER_1 &&
+  check(SUCCEEDED(ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_D3D11_OPTIONS2, &o2, sizeof o2)) && (o2.TiledResourcesTier == D3D11_TILED_RESOURCES_TIER_1 || o2.TiledResourcesTier == D3D11_TILED_RESOURCES_TIER_3) &&
         o2.ConservativeRasterizationTier <= D3D11_CONSERVATIVE_RASTERIZATION_TIER_1 && o2.MapOnDefaultTextures && o2.StandardSwizzle, "D3D11_FEATURE_D3D11_OPTIONS2");
   D3D11_FEATURE_DATA_D3D11_OPTIONS1 o1;
   memset(&o1, 0xCC, sizeof o1);
-  check(SUCCEEDED(ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_D3D11_OPTIONS1, &o1, sizeof o1)) && o1.TiledResourcesTier == D3D11_TILED_RESOURCES_TIER_1 &&
-        !o1.MinMaxFiltering && !o1.MapOnDefaultBuffers, "D3D11_FEATURE_D3D11_OPTIONS1: tiled resources tier 1");
+  check(SUCCEEDED(ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_D3D11_OPTIONS1, &o1, sizeof o1)) && o1.TiledResourcesTier == o2.TiledResourcesTier &&
+        !o1.MinMaxFiltering && !o1.MapOnDefaultBuffers, "D3D11_FEATURE_D3D11_OPTIONS1: tiled resources tier 1 or 3 (test_tiled_tiers)");
   D3D11_FEATURE_DATA_FORMAT_SUPPORT2 tf = {DXGI_FORMAT_R8G8B8A8_UNORM, 0};
   check(SUCCEEDED(ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_FORMAT_SUPPORT2, &tf, sizeof tf)) && (tf.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_TILED),
         "FORMAT_SUPPORT2: R8G8B8A8_UNORM may be tiled");
@@ -3589,7 +3589,7 @@ static void test_tiled_resources(ID3D11Device5 *d5, ID3D11DeviceContext4 *c4) {
     D3D11_PACKED_MIP_DESC packed;
     D3D11_TILE_SHAPE shape;
     ID3D11Device5_GetResourceTiling(d5, (ID3D11Resource *)tb, &total, &packed, &shape, &subs, 0, NULL);
-    check(total == 3 && subs == 0, "GetResourceTiling of the tiled buffer: three tiles");
+    check(total == 3 && subs == 1, "GetResourceTiling of the tiled buffer: three tiles, one subresource tiling");
     memset(back, 0xEE, 3 * TILE);
     check(read_buffer(tb, back, 3 * TILE) && back[0] == 0 && back[3 * TILE - 1] == 0, "a tiled buffer with nothing mapped reads as zeros");
     /* (tile 0 on pool tile 1; tiles 1 and 2 on pool tile 0) */
@@ -3646,9 +3646,9 @@ static void test_tiled_resources(ID3D11Device5 *d5, ID3D11DeviceContext4 *c4) {
   td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
   td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
   check(ID3D11Device5_CreateTexture2D(d5, &td, NULL, &tbad) == E_INVALIDARG && !tbad, "CreateTexture2D refuses a tiled texture the CPU reads");
-  D3D11_TEXTURE3D_DESC vd = {32, 32, 32, 1, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_TILED};
-  ID3D11Texture3D *vbad = NULL;
-  check(ID3D11Device5_CreateTexture3D(d5, &vd, NULL, &vbad) == E_INVALIDARG && !vbad, "CreateTexture3D refuses a tiled volume (tier 3)");
+  D3D11_TEXTURE1D_DESC od = {256, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_TILED};
+  ID3D11Texture1D *obad = NULL;
+  check(ID3D11Device5_CreateTexture1D(d5, &od, NULL, &obad) == E_INVALIDARG && !obad, "CreateTexture1D refuses a tiled texture (never tiled)");
   UINT32 *texels = malloc(256 * 256 * 4), *seen = malloc(256 * 256 * 4);
   if (tt && texels && seen) {
     UINT total = 0, subs = 1;
@@ -3744,6 +3744,156 @@ static void test_tiled_resources(ID3D11Device5 *d5, ID3D11DeviceContext4 *c4) {
   free(seen);
   free(bytes);
   free(back);
+  ID3D11Buffer_Release(pool);
+}
+
+/* Tiled resources tiers 2 and 3 (Direct3D 11.3): the tier per device (3 on the CPU renderer, 1 on virgl, whose shaders have no residency feedback), tiled volumes (tier 3), arrays
+ * (none with packed levels: Direct3D 11 has no tier 4), residency feedback and a lookup's clamp in shaders (tier 2), ResizeTilePool down to nothing and back. */
+static void test_tiled_tiers(ID3D11Device5 *d5, ID3D11DeviceContext4 *c4) {
+  const UINT TILE = 65536;
+  int software = 0;
+  IDXGIDevice *dxgi = NULL;
+  if (SUCCEEDED(ID3D11Device5_QueryInterface(d5, &IID_IDXGIDevice, (void **)&dxgi)) && dxgi) {
+    IDXGIAdapter *adapter = NULL;
+    IDXGIAdapter1 *a1 = NULL;
+    if (SUCCEEDED(IDXGIDevice_GetAdapter(dxgi, &adapter)) && adapter) {
+      DXGI_ADAPTER_DESC1 ad;
+      memset(&ad, 0, sizeof ad);
+      if (SUCCEEDED(IDXGIAdapter_QueryInterface(adapter, &IID_IDXGIAdapter1, (void **)&a1)) && a1) {
+        IDXGIAdapter1_GetDesc1(a1, &ad);
+        IDXGIAdapter1_Release(a1);
+      }
+      software = (ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
+      IDXGIAdapter_Release(adapter);
+    }
+    IDXGIDevice_Release(dxgi);
+  }
+  const D3D11_TILED_RESOURCES_TIER want = software ? D3D11_TILED_RESOURCES_TIER_3 : D3D11_TILED_RESOURCES_TIER_1;
+  D3D11_FEATURE_DATA_D3D11_OPTIONS1 o1;
+  D3D11_FEATURE_DATA_D3D11_OPTIONS2 o2;
+  memset(&o1, 0xCC, sizeof o1);
+  memset(&o2, 0xCC, sizeof o2);
+  check(SUCCEEDED(ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_D3D11_OPTIONS1, &o1, sizeof o1)) && o1.TiledResourcesTier == want &&
+            SUCCEEDED(ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_D3D11_OPTIONS2, &o2, sizeof o2)) && o2.TiledResourcesTier == want,
+        software ? "tiled resources tier 3 on the CPU renderer" : "tiled resources tier 1 on a GPU without residency feedback");
+  D3D11_BUFFER_DESC pd = {8 * TILE, D3D11_USAGE_DEFAULT, 0, 0, D3D11_RESOURCE_MISC_TILE_POOL, 0};
+  ID3D11Buffer *pool = NULL;
+  check(SUCCEEDED(ID3D11Device5_CreateBuffer(d5, &pd, NULL, &pool)) && pool, "CreateBuffer: a tile pool of eight tiles");
+  if (!pool) return;
+  check(SUCCEEDED(ID3D11DeviceContext4_ResizeTilePool(c4, pool, 0)), "ResizeTilePool to no tiles at all");
+  D3D11_BUFFER_DESC bd;
+  ID3D11Buffer_GetDesc(pool, &bd);
+  check(bd.ByteWidth == 0, "the pool's description says it has no tiles");
+  check(SUCCEEDED(ID3D11DeviceContext4_ResizeTilePool(c4, pool, 8 * TILE)), "ResizeTilePool back to eight tiles");
+  /* arrays: one whose levels are all at least a tile (any tier), one with packed levels (no tier of Direct3D 11) */
+  D3D11_TEXTURE2D_DESC ad = {256, 256, 2, 2, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_TILED};
+  ID3D11Texture2D *array = NULL, *bad = NULL;
+  check(SUCCEEDED(ID3D11Device5_CreateTexture2D(d5, &ad, NULL, &array)) && array, "CreateTexture2D: a tiled array of two slices, levels of whole tiles");
+  if (array) {
+    UINT total = 0, subs = 4;
+    D3D11_PACKED_MIP_DESC packed;
+    D3D11_TILE_SHAPE shape;
+    D3D11_SUBRESOURCE_TILING st[4];
+    ID3D11Device5_GetResourceTiling(d5, (ID3D11Resource *)array, &total, &packed, &shape, &subs, 0, st);
+    check(total == 10 && subs == 4 && st[2].StartTileIndexInOverallResource == 5 && st[3].StartTileIndexInOverallResource == 9 && packed.NumPackedMips == 0,
+          "GetResourceTiling of the array: five tiles a slice");
+    ID3D11Texture2D_Release(array);
+  }
+  ad.Width = ad.Height = 128, ad.ArraySize = 3, ad.MipLevels = 8;
+  check(ID3D11Device5_CreateTexture2D(d5, &ad, NULL, &bad) == E_INVALIDARG && !bad, "CreateTexture2D refuses a tiled array with packed levels");
+  ID3D11SamplerState *sampler = point_sampler();
+  ID3D11VertexShader *vs = NULL;
+  ID3D11PixelShader *ps = NULL, *ps3 = NULL, *psc = NULL;
+  ID3D11Device_CreateVertexShader(g_device, dx_vs_vol_dxbc, sizeof dx_vs_vol_dxbc, NULL, &vs);
+  const HRESULT hr_ps = ID3D11Device_CreatePixelShader(g_device, dx_ps_tiled_dxbc, sizeof dx_ps_tiled_dxbc, NULL, &ps);
+  ID3D11Device_CreatePixelShader(g_device, dx_ps_tiled_3d_dxbc, sizeof dx_ps_tiled_3d_dxbc, NULL, &ps3);
+  ID3D11Device_CreatePixelShader(g_device, dx_ps_tiled_clamp_dxbc, sizeof dx_ps_tiled_clamp_dxbc, NULL, &psc);
+  if (want >= D3D11_TILED_RESOURCES_TIER_2) check(SUCCEEDED(hr_ps) && ps && ps3 && psc, "pixel shaders of residency feedback and clamps (tier 2)");
+  else check(FAILED(hr_ps) && !ps, "tier 1: a pixel shader of residency feedback is refused");
+  /* a 2D texture of 256 x 256: tiles 0 and 3 on the pool, red; tiles 1 and 2 nowhere */
+  D3D11_TEXTURE2D_DESC td = {256, 256, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_TILED};
+  ID3D11Texture2D *t = NULL;
+  UINT32 *texels = malloc(256 * 256 * 4), *seen = malloc(256 * 256 * 4);
+  check(SUCCEEDED(ID3D11Device5_CreateTexture2D(d5, &td, NULL, &t)) && t, "CreateTexture2D: a tiled texture of four tiles");
+  if (t && texels && seen) {
+    const D3D11_TILED_RESOURCE_COORDINATE starts[2] = {{0, 0, 0, 0}, {1, 1, 0, 0}};
+    const D3D11_TILE_REGION_SIZE sizes[2] = {{1, FALSE, 0, 0, 0}, {1, FALSE, 0, 0, 0}};
+    const UINT pool_starts[2] = {0, 1}, counts[2] = {1, 1};
+    check(SUCCEEDED(ID3D11DeviceContext4_UpdateTileMappings(c4, (ID3D11Resource *)t, 2, starts, sizes, pool, 2, NULL, pool_starts, counts, 0)), "UpdateTileMappings: tiles 0 and 3");
+    for (UINT i = 0; i < 256 * 256; ++i) texels[i] = 0xFFFF0000u;
+    ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)t, 0, NULL, texels, 256 * 4, 0);
+    check(read_texture(t, 256, 256, seen) && seen[10 * 256 + 10] == 0xFFFF0000u && seen[200 * 256 + 200] == 0xFFFF0000u && seen[10 * 256 + 200] == 0 && seen[200 * 256 + 10] == 0,
+          "the unmapped tiles of a tiled texture drop what is written and read as zero");
+    ID3D11ShaderResourceView *view = NULL;
+    ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)t, NULL, &view);
+    if (ps && view && vs && sampler) {
+      const UINT32 mapped = draw_lookup(vs, ps, view, sampler, 0.25f, 0.25f, 0), unmapped = draw_lookup(vs, ps, view, sampler, 0.75f, 0.25f, 0);
+      printf("d3d11 residency feedback: mapped %08x, unmapped %08x\n", mapped, unmapped);
+      check(mapped == 0xFFFFFFFFu && unmapped == 0, "residency feedback: CheckAccessFullyMapped of Sample, Load and GatherRed");
+    }
+    if (view) ID3D11ShaderResourceView_Release(view);
+  }
+  if (t) ID3D11Texture2D_Release(t);
+  /* a volume of 64 x 32 x 16 (tier 3): two tiles of 32 x 32 x 16, mapped whole by a region of no start and no size, then tile 1 unmapped by a box */
+  D3D11_TEXTURE3D_DESC vd = {64, 32, 16, 1, DXGI_FORMAT_B8G8R8A8_UNORM, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_TILED};
+  ID3D11Texture3D *v = NULL;
+  const HRESULT hr_v = ID3D11Device5_CreateTexture3D(d5, &vd, NULL, &v);
+  if (want < D3D11_TILED_RESOURCES_TIER_3) {
+    check(hr_v == E_INVALIDARG && !v, "CreateTexture3D refuses a tiled volume below tier 3");
+  } else {
+    check(SUCCEEDED(hr_v) && v, "CreateTexture3D: a tiled volume (tier 3)");
+  }
+  if (v && texels) {
+    UINT total = 0, subs = 1;
+    D3D11_PACKED_MIP_DESC packed;
+    D3D11_TILE_SHAPE shape;
+    D3D11_SUBRESOURCE_TILING st;
+    ID3D11Device5_GetResourceTiling(d5, (ID3D11Resource *)v, &total, &packed, &shape, &subs, 0, &st);
+    check(total == 2 && shape.WidthInTexels == 32 && shape.HeightInTexels == 32 && shape.DepthInTexels == 16 && st.WidthInTiles == 2 && st.DepthInTiles == 1,
+          "GetResourceTiling of the volume: two tiles of 32 x 32 x 16");
+    const UINT pool_start = 2;
+    check(SUCCEEDED(ID3D11DeviceContext4_UpdateTileMappings(c4, (ID3D11Resource *)v, 1, NULL, NULL, pool, 1, NULL, &pool_start, NULL, 0)),
+          "UpdateTileMappings of the whole volume (no region given)");
+    for (UINT z = 0; z < 16; ++z)
+      for (UINT i = 0; i < 64 * 32; ++i) texels[z * 64 * 32 + i] = 0xFF000000u | (z * 16) << 16 | 0x4080u;
+    ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)v, 0, NULL, texels, 64 * 4, 64 * 32 * 4);
+    const D3D11_TILED_RESOURCE_COORDINATE second = {1, 0, 0, 0};
+    const D3D11_TILE_REGION_SIZE box = {1, TRUE, 1, 1, 1};
+    const UINT null_flag = D3D11_TILE_RANGE_NULL;
+    check(SUCCEEDED(ID3D11DeviceContext4_UpdateTileMappings(c4, (ID3D11Resource *)v, 1, &second, &box, NULL, 1, &null_flag, NULL, NULL, 0)), "UpdateTileMappings: the volume's tile 1 unmapped");
+    ID3D11ShaderResourceView *view = NULL;
+    ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)v, NULL, &view);
+    if (ps3 && view && vs && sampler) {
+      const UINT32 a = draw_lookup(vs, ps3, view, sampler, 0.1f, 0.5f, 5.5f / 16), b = draw_lookup(vs, ps3, view, sampler, 0.9f, 0.5f, 5.5f / 16);
+      printf("d3d11 tiled volume: %08x mapped, %08x not\n", a, b);
+      check(a == (0xFF000000u | 80u << 16 | 0x4080u) && b == 0, "a tiled volume read by a shader: slice 5 of the mapped tile, zero and unmapped in the other");
+    }
+    if (view) ID3D11ShaderResourceView_Release(view);
+    ID3D11Texture3D_Release(v);
+  }
+  /* a lookup's clamp of the level of detail: four levels of 8 x 8 each one colour, the clamp of 2 gives level 2 */
+  if (psc && vs && sampler) {
+    static UINT32 levels[4][64];
+    D3D11_SUBRESOURCE_DATA initial[4];
+    for (UINT l = 0; l < 4; ++l) {
+      for (UINT i = 0; i < 64; ++i) levels[l][i] = 0xFF000000u | (0x30u + l * 0x40u) << 16 | 0x2010u;
+      initial[l].pSysMem = levels[l], initial[l].SysMemPitch = (8 >> l) * 4, initial[l].SysMemSlicePitch = 0;
+    }
+    D3D11_TEXTURE2D_DESC md = {8, 8, 4, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+    ID3D11Texture2D *m = NULL;
+    ID3D11ShaderResourceView *view = NULL;
+    if (SUCCEEDED(ID3D11Device5_CreateTexture2D(d5, &md, initial, &m)) && m) ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)m, NULL, &view);
+    check(view && draw_lookup(vs, psc, view, sampler, 0.5f, 0.5f, 0) == levels[2][0], "Sample with a clamp of 2: level 2");
+    if (view) ID3D11ShaderResourceView_Release(view);
+    if (m) ID3D11Texture2D_Release(m);
+  }
+  free(texels);
+  free(seen);
+  if (psc) ID3D11PixelShader_Release(psc);
+  if (ps3) ID3D11PixelShader_Release(ps3);
+  if (ps) ID3D11PixelShader_Release(ps);
+  if (vs) ID3D11VertexShader_Release(vs);
+  if (sampler) ID3D11SamplerState_Release(sampler);
   ID3D11Buffer_Release(pool);
 }
 
@@ -4016,6 +4166,7 @@ static void test_d3d11_3(void) {
   ID3D11DeviceContext_QueryInterface(g_context, &IID_ID3D11DeviceContext4, (void **)&c4);
   if (d5 && c4) {
     test_tiled_resources(d5, c4);
+    test_tiled_tiers(d5, c4);
     test_default_texture_access(d5);
     test_conservative(d5);
   }
