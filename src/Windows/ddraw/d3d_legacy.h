@@ -1310,7 +1310,7 @@ DL_API unsigned dl_fvf_elements(uint32_t fvf, DlVertexElement out[DL_MAX_ELEMENT
   unsigned n = 0;
 #define DL_ELEMENT(off, ty, us, ix) do { out[n].stream = 0; out[n].offset = (uint16_t)(off); out[n].type = (uint8_t)(ty); out[n].method = 0; \
                                          out[n].usage = (uint8_t)(us); out[n].usage_index = (uint8_t)(ix); ++n; } while (0)
-  if (l.position_size == 16) DL_ELEMENT(0, DL_DECLTYPE_FLOAT4, DL_USAGE_POSITIONT, 0);
+  if ((fvf & DL_FVF_POSITION_MASK) == DL_FVF_XYZRHW) DL_ELEMENT(0, DL_DECLTYPE_FLOAT4, DL_USAGE_POSITIONT, 0);
   else DL_ELEMENT(0, DL_DECLTYPE_FLOAT3, DL_USAGE_POSITION, 0);
   if (l.blend_weights) DL_ELEMENT(12, DL_DECLTYPE_FLOAT1 + (l.blend_weights > 4 ? 3 : l.blend_weights - 1), DL_USAGE_BLENDWEIGHT, 0);
   if (l.normal >= 0) DL_ELEMENT(l.normal, DL_DECLTYPE_FLOAT3, DL_USAGE_NORMAL, 0);
@@ -1384,7 +1384,8 @@ DL_API DlResult dl_process_fvf(const DlTransform *t, const DlLighting *l, int li
     const size_t base = (size_t)i * lay.stride;
     float p[4] = {0, 0, 0, 1}, n[3] = {0, 0, 0}, tex[DL_TEXTURE_SETS][4];
     uint32_t diffuse = 0xFFFFFFFFu, specular = 0xFF000000u;
-    dl_read(in, base, p, lay.position_size == 16 ? 16 : 12);
+    const int rhw = (fvf & DL_FVF_POSITION_MASK) == DL_FVF_XYZRHW;      /* (XYZB1 is 16 bytes too: a position and a weight) */
+    dl_read(in, base, p, rhw ? 16 : 12);
     if (lay.normal >= 0) dl_read(in, base + (size_t)lay.normal, n, 12);
     if (lay.diffuse >= 0) diffuse = dl_u32(in, base + (size_t)lay.diffuse);
     if (lay.specular >= 0) specular = dl_u32(in, base + (size_t)lay.specular);
@@ -1393,7 +1394,7 @@ DL_API DlResult dl_process_fvf(const DlTransform *t, const DlLighting *l, int li
       tex[s][3] = 1.0f;
       if (s < lay.textures) dl_read(in, base + (size_t)lay.tex[s], tex[s], 4 * lay.tex_size[s]);
     }
-    if (lay.position_size == 16) {
+    if (rhw) {
       DlTlVertex tl;
       tl.sx = p[0]; tl.sy = p[1]; tl.sz = p[2]; tl.rhw = p[3];
       tl.color = diffuse; tl.specular = specular; tl.tu = tex[0][0]; tl.tv = tex[0][1];

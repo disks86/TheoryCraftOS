@@ -683,9 +683,9 @@ static HRESULT depth_upload(Surface *s, D3dRes *r, const RECT *rect) {
   surface_image(s, &im, NULL);
   const DdFormatInfo *f = dd_format(s->fmt);
   uint32_t raw;
-  if (image_uniform(&im, &rc, &raw) || r->format == D3DFMT_D24S8) {
-    /* (a depth buffer with stencil cannot be written by the CPU in Direct3D 9: its first value of the rectangle is cleared over it) */
-    if (r->format == D3DFMT_D24S8) raw = dd_get_raw(&im, (uint32_t)rc.left, (uint32_t)rc.top);
+  if (r->format == D3DFMT_D24S8) {
+    /* (a depth buffer with stencil cannot be written by the CPU in Direct3D 9: the first value of the rectangle is cleared over it) */
+    raw = dd_get_raw(&im, (uint32_t)rc.left, (uint32_t)rc.top);
     D3DRECT dr;
     dr.x1 = rc.left; dr.y1 = rc.top; dr.x2 = rc.right; dr.y2 = rc.bottom;
     IDirect3DSurface9 *old = NULL, *old_rt = NULL;
@@ -942,8 +942,10 @@ static void hook_pull(Surface *s, const RECT *rect) {
   s->store.shadow.state &= ~DD_SHADOW_GPU_NEWER;
   if (!r || !r->owner || !r->owner->dev) return;
   const WORD cw = fpu_get();
-  if (r->kind == RES_DEPTH) depth_download(s, r);
-  else if (r->surface && (r->kind == RES_TARGET || r->target_texture)) target_download(s, r);
+  HRESULT hr = D3D_OK;
+  if (r->kind == RES_DEPTH) hr = depth_download(s, r);
+  else if (r->surface && (r->kind == RES_TARGET || r->target_texture)) hr = target_download(s, r);
+  if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ddraw: reading back a Direct3D target", hr); }
   fpu_set(cw);
 }
 

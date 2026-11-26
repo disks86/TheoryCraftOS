@@ -25,6 +25,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <ddraw.h>
 #include <d3d.h>
 
@@ -340,6 +341,34 @@ static void test_d3d7(void) {
   IDirect3D7_Release(d3d);
 }
 
+
+/* A target of the screen's size with a 24-bit z buffer, the way Wine's tests make theirs (create_device). */
+static void test_d3d7_large(void) {
+  IDirect3D7 *d3d = NULL;
+  if (FAILED(IDirectDraw7_QueryInterface(g_dd7, &IID_IDirect3D7, (void **)&d3d))) return;
+  const DDPIXELFORMAT xrgb = rgb_format(32, 0xFF0000, 0xFF00, 0xFF, 0), zf = z_format(32, 0xFFFFFF);
+  IDirectDrawSurface7 *rt = surface7(640, 480, DDSCAPS_OFFSCREENPLAIN | DDSCAPS_3DDEVICE, &xrgb);
+  IDirectDrawSurface7 *z = surface7(640, 480, DDSCAPS_ZBUFFER, &zf);
+  check(rt && z, "a 640x480 target and a 24-bit z buffer");
+  if (rt && z) {
+    IDirectDrawSurface7_AddAttachedSurface(rt, z);
+    IDirect3DDevice7 *dev = NULL;
+    HRESULT hr = IDirect3D7_CreateDevice(d3d, &IID_IDirect3DHALDevice, rt, &dev);
+    check(hr == D3D_OK, "a device on it");
+    if (dev) {
+      hr = IDirect3DDevice7_Clear(dev, 0, NULL, D3DCLEAR_TARGET, 0xff00ff00, 1.0f, 0);
+      const DWORD c = pixel7(rt, 320, 240);
+      printf("d3dimtest: large clear hr %#lx colour %#lx\n", (unsigned long)hr, (unsigned long)c);
+      check(hr == D3D_OK && near_colour(c & 0xFFFFFF, 0x00FF00, 1), "Clear of a 640x480 target");
+      IDirect3DDevice7_Release(dev);
+    }
+    IDirectDrawSurface7_DeleteAttachedSurface(rt, 0, z);
+  }
+  if (z) IDirectDrawSurface7_Release(z);
+  if (rt) IDirectDrawSurface7_Release(rt);
+  IDirect3D7_Release(d3d);
+}
+
 /* A 3D flipping chain in exclusive mode: what is drawn into the back buffer is the front buffer after Flip. */
 static void test_flip(void) {
   if (FAILED(IDirectDraw7_SetCooperativeLevel(g_dd7, g_window, DDSCL_EXCLUSIVE | DDSCL_FULLSCREEN))) { check(0, "exclusive mode"); return; }
@@ -364,9 +393,12 @@ static void test_flip(void) {
   if (dev) {
     for (int frame = 0; frame < 2; ++frame) {
       const DWORD colour = frame ? 0xFF00FF00 : 0xFFFF0000;
-      IDirect3DDevice7_Clear(dev, 0, NULL, D3DCLEAR_TARGET, colour, 1.0f, 0);
+      const HRESULT ch = IDirect3DDevice7_Clear(dev, 0, NULL, D3DCLEAR_TARGET, colour, 1.0f, 0);
+      const DWORD before = pixel7(back, 100, 100);
       hr = IDirectDrawSurface7_Flip(front, NULL, DDFLIP_WAIT);
       check(hr == DD_OK, "Flip");
+      printf("d3dimtest: frame %d: Clear %#lx, back before Flip %#lx, front after %#lx\n", frame, (unsigned long)ch, (unsigned long)before,
+             (unsigned long)pixel7(front, 100, 100));
       check(near_colour(pixel7(front, 100, 100) & 0xFFFFFF, colour & 0xFFFFFF, 1), frame ? "the second frame is the front buffer" : "the first frame is the front buffer");
     }
     IDirect3DDevice7_Release(dev);
@@ -673,6 +705,7 @@ int main(void) {
   SetForegroundWindow(g_window);
   test_d3d7();
   if (g_dd7) {
+    test_d3d7_large();
     test_flip();
     check(IDirectDraw7_Release(g_dd7) == 0, "the DirectDraw object goes with its last reference");
   }

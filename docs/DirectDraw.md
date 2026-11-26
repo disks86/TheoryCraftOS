@@ -58,10 +58,11 @@ separate part of the same library that plugs into the hooks below (see "The Dire
 | `Win32kUserInput.cpp` | WM_ACTIVATEAPP to the top-levels of the threads that lose and gain the foreground; a hidden top-level can be made the foreground window (as Windows). |
 | user32 `display.inc` | EnumDisplaySettingsA/ExA, ChangeDisplaySettingsA/ExA, EnumDisplayDevicesA; ChangeDisplaySettingsExW sends WM_DISPLAYCHANGE to the top-level windows. |
 | ole32 `compobj.inc` | CLSID_DirectDraw, CLSID_DirectDraw7, CLSID_DirectDrawClipper are ddraw.dll's classes. |
+| d3d9 `resources.inc`, `formats.inc` | locks of D16_LOCKABLE / D32F_LOCKABLE / D32_LOCKABLE depth buffers read the depth from the device and write it back (`tex_depth_copy`; they had a pitch of 0 and no contents) - what Lock of a DirectDraw z buffer after Direct3D drew needs. |
 
 ## The Direct3D part (hooks)
 
-The Direct3D interfaces are written beside this code in the same library (they are not here yet). They plug in by defining
+The Direct3D interfaces are written beside this code in the same library ("Direct3D 1, 2, 3 and 7" below). They plug in by defining
 
 ```c
 void dd_d3d_register(DdD3dHooks *hooks);   /* (weak in ddraw.c: called from DllMain before anything is made) */
@@ -86,6 +87,50 @@ and filling the fields they have; a field left NULL means that part of Direct3D 
 `dd_write_argb`, `dd_depth_to_u32`/`dd_depth_from_u32`, and the surface fields `desc`, `fmt`, `palette`, `complex[]`, `next_attached` (the
 attached z buffer), `lod`, `priority`, `version`, `dd`. Take `dd_lock()` (the global lock, re-entrant) around anything that walks or changes them.
 
+## Direct3D 1, 2, 3 and 7
+
+The Direct3D part of ddraw.dll (`d3d*.inc`, included at the end of `ddraw.c`) fills the hooks above. It is built on d3d9.dll's COM interfaces, which
+it loads when Direct3D is first used (LoadLibrary: a program that only uses DirectDraw never loads it). `d3d9_ddraw.h` declares them for a
+translation unit that has mingw's `d3d.h` (`scripts/gen-d3d9-ddraw-abi.py`: the enumerations both headers name are DWORDs, the structures of the same
+layout are Direct3D 7's). The logic without COM objects is `d3d_legacy.h` ([Direct3DLegacy.md](Direct3DLegacy.md)).
+
+| file | what |
+|---|---|
+| `d3d.inc` | the objects (`D3dDD` per DirectDraw object, `D3dDevice`, viewports, lights, materials, execute and vertex buffers, `D3dRes` copies of surfaces), the handle tables, the FPU control word, the Direct3D 9 device, the copies of surfaces (targets, depth buffers, textures) and the DirectDraw hooks |
+| `d3d_state.inc` | the states of a device (what the program set, kept for Get*), dirty masks, state blocks, what goes to Direct3D 9 before a draw (`d3_flush`), the CPU lighting and transform of a device |
+| `d3d_draw.inc` | drawing: Direct3D 7 (and transformed vertices of every version) through Direct3D 9's fixed function, Direct3D 1-3 transformed, lit and clipped on the CPU; the clip status; Clear |
+| `d3d_device.inc` | device creation and references, the methods the versions share (caps, render/light states, transforms, viewports of a device, Begin .. End, texture stages, strided and vertex buffer draws) |
+| `d3d_methods.inc` | the methods of IDirect3DDevice7, 3, 2 and IDirect3DDevice (state blocks, Load, matrices, execute, pick ...) |
+| `d3d_objects.inc` | IDirect3DLight, IDirect3DMaterial/2/3, IDirect3DViewport/2/3, IDirect3DExecuteBuffer (and running one), IDirect3DVertexBuffer/7, IDirect3DTexture/2 |
+| `d3d_vtbl.inc` | IDirect3D, 2, 3 and 7, the device vtables, `dd_d3d_register` |
+
+| part | how |
+|---|---|
+| Direct3D 9 device | one per DirectDraw object (`dd->d3d`), made on first use on a hidden window of its own, windowed, an 8x8 back buffer that is never shown, software vertex processing, FPU preserved. Every Direct3D device of the object draws through it: the device whose states it has is `active`; another one puts all of its states back (`all_dirty`) before it draws. |
+| surfaces | the DirectDraw memory stays what counts. A surface Direct3D draws into or samples gets a Direct3D 9 copy, `D3dRes`, in `s->store.shadow.resource` (Flip moves it with the memory): a render target X8R8G8B8 / A8R8G8B8 (whatever the DirectDraw format: converted both ways, 5-6-5 and 5-5-5 with fast paths) with a system-memory twin for GetRenderTargetData / UpdateSurface; a depth buffer D32F_LOCKABLE (D24S8 when the format has stencil bits); a texture A8R8G8B8 / X8R8G8B8 of the managed pool with every level or cube face; a texture with DDSCAPS_3DDEVICE is a render target texture. A CPU write (`cpu_wrote`) of a target or depth buffer is sent at once - a rectangle of one value as a Clear, the rest through UpdateSurface or a lock of the lockable depth -; a texture is sent at its next use (each level's DD_SHADOW_CPU_NEWER). A draw marks the target (and a written depth buffer) DD_SHADOW_GPU_NEWER and `pull` reads it back only when the CPU touches it (Lock, GetDC, Blt, the primary on the screen). |
+| textures | every DirectDraw format is converted on the CPU (`dd_to_argb`: palettes, DXT, YUV, luminance). Colour keying (D3DRENDERSTATE_COLORKEYENABLE with a DDSD_CKSRCBLT texture): keyed texels become alpha 0 and an alpha test GREATER 0 removes them while the program does not test alpha itself. A palette change, SetColorKey, Load and the CPU's writes make the copy again; SetLOD is the managed texture's LOD. |
+| Direct3D 7 | draws with Direct3D 9's fixed function: render states through `dl_render_state`, texture stage states (the render states of stage 0's sampler are stage 0's states, as they share them), transforms, materials, clip planes, lights (the first eight enabled lights by index are Direct3D 9's lights 0-7), vertex declarations from the FVF code (`dl_fvf_elements`: D3DFVF_RESERVED1 is not d3d9's PSIZE). The clip status is worked out on the CPU from the positions. ProcessVertices is the CPU's (`dl_process_fvf` with Direct3D 7 lighting). |
+| Direct3D 1-3 | untransformed vertices are transformed with the current viewport's clip space, lit with its lights (the legacy model, D3DLIGHT/D3DLIGHT2) and the material of D3DLIGHTSTATE_MATERIAL, clipped (Sutherland-Hodgman, `dl_clip_polygon`) and drawn as transformed vertices; transformed vertices go to Direct3D 9 as they are. TEXTUREMAPBLEND drives stage 0 (`dl_texture_map_blend`, MODULATE taking the texture's alpha only if it has one) until a texture stage state changes. |
+| execute buffers | `dl_execute_*` walks the instructions; PROCESSVERTICES fills the device's D3DTLVERTEX array and their clip-space copies, POINT/LINE/TRIANGLE/SPAN draw from them (clipped; wireframe edges by the triangle flags), MATRIXLOAD/MULTIPLY on matrix handles, STATETRANSFORM (SetMatrix of a matrix a transform came from changes the transform), STATELIGHT, STATERENDER, TEXTURELOAD, the status for BRANCHFORWARD and SETSTATUS; ZVISIBLE through an occlusion query (D3DSTATUS_ZNOTVISIBLE cleared when something passed). Pick finds the triangles under the rectangle's corner. Execute of a locked buffer D3DERR_EXECUTE_LOCKED. |
+| references | IDirect3D7 counts on IDirectDraw7, the others on IDirectDraw; a device holds its target's interface (not Direct3D 1: QueryInterface of a surface makes the device aggregated into the surface, counting on its IDirectDrawSurface, destroyed with it); a vertex buffer of IDirect3D7 holds IDirectDraw7; viewports added to a device are held by it; SetTexture holds nothing (a texture that goes is unbound). SetRenderTarget follows Wine's tests of Windows (a depth buffer is taken and refused, a system-memory target of a hardware device is taken and ignored by 2 and 3). |
+| handles | materials, textures and matrices in one table of the process (Windows' handles may be used with any device), state blocks per device. |
+| FPU | without DDSCL_FPUPRESERVE device creation sets the x87 control word to single precision with exceptions masked; with it Direct3D 7's methods set it up and put the program's back (Wine keeps two vtables for this). |
+| presentation | Flip of a 3D flipping chain shows the rendered frame (the front buffer is pulled for the screen); a scene drawn straight into the primary is shown at EndScene. |
+
+What is not there, and why:
+
+- Bump mapping (D3DTOP_BUMPENVMAP*) and bump formats as textures: Direct3D 9's fixed function here has no bump environment mapping (docs/Direct3D9.md);
+  bump textures are sent black.
+- A depth buffer with stencil bits (D24S8, D15S1, D24X4S4) is D24S8 in Direct3D 9, which no lock reads: what Direct3D drew into it is not read back by
+  Lock, and a CPU write that is not one depth value is sent as a Clear with its first value. Depth buffers without stencil are read back and written.
+- Ramp (palette) devices draw in RGB, as DirectX 6 and later do; line patterns, stippling, ROP2 and plane masks are kept as states and not drawn (the
+  caps do not claim them).
+- IDirect3DExecuteBuffer::Validate and Optimize, IDirect3DMaterial::Reserve/Unreserve, IDirect3DViewport::LightElements: DDERR_UNSUPPORTED, which is what
+  Windows' runtime answers (Microsoft documents them as not implemented).
+- GetInfo: S_FALSE, the retail runtime's answer (statistics are a debug runtime's).
+- A device draws on the CPU path for 1-3 and the fixed function for 7, so two devices of different versions on one object switch all states each time
+  they alternate (correct, slower).
+
 ## Not done, and why
 
 - Overlays and video ports: no overlay plane in the kernel's display; Windows' answers for hardware without them (DDERR_NOOVERLAYHW, DDERR_NOTAOVERLAYSURFACE).
@@ -93,7 +138,6 @@ attached z buffer), `lod`, `priority`, `version`, `dd`. Take `dd_lock()` (the gl
 - The windowed primary does not see what other programs draw on the screen after it was made (no read-back of the composited desktop on Lock).
 - GDI's own view of a low-colour mode: the kernel reports the depth a program set (EnumDisplaySettings), but GDI keeps drawing 32 bits (GetDeviceCaps(BITSPIXEL) stays 32).
 - Range colour keys (DDCKEY_COLORSPACE with low != high): DDERR_NOCOLORKEYHW, as the caps report no range keys (the blitter itself takes ranges).
-- Direct3D 1 .. 7: the separate part above.
 - The order of window messages around a focus loss and mode change (`test_coop_level_mode_set`): Windows sends WM_ACTIVATE, the window changes
   and WM_DISPLAYCHANGE before ddraw reports the loss at WM_ACTIVATEAPP; here WM_ACTIVATEAPP comes first (the window manager's order).
 - P8 to RGB blits look the colours up in the palette (as Wine); Windows' drivers copy the index as a grey level (`test_p8_blit`).

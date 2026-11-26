@@ -818,7 +818,9 @@ static void vb_write_processed(D3dVertexBuffer *dst, DWORD at, const DlTransform
     const SIZE_T base = (SIZE_T)(at + k) * l.stride;
     float s[4];
     dl_to_screen(&t->viewport, cv[k].position, &s[0], &s[1], &s[2], &s[3]);
-    dl_write(out, base, s, l.position_size < 16 ? l.position_size : 16);
+    /* (a destination without RHW gets it all the same, over the next vertex's first number - Windows does: Wine's test_process_vertices) */
+    const SIZE_T room = dst->size - base;
+    dl_write(out, base, s, room < 16 ? room : 16);
     if (copy_colours) {
       if (l.diffuse >= 0) { const uint32_t c = dl_color_from_float(cv[k].diffuse); dl_write(out, base + (SIZE_T)l.diffuse, &c, 4); }
       if (l.specular >= 0) { const uint32_t c = dl_color_from_float(cv[k].specular); dl_write(out, base + (SIZE_T)l.specular, &c, 4); }
@@ -829,9 +831,8 @@ static void vb_write_processed(D3dVertexBuffer *dst, DWORD at, const DlTransform
 }
 /* ProcessVertices (and ProcessVerticesStrided): `count` vertices of `fvf` through the device's transform (and lighting, with D3DVOP_LIGHT) into the
  * destination, which holds transformed vertices. */
-static HRESULT vb_process(D3dVertexBuffer *dst, DWORD op, DWORD dst_index, DWORD count, DWORD fvf, const BYTE *src, D3dDevice *dev, DWORD flags) {
+static HRESULT vb_process(D3dVertexBuffer *dst, DWORD op, DWORD dst_index, DWORD count, DWORD fvf, const BYTE *src, const BYTE *src_end, D3dDevice *dev, DWORD flags) {
   if (!dev || !(op & D3DVOP_TRANSFORM)) return DDERR_INVALIDPARAMS;
-  if ((dst->desc.dwFVF & D3DFVF_POSITION_MASK) != D3DFVF_XYZRHW) return DDERR_INVALIDPARAMS;
   if (dst_index > dst->desc.dwNumVertices || count > dst->desc.dwNumVertices - dst_index) return DDERR_INVALIDPARAMS;
   if (!count) return D3D_OK;
   if (dst->lock_count) return D3DERR_VERTEXBUFFERLOCKED;
@@ -844,8 +845,60 @@ static HRESULT vb_process(D3dVertexBuffer *dst, DWORD op, DWORD dst_index, DWORD
   d3_lighting(dev, &l);
   DlProcessResult result;
   dl_result_init(&result);
-  const DWORD stride = dl_fvf_stride(fvf);
+  DWORD stride = dl_fvf_stride(fvf);
   const BOOL light = (op & D3DVOP_LIGHT) != 0;
+  const DWORD blend = dev->version >= 7 ? dev->st.rs[D3DRENDERSTATE_VERTEXBLEND] : 0;
+  if (blend >= D3DVBLEND_1WEIGHT && blend <= D3DVBLEND_3WEIGHTS && (fvf & D3DFVF_POSITION_MASK) != D3DFVF_XYZRHW) {
+    /* Vertex blending (D3DRENDERSTATE_VERTEXBLEND): the position and normal are the weighted sum of what the world matrices 0 .. n make of them (the last
+     * weight is 1 minus the others), then view and projection. The weights follow the position; a vertex without them gives the numbers after its
+     * position (Windows: Wine's test_process_vertices). The blended vertices go on as XYZ vertices with an identity world. */
+    DlFvfLayout lay;
+    dl_fvf_layout(fvf, &lay);
+    const DWORD out_fvf = (fvf & ~(DWORD)D3DFVF_POSITION_MASK) | D3DFVF_XYZ;
+    DlFvfLayout ol;
+    dl_fvf_layout(out_fvf, &ol);
+    BYTE *blended = d3_scratch(dev->dd3, 1, (SIZE_T)count * ol.stride);
+    if (!blended) return DDERR_OUTOFMEMORY;
+    const DlMatrix *world[4] = {&dev->st.xf[D3DTRANSFORMSTATE_WORLD], &dev->st.xf[D3DTRANSFORMSTATE_WORLD1], &dev->st.xf[D3DTRANSFORMSTATE_WORLD2],
+                                &dev->st.xf[D3DTRANSFORMSTATE_WORLD3]};
+    const SIZE_T src_bytes = src_end > src ? (SIZE_T)(src_end - src) : 0;
+    const DlConstBytes in = dl_const_bytes(src, src_bytes);
+    for (DWORD k = 0; k < count; ++k) {
+      const SIZE_T at = (SIZE_T)k * stride;
+      float p[3] = {0, 0, 0}, n[3] = {0, 0, 0}, w[4] = {0, 0, 0, 0};
+      dl_read(in, at, p, 12);
+      for (DWORD j = 0; j < blend; ++j)
+        if (!dl_read(in, at + 12 + 4 * j, &w[j], 4)) w[j] = 0.0f;
+      float last = 1.0f;
+      for (DWORD j = 0; j < blend; ++j) last -= w[j];
+      w[blend] = last;
+      if (lay.normal >= 0) dl_read(in, at + (SIZE_T)lay.normal, n, 12);
+      float bp[3] = {0, 0, 0}, bn[3] = {0, 0, 0};
+      for (DWORD j = 0; j <= blend; ++j) {
+        float q[4];
+        dl_transform_point(world[j], p, q);
+        for (int c = 0; c < 3; ++c) {
+          bp[c] += w[j] * q[c];
+          bn[c] += w[j] * (n[0] * world[j]->m[0][c] + n[1] * world[j]->m[1][c] + n[2] * world[j]->m[2][c]);
+        }
+      }
+      BYTE *o = blended + (SIZE_T)k * ol.stride;
+      memcpy(o, bp, 12);
+      /* (the rest of the vertex as it is: everything after the position and weights) */
+      const SIZE_T rest = stride - lay.position_size;
+      if (rest) dl_read(in, at + lay.position_size, o + 12, rest);
+      if (ol.normal >= 0) memcpy(o + ol.normal, bn, 12);
+    }
+    dev->st.xf[0] = dev->st.xf[D3DTRANSFORMSTATE_WORLD];      /* (spare slot: the world is put back below) */
+    dl_matrix_identity(&dev->st.xf[D3DTRANSFORMSTATE_WORLD]);
+    DlTransform tb;
+    d3_transform(dev, &tb);
+    dev->st.xf[D3DTRANSFORMSTATE_WORLD] = dev->st.xf[0];
+    t = tb;
+    fvf = out_fvf;
+    stride = ol.stride;
+    src = blended;
+  }
   if (dl_process_fvf(&t, &l, light, fvf, dl_const_bytes(src, (SIZE_T)count * stride), count, cv, count, &result) != DL_OK) return DDERR_INVALIDPARAMS;
   /* (D3DPV_DONOTCOPYDATA: the destination keeps its colours and texture coordinates where the source has none) */
   vb_write_processed(dst, dst_index, &t, cv, count, !(flags & D3DPV_DONOTCOPYDATA) || (fvf & (D3DFVF_DIFFUSE | D3DFVF_SPECULAR | D3DFVF_NORMAL)));
@@ -855,7 +908,7 @@ static HRESULT vb_process(D3dVertexBuffer *dst, DWORD op, DWORD dst_index, DWORD
 static HRESULT vb_process_from(D3dVertexBuffer *dst, DWORD op, DWORD dst_index, DWORD count, D3dVertexBuffer *src, DWORD src_index, D3dDevice *dev, DWORD flags) {
   if (!src) return DDERR_INVALIDPARAMS;
   if (src_index > src->desc.dwNumVertices || count > src->desc.dwNumVertices - src_index) return DDERR_INVALIDPARAMS;
-  return vb_process(dst, op, dst_index, count, src->desc.dwFVF, src->memory + (SIZE_T)src_index * src->stride, dev, flags);
+  return vb_process(dst, op, dst_index, count, src->desc.dwFVF, src->memory + (SIZE_T)src_index * src->stride, src->memory + src->size, dev, flags);
 }
 static HRESULT vb_get_desc(D3dVertexBuffer *vb, D3DVERTEXBUFFERDESC *desc) {
   if (!desc) return DDERR_INVALIDPARAMS;
@@ -905,7 +958,7 @@ static HRESULT STDMETHODCALLTYPE vb7_ProcessVerticesStrided(IDirect3DVertexBuffe
   if (dev->dd3 && !buf) hr = DDERR_OUTOFMEMORY;
   else if (buf) {
     hr = dl_gather_strided(fvf, (const DlStridedData *)data, 0, count, count, dl_bytes(buf, (SIZE_T)count * stride));
-    if (hr == DL_OK) hr = vb_process(VB(i), op, dst_index, count, fvf, buf, dev, flags);
+    if (hr == DL_OK) hr = vb_process(VB(i), op, dst_index, count, fvf, buf, buf + (SIZE_T)count * stride, dev, flags);
   }
   fpu_set(cw);
   dd_unlock();

@@ -392,6 +392,8 @@ static void d3_transform(D3dDevice *dev, DlTransform *t) {
   t->projection = dev->st.xf[D3DTRANSFORMSTATE_PROJECTION];
   if (dev->version < 7) t->clip = dev->clip;
   memcpy(&t->viewport, &dev->st.viewport, sizeof t->viewport);
+  /* (an empty or inverted depth range is 0.001 deep, as Windows - Wine's test_process_vertices) */
+  if (!(t->viewport.dvMaxZ > t->viewport.dvMinZ)) t->viewport.dvMaxZ = t->viewport.dvMinZ + 0.001f;
   if (dev->version >= 7) {
     t->user_planes = dev->st.rs[D3DRENDERSTATE_CLIPPLANEENABLE] & 0x3Fu;
     for (UINT i = 0; i < 6; ++i) for (UINT k = 0; k < 4; ++k) t->user_plane[i][k] = dev->st.plane[i][k];

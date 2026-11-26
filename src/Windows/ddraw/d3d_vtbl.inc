@@ -175,7 +175,7 @@ static HRESULT STDMETHODCALLTYPE d3d7_CreateDevice(IDirect3D7 *i, REFCLSID guid,
   return d3_create_device_iface(D3D7O(i), guid, (IUnknown *)s, 7, (void **)out);
 }
 static HRESULT STDMETHODCALLTYPE d3d7_CreateVertexBuffer(IDirect3D7 *i, D3DVERTEXBUFFERDESC *desc, IDirect3DVertexBuffer7 **out, DWORD flags) {
-  if (flags) return DDERR_INVALIDPARAMS;
+  (void)flags;      /* (documented as 0, any value is taken: Wine's test_process_vertices) */
   return vb_create(D3D7O(i), 7, desc, (void **)out);
 }
 static HRESULT STDMETHODCALLTYPE d3d7_EnumZBufferFormats(IDirect3D7 *i, REFCLSID device, LPD3DENUMPIXELFORMATSCALLBACK cb, void *ctx) {
@@ -199,7 +199,7 @@ static HRESULT STDMETHODCALLTYPE d3d3_CreateDevice(IDirect3D3 *i, REFCLSID guid,
 }
 static HRESULT STDMETHODCALLTYPE d3d3_CreateVertexBuffer(IDirect3D3 *i, D3DVERTEXBUFFERDESC *desc, IDirect3DVertexBuffer **out, DWORD flags, IUnknown *outer) {
   if (outer) return CLASS_E_NOAGGREGATION;
-  if (flags & ~(DWORD)D3DDP_DONOTCLIP) return DDERR_INVALIDPARAMS;
+  (void)flags;
   return vb_create(D3D3O(i), 3, desc, (void **)out);
 }
 static HRESULT STDMETHODCALLTYPE d3d3_EnumZBufferFormats(IDirect3D3 *i, REFCLSID device, LPD3DENUMPIXELFORMATSCALLBACK cb, void *ctx) {

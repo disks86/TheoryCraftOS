@@ -444,10 +444,12 @@ static void volume_destroy(DxObj *o);
 static void tex_destroy(DxObj *o) {
   Tex *t = (Tex *)o;
   Dev *d = t->c.dev;
-  settle(d, t->used);
-  for (UINT i = 0; i < d->clear_count;) {      /* (a clear nothing drew after: it goes with the buffer) */
+  /* (a clear nothing drew after goes with the buffer - before the list is sent, or flush records it again into the next list, which would then clear a
+   * buffer that is gone and the kernel refuse that list with all that is drawn in it) */
+  for (UINT i = 0; i < d->clear_count;) {
     if (d->clears[i].depth == t) d->clears[i] = d->clears[--d->clear_count]; else ++i;
   }
+  settle(d, t->used);
   if (t->target && d->rtv_free_count < RTV_SLOTS) d->rtv_free[d->rtv_free_count++] = t->rtv_slot;
   if (t->depth && t->res && d->dsv_free_count < DSV_SLOTS) d->dsv_free[d->dsv_free_count++] = t->dsv_slot;
   for (UINT i = 0; i < MAX_SUBS; ++i) {
