@@ -354,7 +354,13 @@ static void d3_lighting(D3dDevice *dev, DlLighting *l) {
       for (D3dLight *li = dev->current_viewport->lights; li && l->lights < DL_LIGHTS; li = li->next_in_viewport) {
         int active = 0;
         if (!li->set) continue;
-        if (dl_light_from_legacy(&li->light, &l->light[l->lights], &active) == DL_OK && active) ++l->lights;
+        if (dl_light_from_legacy(&li->light, &l->light[l->lights], &active) != DL_OK || !active) continue;
+        /* (a light of no colour adds nothing: it does not take one of the DL_LIGHTS places - Wine's test_specular_lighting puts 64 black lights
+         * before the one it tests) */
+        const DlLightEntry *e = &l->light[l->lights];
+        BOOL dark = TRUE;
+        for (int k = 0; k < 3 && dark; ++k) dark = e->diffuse[k] == 0.0f && e->specular[k] == 0.0f && e->ambient[k] == 0.0f;
+        if (!dark) ++l->lights;
       }
     return;
   }

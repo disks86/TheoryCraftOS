@@ -383,6 +383,9 @@ static HRESULT surface_create(DDraw *dd, const DDSURFACEDESC2 *in, UINT version,
     const UINT most = log2_floor(d.dwWidth > d.dwHeight ? d.dwWidth : d.dwHeight) + 1;
     if (levels > most) return DDERR_INVALIDPARAMS;
   }
+  /* a DXTn surface is whole 4 x 4 blocks: another size is refused in any memory (Windows, Wine's test_block_formats_creation; its levels below 4 are
+   * fine) */
+  if (dd_format_is_blocks(fmt) && ((d.dwWidth & 3u) || (d.dwHeight & 3u))) return DDERR_INVALIDPARAMS;
   /* where the memory is: a format the "hardware" takes goes to video memory, the others to system memory (an object of the emulation only has no
    * video memory, and its z buffers are the HEL's: 16 and 32 bits) */
   BOOL sysmem_fallback = FALSE;

@@ -820,6 +820,13 @@ DL_API float dl_fog_factor(int mode, float start, float end, float density, floa
  * ddraw. Both give no light past the range. A parallel point light (1-3) shines from its position onto the whole object: its direction is from the
  * object's origin (the world matrix's translation), not from each vertex, and it is not attenuated. H is half way between L and the direction to
  * the camera (from the vertex for a local viewer, back along the camera's axis otherwise). */
+/* The alpha a lit vertex's specular colour gets in Direct3D 7: that of the specular colour's source (the material's, or the vertex colour that
+ * D3DRENDERSTATE_SPECULARMATERIALSOURCE names) - Wine's test_specular_lighting of ddraw7 (a material specular alpha of 0.5 gives 0x80). */
+DL_API float dl_specular_alpha(const DlLighting *l, const float *vertex_diffuse, const float *vertex_specular) {
+  const float *sources[3] = {NULL, vertex_diffuse, vertex_specular};
+  if (l->color_vertex && l->specular_source >= 1 && l->specular_source <= 2 && sources[l->specular_source]) return ffl_clamp(sources[l->specular_source][3]);
+  return ffl_clamp(l->material.specular.a);
+}
 DL_API void dl_light_vertex(const DlTransform *t, const DlLighting *l, const float position[3], const float *normal, const float *vertex_diffuse,
                             const float *vertex_specular, float diffuse[4], float specular[3]) {
   float place[4], n[3] = {0.0f, 0.0f, 0.0f};
@@ -1003,7 +1010,7 @@ DL_API void dl_process_vertex(const DlTransform *t, const DlLighting *l, int lig
     float lit_specular[3];
     dl_light_vertex(t, l, position, normal, diffuse ? vd : NULL, specular ? vs : NULL, out->diffuse, lit_specular);
     for (int i = 0; i < 3; ++i) out->specular[i] = lit_specular[i];
-    out->specular[3] = vs[3];
+    out->specular[3] = l->legacy ? vs[3] : dl_specular_alpha(l, diffuse ? vd : NULL, specular ? vs : NULL);
   } else {
     for (int i = 0; i < 4; ++i) {
       out->diffuse[i] = vd[i];

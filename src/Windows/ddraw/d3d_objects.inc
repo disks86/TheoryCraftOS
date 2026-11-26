@@ -903,6 +903,10 @@ static HRESULT vb_process(D3dVertexBuffer *dst, DWORD op, DWORD dst_index, DWORD
     src = blended;
   }
   if (dl_process_fvf(&t, &l, light, fvf, dl_const_bytes(src, (SIZE_T)count * stride), count, cv, count, &result) != DL_OK) return DDERR_INVALIDPARAMS;
+  /* (Direct3D 3's ProcessVertices gives lit vertices a specular alpha of 0 - the fog factor it did not work out; Wine's test_specular_lighting of
+   * ddraw4) */
+  if (dev->version < 7 && light && l.enabled)
+    for (DWORD i = 0; i < count; ++i) cv[i].specular[3] = 0.0f;
   /* (D3DPV_DONOTCOPYDATA: the destination keeps its colours and texture coordinates where the source has none) */
   vb_write_processed(dst, dst_index, &t, cv, count, !(flags & D3DPV_DONOTCOPYDATA) || (fvf & (D3DFVF_DIFFUSE | D3DFVF_SPECULAR | D3DFVF_NORMAL)));
   if (op & D3DVOP_EXTENTS) clip_status_add(dev, &result, 0);
