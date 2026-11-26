@@ -154,6 +154,11 @@ static void state8_defaults(Device8 *d) {
   d->state.extra[EXTRA_PATCHSEGMENTS] = bits_of(1.0f);
 }
 
+/* The render states whose first value Direct3D 8 has otherwise than Direct3D 9 (D3DRS_POINTSIZE_MIN: 0, not 1), set on a new or reset device. */
+static void defaults8_apply(Device8 *d) {
+  CALL9(D9(d), SetRenderState, D3DRS_POINTSIZE_MIN, 0);
+}
+
 /* ---- state blocks ----------------------------------------------------------------------------------------------------------------------------------- */
 
 static UINT state_block_parts(D3DSTATEBLOCKTYPE type) {

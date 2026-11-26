@@ -20,15 +20,15 @@ interfaces come from `scripts/gen-dx-vtables.py d3d8` (every method is written: 
 | `GetContainer` | the texture of a level; the device for every other surface. |
 | private data | kept by the wrapper (Direct3D 8's `SetPrivateData` with `D3DSPD_IUNKNOWN`, `D3DERR_MOREDATA`, `D3DERR_NOTFOUND`): a level's is its own, not its texture's. |
 | caps | `D3DCAPS8` of Direct3D 9's caps: the same numbers, the bits Direct3D 8 defines (Direct3D 9's later ones left out), `D3DPRASTERCAPS_ZBIAS` where there is a depth bias, `D3DPRASTERCAPS_ANTIALIASEDGES` where lines are smoothed, `D3DVTXPCAPS_NO_VSDT_UBYTE4` where `UBYTE4` cannot be read, `D3DCAPS2_CANRENDERWINDOWED`; shader versions of Direct3D 8: vertex shaders 1.1 and pixel shaders 1.4 at most. |
-| adapters and modes | `GetAdapterModeCount` / `EnumAdapterModes` enumerate the modes of every display format in one list (X8R8G8B8, R5G6B5, X1R5G5B5, A2R10G10B10); `D3DENUM_NO_WHQL_LEVEL` is the opposite of Direct3D 9's `D3DENUM_WHQL_LEVEL`; `CheckDeviceType` takes no back buffer of `D3DFMT_UNKNOWN` (Direct3D 9 does, for a window). |
-| `D3DPRESENT_PARAMETERS` | Direct3D 8's rules (a swap effect of 1 .. 4, at most 3 back buffers, one with the copy swap effects - which `Reset` does not check -, no refresh rate for a window), then Direct3D 9's form: `D3DSWAPEFFECT_COPY_VSYNC` is a copy at the vertical blank, a window presents at once with the other swap effects (Direct3D 9's default interval waits), `FullScreen_PresentationInterval` is the interval of a full screen, no multisample quality. What Direct3D 9 chose (the size of a window's back buffer, the count) is written back; of an additional swap chain only the count, as Direct3D 8 does. |
+| adapters and modes | `GetAdapterModeCount` / `EnumAdapterModes` enumerate the modes of every display format in one list (X8R8G8B8, R5G6B5, X1R5G5B5, A2R10G10B10); `D3DENUM_NO_WHQL_LEVEL` is the opposite of Direct3D 9's `D3DENUM_WHQL_LEVEL`; `CheckDeviceType` takes no back buffer of `D3DFMT_UNKNOWN` (Direct3D 9 does, for a window) and none of another format than the display's or that format with alpha (Direct3D 8 converts no format when it presents). |
+| `D3DPRESENT_PARAMETERS` | Direct3D 8's rules (a swap effect of 1 .. 4, at most 3 back buffers, one with the copy swap effects - which `Reset` does not check -, no refresh rate for a window), then Direct3D 9's form: `D3DSWAPEFFECT_COPY_VSYNC` is a copy at the vertical blank, a window presents at once with the other swap effects (Direct3D 9's default interval waits), `FullScreen_PresentationInterval` is the interval of a full screen, no multisample quality. Only the back buffer count is written back (a size of 0 stays 0), as Direct3D 8 does. |
 | `CreateDevice` | exactly one kind of vertex processing; a resource made with `D3DFMT_UNKNOWN` fails with the program's pointer as it was (an image surface's is set to NULL), as in Direct3D 8; the x87 control word is set to single precision, rounding to the nearest, every exception masked (0x7F) before the device is made, unless `D3DCREATE_FPU_PRESERVE`. |
-| `Reset` | the implicit surfaces are the same objects with Direct3D 9's new surfaces in them; Direct3D 8's own state is a new device's (no shader set, no base vertex index); shaders and state blocks are kept. |
+| `Reset` | the parameters are checked as `CreateDevice` checks them, and a full screen of a mode the adapter has not is D3DERR_INVALIDCALL. The implicit surfaces the program holds no reference of let Direct3D 9's surfaces go for the Reset and take the new ones (the same objects for the program); one the program holds, or a resource of the default pool, makes Direct3D 9 refuse, which Direct3D 8 answers D3DERR_DEVICELOST: the device stays lost (TestCooperativeLevel D3DERR_DEVICENOTRESET, Present D3DERR_DEVICELOST) until a Reset succeeds. Direct3D 8's own state is a new device's (no shader set, no base vertex index, `D3DRS_POINTSIZE_MIN` 0 - Direct3D 9's is 1); shaders and state blocks are kept. Only the back buffer count is written back (a window's size of 0 stays 0). |
 | image surfaces | `CreateImageSurface` is a surface in system memory (`D3DPOOL_SYSTEMMEM`). |
 | `D3DSURFACE_DESC`, `D3DVOLUME_DESC` | with Direct3D 8's `Size`: the bytes of the level (blocks of 4 x 4 for DXT1 .. DXT5). |
 | volumes | an `IDirect3DVolume8` is its volume texture's level: `LockBox`, `UnlockBox` and `GetDesc` are the texture's of that level (no `IDirect3DVolume9` is needed). |
 | `SetRenderTarget(target, depth)` | a NULL target keeps the one that is set, a NULL depth buffer sets none; a depth buffer smaller than the target or of other multisampling is refused. |
-| `CopyRects` | every rectangle (or the whole surface) to its point (or the same place), checked before anything is copied: the same format, no depth formats, within both surfaces, compressed formats by whole blocks, not a surface onto itself. Each is copied by what Direct3D 9 has for the two pools - `UpdateSurface` from memory into the device, `StretchRect` of one size between surfaces of the device, `GetRenderTargetData` of a whole target into memory - and by locking both surfaces where that is not the case or Direct3D 9 does not take it. |
+| `CopyRects` | every rectangle (or the whole surface) to its point (or the same place), checked before anything is copied: the same format, no depth formats, within both surfaces, compressed formats by whole blocks, not a surface onto itself. Each is copied by what Direct3D 9 has for the two pools - `UpdateSurface` from memory into the device, `StretchRect` of one size between surfaces of the device, `GetRenderTargetData` of a target into memory (whole, into a surface of its size first when a part is wanted) - and by locking both when neither is in the device. |
 | `GetFrontBuffer` | Direct3D 9's `GetFrontBufferData` of the device's swap chain. |
 | streams and indices | `SetStreamSource(stream, buffer, stride)` is offset 0; a stream set to no buffer keeps its stride, as in Direct3D 8. `SetIndices(buffer, base vertex index)` keeps the base vertex index here, and `DrawIndexedPrimitive` passes it as Direct3D 9's `BaseVertexIndex`. `DrawIndexedPrimitiveUP` leaves no index buffer and with it no base vertex index. |
 | render states | Direct3D 9's numbers, but: `D3DRS_ZBIAS` (0 .. 16, in units of the depth buffer) is Direct3D 9's `D3DRS_DEPTHBIAS` of -zbias units of the depth buffer that is set (worked out again when the depth buffer changes), `D3DRS_EDGEANTIALIAS` is `D3DRS_ANTIALIASEDLINEENABLE`, `D3DRS_SOFTWAREVERTEXPROCESSING` is `SetSoftwareVertexProcessing` (refused on a device of hardware vertex processing), `D3DRS_PATCHSEGMENTS` is `SetNPatchMode` (1.0 to begin with), and `D3DRS_LINEPATTERN` and `D3DRS_ZVISIBLE` are kept (Direct3D 8 itself draws with neither). A state Direct3D 8 has not (Direct3D 9's own, the holes of the list) is `D3DERR_INVALIDCALL`. |
@@ -78,29 +78,20 @@ DLL of the OS mingw has no 64-bit library of, `tests/d3d12_qemu.sh` with dlltool
 
 ## What is not there
 
-What Direct3D 9 here has not, Direct3D 8 has not either, and fails as Direct3D 9 fails (E_NOTIMPL, or a draw without the effect):
+What Direct3D 9 here has not, Direct3D 8 has not either, and fails as Direct3D 9 fails:
 
-- additional swap chains (`CreateAdditionalSwapChain`), more than one back buffer, `GetFrontBuffer` (`GetFrontBufferData`), `GetRasterStatus`,
-  the palette (`SetPaletteEntries`, `SetCurrentTexturePalette` and the Get methods), `SetCursorProperties`, `ProcessVertices`, patches
-  (`DrawRectPatch`, `DrawTriPatch`, `DeletePatch`), `GetClipPlane`, `SetClipStatus` / `GetClipStatus`: E_NOTIMPL in d3d9.dll.
-- state block recording: Direct3D 9's `BeginStateBlock` records nothing apart (what is set between it and `EndStateBlock` changes the device
-  at once, and the block is of everything). Direct3D 8's own state (shader handles, the base vertex index, its five render states) is recorded
-  correctly here.
-- `CopyRects`, `UpdateSurface` of parts and `StretchRect` of parts are not in Direct3D 9 here: the copy by locking stands in, which needs both
-  surfaces lockable (not depth buffers).
-- resource priorities (Direct3D 9's `SetPriority` keeps none), `GetNPatchMode` (0), the cursor, gamma ramps, the clip planes (`SetClipPlane`
-  is taken and not drawn with): Direct3D 9's.
+- palettes, `SetCursorProperties`, `ProcessVertices`, patches, `GetClipStatus` and the other methods Direct3D9.md lists as missing.
 - the gaps of Direct3D 9's translator for the shaders of Direct3D 8 (Direct3D9.md): pixel shaders 1.x with `texbem`, `texbeml`, `bem`,
-  `texm3x3tex`, `texm3x3spec`, `texm3x3vspec`, `texdepth` and `texm3x2depth` cannot be made; vertex shaders are drawn without the half pixel
-  between Direct3D's pixel centres and the rasterizer's.
+  `texm3x3tex`, `texm3x3spec`, `texm3x3vspec`, `texdepth` and `texm3x2depth` cannot be made.
 - `D3DRS_LINEPATTERN` and `D3DRS_ZVISIBLE` are kept and not drawn with (Direct3D 8 draws with neither).
-- a depth buffer larger than the render target (which Direct3D 8 and 9 allow): with one set, nothing is drawn into a smaller texture in
-  Direct3D 9 here (d3d8test draws into its texture with no depth buffer).
-- a back buffer of 640 x 480 (the size Wine's visual tests take): after a draw the whole back buffer reads back as 0 in Direct3D 9 here,
-  where 256 x 256 and smaller draw; most of Wine's visual.c fails on that, before anything of Direct3D 8 is looked at.
-- the zero stride and NULL stream 0 Direct3D 8 leaves after `DrawPrimitiveUP`, `DrawIndexedPrimitive` with no index buffer set, the rules of
-  `CheckDeviceFormat` for adapter formats, lockable back buffers (`D3DPRESENTFLAG_LOCKABLE_BACKBUFFER`), partial locks of compressed levels,
-  the levels of a texture in one allocation, the transforms of vertex blending (`D3DTS_WORLDMATRIX(1 ..)`), multisampled targets: Direct3D 9's.
+- Wine's visual.c (one program) stops the machine (a hang inside Direct3D 9 or below, not looked into); one program per test function runs
+  them all (tests/windows/wine/README.md).
+- a full-screen device's window handling (styles, focus, mode changes), the second adapter, `CheckDeviceFormat` of the adapter format
+  `D3DFMT_UNKNOWN` (D3DERR_NOTAVAILABLE where Direct3D 8 says D3DERR_INVALIDCALL), the lock rules of scratch surfaces, multisampled targets:
+  Direct3D 9's (the failing checks of Wine's device.c).
+
+Copies between two surfaces in memory (`CopyRects` with neither in `D3DPOOL_DEFAULT`) lock both, as Direct3D 9 has no call for them; a part
+of a target into memory is fetched whole (`GetRenderTargetData` into a surface in memory of its size) and the part copied from there.
 
 ## Tests
 
@@ -110,17 +101,17 @@ shaders 1.0 .. 1.4 as Direct3D 9 takes them, translated by d3d9.dll's own transl
 with its declaration's usage; the cases of Wine's `test_validate_vs` / `test_validate_ps`; every shortened declaration and shader, and 32000 with
 bits turned.
 
-`tests/windows/d3d8test.c` (77 checks): the Direct3D object, its modes and caps, presentation parameters Direct3D 8 refuses, references and identities (the
+`tests/windows/d3d8test.c` (78 checks): the Direct3D object, its modes and caps, presentation parameters Direct3D 8 refuses, references and identities (the
 implicit surfaces at 0, a texture's levels, GetTexture / GetStreamSource / GetIndices, private data), draws read back by pixel (an FVF handle,
 vertex and index buffers with SetIndices' base vertex index, a vertex shader of D3DVSD tokens with a constant its declaration loads, the
 fixed-function pipeline through a declaration handle, pixel shaders 1.1 and 1.0, a texture through sampler states that are stage states),
 Direct3D 8's own render states, state blocks by handle, CopyRects (rectangles to points, into and out of the back buffer), the sizes in the
-descriptions, a volume level, a texture drawn into with `SetRenderTarget(target, depth)`, Present and Reset, ValidateVertexShader and
+descriptions, a volume level, a texture drawn into with `SetRenderTarget(target, depth)`, Present, a Reset refused while the back buffer is held (D3DERR_DEVICELOST) and one that succeeds, ValidateVertexShader and
 ValidatePixelShader. Run as a 32-bit program by `tests/wow64_qemu.sh d3d8test`, as a 64-bit one on the CPU renderer by
-`GPU=std tests/d3d12_qemu.sh d3d8test` and on the 3D hardware by `tests/d3d12_qemu.sh d3d8test`: all 77 pass in each (2026-11-26). One check
+`GPU=std tests/d3d12_qemu.sh d3d8test` and on the 3D hardware by `tests/d3d12_qemu.sh d3d8test`: all 78 pass in each (2026-11-26, on the d3d9.dll of the d3d9 gap pass). One check
 reads a pixel back the way Wine's visual tests do (CopyRects of the render target into a level of a texture in system memory).
 
-Wine's d3d8 tests (`tests/windows/wine/d3d8`, `scripts/winetest.sh d3d8`): see the table in tests/windows/wine/README.md. device.c stops at
-the first test that uses what Direct3D 9 here has not (`test_swapchain`); to see every test function, a split build - one program per function,
-made from device.c and visual.c into a folder of its own, run with `scripts/winetest.sh <folder>` and not checked in - was used: 69 of 145
-functions pass, and what fails is Direct3D 9's (the list above).
+Wine's d3d8 tests (`tests/windows/wine/d3d8`, `scripts/winetest.sh d3d8`): see the table in tests/windows/wine/README.md (device 445,
+stateblock 0, visual 1048 and a hang). Because one crash or hang hides the rest of a program, a split build - one program per test function,
+made from device.c and visual.c into a folder of its own, run with `scripts/winetest.sh <folder>` and not checked in - was used too: 85 of
+145 functions pass, and what fails is Direct3D 9's or below (the list above).

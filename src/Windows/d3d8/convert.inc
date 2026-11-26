@@ -102,7 +102,7 @@ static void caps_from9(const D3DCAPS9 *c9, D3DCAPS8 *c8) {
 
 /* ---- presentation parameters ------------------------------------------------------------------------------------------------------------------------ */
 
-/* Direct3D 8's rules for D3DPRESENT_PARAMETERS (Reset takes any back buffer count with the copy swap effects), and the Direct3D 9 form: the swap
+/* Direct3D 8's rules for D3DPRESENT_PARAMETERS (the same for CreateDevice, CreateAdditionalSwapChain and Reset), and the Direct3D 9 form: the swap
  * effect D3DSWAPEFFECT_COPY_VSYNC is a copy at the vertical blank, a window presents at once with the others (Direct3D 9's default waits), and
  * there is no multisample quality. */
 static HRESULT present_to9(const D3DPRESENT_PARAMETERS *p8, D3DPRESENT_PARAMETERS9 *p9, BOOL reset) {
@@ -111,7 +111,8 @@ static HRESULT present_to9(const D3DPRESENT_PARAMETERS *p8, D3DPRESENT_PARAMETER
   const DWORD effect = p8->SwapEffect;
   if (effect < D3DSWAPEFFECT_DISCARD || effect > D3DSWAPEFFECT_COPY_VSYNC) return D3DERR_INVALIDCALL;
   if (p8->BackBufferCount > D3DPRESENT_BACK_BUFFERS_MAX) return D3DERR_INVALIDCALL;
-  if (!reset && (effect == D3DSWAPEFFECT_COPY || effect == D3DSWAPEFFECT_COPY_VSYNC) && p8->BackBufferCount > 1) return D3DERR_INVALIDCALL;
+  if ((effect == D3DSWAPEFFECT_COPY || effect == D3DSWAPEFFECT_COPY_VSYNC) && p8->BackBufferCount > 1) return D3DERR_INVALIDCALL;
+  (void)reset;
   if (p8->Windowed && p8->FullScreen_RefreshRateInHz) return D3DERR_INVALIDCALL;      /* (a window has the display's rate) */
   p9->BackBufferWidth = p8->BackBufferWidth;
   p9->BackBufferHeight = p8->BackBufferHeight;
@@ -130,11 +131,8 @@ static HRESULT present_to9(const D3DPRESENT_PARAMETERS *p8, D3DPRESENT_PARAMETER
   else p9->PresentationInterval = p8->FullScreen_PresentationInterval;
   return D3D_OK;
 }
-/* What Direct3D 9 chose (the size and format of a window's back buffer, the count) back into the program's parameters. */
+/* What Direct3D 8 writes back into the program's parameters: the count of back buffers only (a window's size of 0 stays 0, unlike Direct3D 9). */
 static void present_from9(const D3DPRESENT_PARAMETERS9 *p9, D3DPRESENT_PARAMETERS *p8) {
-  p8->BackBufferWidth = p9->BackBufferWidth;
-  p8->BackBufferHeight = p9->BackBufferHeight;
-  p8->BackBufferFormat = p9->BackBufferFormat;
   p8->BackBufferCount = p9->BackBufferCount ? p9->BackBufferCount : 1;
 }
 
