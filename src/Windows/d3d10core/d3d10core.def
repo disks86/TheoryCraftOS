@@ -1,0 +1,8 @@
+LIBRARY d3d10core.dll
+EXPORTS
+; (the device is d3d11.dll's: src/Windows/d3d11/d3d10.inc)
+D3D10CoreCreateDevice
+D3D10CoreGetVersion
+D3D10CoreRegisterLayers
+OpenAdapter10 = d3d11.OpenAdapter10
+OpenAdapter10_2 = d3d11.OpenAdapter10_2

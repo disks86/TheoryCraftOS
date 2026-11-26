@@ -30,6 +30,8 @@ static HRESULT STDMETHODCALLTYPE dev_QueryInterface(Dev *d, REFIID riid, void **
   else if (guid_eq(riid, &IID_IDXGIObject) || guid_eq(riid, &IID_IDXGIDevice) || guid_eq(riid, &IID_IDXGIDevice1) || guid_eq(riid, &IID_IDXGIDevice2) ||
            guid_eq(riid, &IID_IDXGIDevice3)) *out = &d->dxgi;      /* (DXGI 1.2: ANGLE needs it to present to another process's window) */
   else if (guid_eq(riid, &IID_ITcosPresenter)) *out = &d->presenter;
+  else if ((guid_eq(riid, &IID_ID3D10Device) || guid_eq(riid, &IID_ID3D10Device1)) && d->d10.lpVtbl) *out = &d->d10;      /* (a device Direct3D 10 made: d3d10.inc) */
+  else if (guid_eq(riid, &IID_ID3D10Multithread)) *out = &d->d10mt;
   else if ((guid_eq(riid, &IID_ID3D11On12Device) || guid_eq(riid, &IID_ID3D11On12Device1)) && d->on12.lpVtbl) *out = &d->on12;      /* (a device of D3D11On12CreateDevice) */
   else if (guid_eq(riid, &IID_ID3D11VideoDevice) || guid_eq(riid, &IID_ID3D11VideoDevice1) || guid_eq(riid, &IID_ID3D11VideoDevice2)) *out = &d->video;      /* (video.inc) */
   else { dx_no_interface("ID3D11Device", riid); return E_NOINTERFACE; }
@@ -712,6 +714,7 @@ static HRESULT dev_create_on(IDXGIAdapter *adapter, UINT flags, const D3D_FEATUR
   d->dxgi.lpVtbl = (const IDXGIDevice1Vtbl *)&g_dxgi_vtbl;      /* (IDXGIDevice3's table begins with IDXGIDevice1's) */
   d->presenter.lpVtbl = &g_presenter_vtbl;
   d->video.lpVtbl = &vdev_vtbl;
+  d->d10mt.lpVtbl = &g_d10mt_vtbl;
   InitializeCriticalSection(&d->lock);
   d->level = D3D_FEATURE_LEVEL_11_0;      /* (until the adapter's is known: below) */
   d->flags = flags;

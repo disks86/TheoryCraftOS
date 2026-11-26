@@ -12,6 +12,8 @@
 #            (dxgi.dll and d3d12.dll over the kernel's software adapter).
 #   d3d11test  tests/windows/d3d11test.c: Direct3D 11 (d3d11.dll, a layer on d3d12.dll) - a device, buffers, draws read back, constants a stage,
 #            textures, depth, blending, a swap chain on a window. The same source built for x86-64 tests the 64-bit library.
+#   d3d10test  tests/windows/d3d10test.c: Direct3D 10 (d3d10.dll, d3d10_1.dll, d3d10core.dll over d3d11.dll's device) - draws read back, states, a geometry
+#              shader and stream output, queries, Map, Direct3D 10 <-> 11 interfaces, state blocks, a swap chain and a triangle drawn through an effect
 #   d3d9test  tests/windows/d3d9test.c: Direct3D 9 (d3d9.dll: the fixed-function pipeline and a program's own shaders, a layer on d3d12.dll) - a device on a window, draws read
 #            back, buffers, textures and their stages, blending, depth, a texture drawn into, Present, Reset. Also built for x86-64.
 #   d3d8test  tests/windows/d3d8test.c: Direct3D 8 (d3d8.dll, a layer on d3d9.dll's interfaces) - Direct3D 8's references and identities, draws read back
@@ -30,14 +32,14 @@
 # autorun. Needs i686-w64-mingw32-gcc.
 #   share32  tests/windows/d3dsharetest.c: Direct3D shared handles - resources, heaps and fences between two devices and with a second process that inherits the
 #            handles, and gdi32's D3DKMT sharing functions with a 32-bit program's structures.
-# Usage: tests/wow64_qemu.sh [hello32] [crt32] [seh32] [gui32] [lib32] [old32] [dx32] [d3d11test] [d3d9test] [d3d8test] [com32] [com64] [xml32] [cab32] [cab64] [share32] [d3d12videotest] [d3d11videotest] [d3d12encodetest] [d3d12encodecodectest]      (no arguments: all)
+# Usage: tests/wow64_qemu.sh [hello32] [crt32] [seh32] [gui32] [lib32] [old32] [dx32] [d3d11test] [d3d10test] [d3d9test] [d3d8test] [com32] [com64] [xml32] [cab32] [cab64] [share32] [d3d12videotest] [d3d11videotest] [d3d12encodetest] [d3d12encodecodectest]      (no arguments: all)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 build=${BUILD:-build-wow64-qemu}
 work=${TMPDIR:-/tmp}/tcos-wow64-qemu
 rm -rf "$work"; mkdir -p "$work"
 programs=("$@")
-[ ${#programs[@]} -eq 0 ] && programs=(hello32 crt32 seh32 gui32 lib32 old32 dx32 d3d11test d3d9test d3d8test com32 com64 xml32 cab32 cab64 share32 d3d12videotest d3d11videotest d3d12encodetest d3d12encodecodectest)
+[ ${#programs[@]} -eq 0 ] && programs=(hello32 crt32 seh32 gui32 lib32 old32 dx32 d3d11test d3d10test d3d9test d3d8test com32 com64 xml32 cab32 cab64 share32 d3d12videotest d3d11videotest d3d12encodetest d3d12encodecodectest)
 i686-w64-mingw32-gcc -O1 -ffreestanding -nostdlib -Isrc/Windows -Wl,--entry=_start32 -Wl,--subsystem,console -o "$work/hello32.exe" tests/windows/hello32.c
 i686-w64-mingw32-gcc -O1 -o "$work/crt32.exe" tests/windows/crt32.c
 i686-w64-mingw32-gcc -O1 -shared -o "$work/plug32.dll" tests/windows/plug32.c      # (a library crt32 loads while it runs)
@@ -50,13 +52,14 @@ i686-w64-mingw32-gcc -O1 -mcrtdll=msvcrt-os -o "$work/old32.exe" tests/windows/o
 python3 - "$work/dxfixtures.h" <<'PY'
 import glob, os, sys
 out = open(sys.argv[1], "w")
-for path in sorted(glob.glob("tests/data/dxbc/*.dxbc") + glob.glob("tests/data/dxbc/*.dxil")):
+for path in sorted(glob.glob("tests/data/dxbc/*.dxbc") + glob.glob("tests/data/dxbc/*.dxil") + glob.glob("tests/data/fx/*.fxo")):
     n = os.path.basename(path).replace(".", "_")
     data = open(path, "rb").read()
     out.write("static const unsigned char dx_%s[] = {%s};\n" % (n, ",".join(str(b) for b in data)))
 PY
 i686-w64-mingw32-gcc -O1 -I "$work" -o "$work/dx32.exe" tests/windows/dx32.c -ldxgi -ld3d12 -luuid -lgdi32
 i686-w64-mingw32-gcc -O1 -I "$work" -o "$work/d3d11test.exe" tests/windows/d3d11test.c -ld3d11 -ld3d12 -ldxgi -luuid -ldxguid -luser32
+i686-w64-mingw32-gcc -O1 -I "$work" -o "$work/d3d10test.exe" tests/windows/d3d10test.c -ld3d10 -ld3d11 -ldxgi -luuid -ldxguid -luser32
 i686-w64-mingw32-gcc -O1 -o "$work/d3d9test.exe" tests/windows/d3d9test.c -ld3d9 -luser32 -lgdi32
 i686-w64-mingw32-gcc -O1 -o "$work/d3d8test.exe" tests/windows/d3d8test.c -ld3d8 -luser32
 # (com32's interfaces: the type library is a resource of the program, the header and the identifiers are generated)

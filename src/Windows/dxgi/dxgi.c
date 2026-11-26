@@ -240,6 +240,10 @@ static HRESULT STDMETHODCALLTYPE fac_CreateSwapChain(Factory *This, IUnknown *de
   DXGI_SWAP_CHAIN_FULLSCREEN_DESC fs;
   IDXGISwapChain1 *c = NULL;
   if (!device || !desc || !chain) return DXGI_ERROR_INVALID_CALL;
+  *chain = NULL;
+  /* (a swap chain of this call needs its window; a format no swap chain has is E_INVALIDARG, as Windows answers) */
+  if (!desc->OutputWindow) return DXGI_ERROR_INVALID_CALL;
+  if (!is_swap_format(desc->BufferDesc.Format)) return E_INVALIDARG;
   memset(&d, 0, sizeof d);
   memset(&fs, 0, sizeof fs);
   d.Width = desc->BufferDesc.Width;
@@ -786,12 +790,14 @@ static HRESULT STDMETHODCALLTYPE sc_SetColorSpace1(SwapChain *This, DXGI_COLOR_S
 
 /* ---- the entry points -------------------------------------------------------------------------------------------------------------------------------------------------------- */
 
-static HRESULT create_factory(UINT flags, REFIID riid, void **out) {
+/* (a factory of CreateDXGIFactory is DXGI 1.0's: IDXGIFactory alone, as on Windows - IDXGIFactory1 and later are CreateDXGIFactory1's and CreateDXGIFactory2's) */
+static const GUID *const g_factory10_iids[] = {&IID_IDXGIObject, &IID_IDXGIFactory, NULL};
+static HRESULT create_factory(UINT flags, REFIID riid, void **out, BOOL dxgi10) {
   if (!out) return DXGI_ERROR_INVALID_CALL;
   *out = NULL;
   Factory *f = mem_alloc(sizeof *f);
   if (!f) return E_OUTOFMEMORY;
-  dx_init(OBJ(f), &fac_vtbl, g_factory_iids, factory_destroy);
+  dx_init(OBJ(f), &fac_vtbl, dxgi10 ? g_factory10_iids : g_factory_iids, factory_destroy);
   f->flags = flags;
   f->count = read_adapters(f->adapters);
   const HRESULT hr = dx_QueryInterface(OBJ(f), riid, out);
@@ -799,9 +805,9 @@ static HRESULT create_factory(UINT flags, REFIID riid, void **out) {
   return hr;
 }
 
-EXPORT HRESULT WINAPI CreateDXGIFactory(REFIID riid, void **factory) { return create_factory(0, riid, factory); }
-EXPORT HRESULT WINAPI CreateDXGIFactory1(REFIID riid, void **factory) { return create_factory(0, riid, factory); }
-EXPORT HRESULT WINAPI CreateDXGIFactory2(UINT flags, REFIID riid, void **factory) { return create_factory(flags, riid, factory); }
+EXPORT HRESULT WINAPI CreateDXGIFactory(REFIID riid, void **factory) { return create_factory(0, riid, factory, TRUE); }
+EXPORT HRESULT WINAPI CreateDXGIFactory1(REFIID riid, void **factory) { return create_factory(0, riid, factory, FALSE); }
+EXPORT HRESULT WINAPI CreateDXGIFactory2(UINT flags, REFIID riid, void **factory) { return create_factory(flags, riid, factory, FALSE); }
 EXPORT HRESULT WINAPI DXGIGetDebugInterface1(UINT flags, REFIID riid, void **debug) {
   if (debug) *debug = NULL;
   return DXGI_ERROR_SDK_COMPONENT_MISSING;

@@ -19,9 +19,12 @@ list of failing tests is the to-do list for the implementation.
 ## State
 
 343 programs build (kernel32 33, comctl32 29, ntdll 28, user32 23, shell32 19, crypt32 15, gdi32 14, advapi32 12, gdiplus 12, ole32 11, shlwapi 11, winmm 10, ... 60 DLLs).
-26 tests are imported but do not link here, because they need something mingw-w64 lacks: the import libraries of `kernelbase`, `win32u`, `winspool.drv` and `d3d10_1`,
-the private entry points `__STRINGTOLD`, `GetDiskInfoA` and `D3D10CreateDevice1`, or GUIDs and helpers that Wine's build makes from IDL files of its own tree (msi, dsound,
+26 tests are imported but do not link here, because they need something mingw-w64 lacks: the import libraries of `kernelbase`, `win32u` and `winspool.drv`,
+the private entry points `__STRINGTOLD` and `GetDiskInfoA`, or GUIDs and helpers that Wine's build makes from IDL files of its own tree (msi, dsound,
 oleaut32 `tmarshal`, rpcrt4 `cstub`, ole32 `CLSID_ManualResetEvent`, ...). Wine tests of DLLs this OS has no file for (windowscodecs, jscript, vbscript, ...) are not imported.
+A DLL mingw-w64 has no import library of (`d3d10_1`) gets one made from this OS's own `src/Windows/<dll>/<dll>.def` (dlltool), and a DLL's `defines.txt` holds the
+EXTRADEFS of its Makefile.in (`d3d10`, `d3d10_1`: d3dcompiler_43's `reflection.c` built with `-DD3D_COMPILER_VERSION=0`, which tests `D3D10ReflectShader`). The Direct3D 10
+tests (`d3d10core`, `d3d10_1`, `d3d10`) were added later, from the same commit.
 
 ## Running them, and where the implementations stand
 
@@ -90,6 +93,12 @@ Checks that failed (Wine commit f343ca6), before the implementation of the libra
 | d3d9 stateblock | 540, runs to the end (11818 checks) | 0 of 14738 |
 | d3d9 visual | 193, then an access violation in clear_test (the 7th test) | about 50 in the first part (clears, lighting of singular and non-affine world matrices, fog, the test of 4470), running past clear_test; not run to the end on the emulator (too slow on a loaded machine) |
 | d3d8 device, stateblock, visual (imported 2026-11-26) | not run (there was no d3d8.dll) | device: 4, then a crash at `test_swapchain` (it uses the swap chain `CreateAdditionalSwapChain` did not make: E_NOTIMPL in d3d9.dll); stateblock: 556 (Direct3D 9's state block recording and capture); visual: 797, then a crash at `test_flip` (a second back buffer). Run one program per test function (a split build of device.c and visual.c, not checked in, docs/Direct3D8.md): 145 programs, 69 with no failure, 6930 failed checks - device 5162 (4141 of them the block rules of compressed surfaces and volumes in `test_surface_blocks` / `test_volume_blocks`, 549 the levels of a texture in one allocation, 259 pools and usages of `test_resource_access`), stateblock 556, visual 1212. What is left is Direct3D 9's (d3d9.dll and below): a depth buffer of 640 x 480 or 512 x 512 makes every draw of Wine's visual tests come out as 0; swap chains, back buffers, palettes, cursor, priorities, recording state blocks, lock rules, window-system behaviour of full-screen devices. d3d8's own checks pass (`test_refcount`, `test_shader`, `test_validate_vs` / `test_validate_ps`, `test_private_data`, `test_get_info`, `test_unsupported_shaders`, `test_texture_stage_states`, `test_surface_get_container`, `test_reset_resources` ...) |
+| d3d10 device (state block masks, state blocks) | not run (no d3d10.dll) | 0 of 218 |
+| d3d10 reflection, d3d10_1 reflection (D3D10ReflectShader) | not run | 0 of 624 each |
+| d3d10 effect | not run | stops at effect.c:140: D3D10CompileEffectFromMemory is E_NOTIMPL (no HLSL compiler) and the test uses the NULL blob. With the run-time compiles replaced by blobs of Microsoft's d3dcompiler_47: 51 of 5041, all from that compiler leaving out the empty `$Globals` buffer d3d10's own emits |
+| d3d10_1 d3d10_1 | did not link | 1 (d3d10_1.c:1069, the same missing compiler), then the test crashes on the NULL blob |
+| d3d10core d3d10core | not run | 2, then a crash in test_create_rendertarget_view (a buffer's render target view is refused: docs/Direct3D10.md). Without that test it runs to test_cube_maps within the emulator's 1800 s: 448, nearly all drawing of the kernel's gaps - 410 in test_texture (formats), 23 layered rendering (SV_RenderTargetArrayIndex), 12 test_texture1d, cube maps, 1 blend |
+| d3d11 d3d11 (after the Direct3D 10 work) | 41, then the crash at the depth view arrays | 7 (a child process, three texture formats), then a crash at a buffer's render target view (d3d11.c:4398) |
 
 Everything else was measured once and has not been worked on: ntdll alpc 1684, directory 784, file 354, sync 246, threadpool 244, reg 133 (the NT registry services), path 279;
 shlwapi UrlHash/HashData (need Wine's 256-byte table); mpr 211, psapi 123, userenv 68, secur32 53. Most of those are

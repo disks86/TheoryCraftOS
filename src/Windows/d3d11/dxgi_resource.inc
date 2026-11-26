@@ -36,11 +36,64 @@ static HRESULT STDMETHODCALLTYPE tex_QueryInterface(Tex *t, REFIID riid, void **
     if (t->desc.ArraySize != 1 || t->desc.MipLevels != 1 || t->kind != 0) { dx_no_interface("ID3D11Texture2D (a surface of several subresources)", riid); return E_NOINTERFACE; }
     *out = &t->dxgi_surf;
   } else {
-    return dx_QueryInterface(OBJ(t), riid, out);
+    return child_QueryInterface(&t->c, riid, out);      /* (its Direct3D 10 interface, then the Direct3D 11 ones) */
   }
   dx_AddRef(OBJ(t));
   return S_OK;
 }
+
+/* ---- a buffer as DXGI sees it: IDXGIResource1 (Buf.dxgi_res), with the buffer's count ---- */
+static Buf *buf_of_dxgi_res(IDXGIResource1 *p) { return (Buf *)((BYTE *)p - offsetof(Buf, dxgi_res)); }
+static const IDXGIResource1Vtbl g_buf_dxgi_vtbl;
+static HRESULT STDMETHODCALLTYPE buf_QueryInterface(Buf *b, REFIID riid, void **out) {
+  if (out && riid && (guid_eq(riid, &IID_IDXGIObject) || guid_eq(riid, &IID_IDXGIDeviceSubObject) || guid_eq(riid, &IID_IDXGIResource) || guid_eq(riid, &IID_IDXGIResource1))) {
+    b->dxgi_res.lpVtbl = &g_buf_dxgi_vtbl;
+    dx_AddRef(OBJ(b));
+    *out = &b->dxgi_res;
+    return S_OK;
+  }
+  return child_QueryInterface(&b->c, riid, out);
+}
+static HRESULT STDMETHODCALLTYPE bres_QueryInterface(IDXGIResource1 *p, REFIID riid, void **out) { return buf_QueryInterface(buf_of_dxgi_res(p), riid, out); }
+static ULONG STDMETHODCALLTYPE bres_AddRef(IDXGIResource1 *p) { return child_AddRef(&buf_of_dxgi_res(p)->c); }
+static ULONG STDMETHODCALLTYPE bres_Release(IDXGIResource1 *p) { return child_Release(&buf_of_dxgi_res(p)->c); }
+static HRESULT STDMETHODCALLTYPE bres_SetPrivateData(IDXGIResource1 *p, REFGUID g, UINT size, const void *data) { return dx_SetPrivateData(OBJ(buf_of_dxgi_res(p)), g, size, data); }
+static HRESULT STDMETHODCALLTYPE bres_SetPrivateDataInterface(IDXGIResource1 *p, REFGUID g, const IUnknown *o) { return dx_SetPrivateDataInterface(OBJ(buf_of_dxgi_res(p)), g, o); }
+static HRESULT STDMETHODCALLTYPE bres_GetPrivateData(IDXGIResource1 *p, REFGUID g, UINT *size, void *data) { return dx_GetPrivateData(OBJ(buf_of_dxgi_res(p)), g, size, data); }
+static HRESULT STDMETHODCALLTYPE bres_GetParent(IDXGIResource1 *p, REFIID riid, void **out) { return dev_QueryInterface(buf_of_dxgi_res(p)->c.dev, riid, out); }
+static HRESULT STDMETHODCALLTYPE bres_GetDevice(IDXGIResource1 *p, REFIID riid, void **out) { return dev_QueryInterface(buf_of_dxgi_res(p)->c.dev, riid, out); }
+/* (buffers are not shared by this runtime: a buffer has no shared handle - DXGI_ERROR_INVALID_CALL, as for a resource made without sharing - and no NT one) */
+static HRESULT STDMETHODCALLTYPE bres_GetSharedHandle(IDXGIResource1 *p, HANDLE *handle) { (void)p; if (!handle) return E_INVALIDARG; *handle = NULL; return DXGI_ERROR_INVALID_CALL; }
+static HRESULT STDMETHODCALLTYPE bres_GetUsage(IDXGIResource1 *p, DXGI_USAGE *usage) {
+  const Buf *b = buf_of_dxgi_res(p);
+  if (!usage) return E_INVALIDARG;
+  *usage = 0;
+  if (b->desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) *usage |= DXGI_USAGE_SHADER_INPUT;
+  if (b->desc.BindFlags & D3D11_BIND_RENDER_TARGET) *usage |= DXGI_USAGE_RENDER_TARGET_OUTPUT;
+  if (b->desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS) *usage |= DXGI_USAGE_UNORDERED_ACCESS;
+  if (b->desc.CPUAccessFlags & D3D11_CPU_ACCESS_READ) *usage |= DXGI_CPU_ACCESS_READ_WRITE;
+  else if (b->desc.Usage == D3D11_USAGE_DYNAMIC) *usage |= DXGI_CPU_ACCESS_DYNAMIC;
+  return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE bres_SetEvictionPriority(IDXGIResource1 *p, UINT priority) { buf_SetEvictionPriority(buf_of_dxgi_res(p), priority); return S_OK; }
+static HRESULT STDMETHODCALLTYPE bres_GetEvictionPriority(IDXGIResource1 *p, UINT *priority) {
+  if (!priority) return E_INVALIDARG;
+  *priority = buf_GetEvictionPriority(buf_of_dxgi_res(p));
+  return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE bres_CreateSubresourceSurface(IDXGIResource1 *p, UINT index, IDXGISurface2 **out) { (void)p; (void)index; if (out) *out = NULL; return E_INVALIDARG; }      /* (no surface of a buffer) */
+static HRESULT STDMETHODCALLTYPE bres_CreateSharedHandle(IDXGIResource1 *p, const SECURITY_ATTRIBUTES *attributes, DWORD access, LPCWSTR name, HANDLE *handle) {
+  (void)p; (void)attributes; (void)access; (void)name;
+  if (handle) *handle = NULL;
+  return E_INVALIDARG;      /* (made without SHARED_NTHANDLE: this runtime makes no shared buffers) */
+}
+#define BRES_SLOT(name) .name = (__typeof__(((IDXGIResource1Vtbl *)0)->name))bres_##name
+static const IDXGIResource1Vtbl g_buf_dxgi_vtbl = {
+    BRES_SLOT(QueryInterface), BRES_SLOT(AddRef), BRES_SLOT(Release), BRES_SLOT(SetPrivateData), BRES_SLOT(SetPrivateDataInterface), BRES_SLOT(GetPrivateData),
+    BRES_SLOT(GetParent), BRES_SLOT(GetDevice), BRES_SLOT(GetSharedHandle), BRES_SLOT(GetUsage), BRES_SLOT(SetEvictionPriority), BRES_SLOT(GetEvictionPriority),
+    BRES_SLOT(CreateSubresourceSurface), BRES_SLOT(CreateSharedHandle),
+};
+#undef BRES_SLOT
 
 static UINT dxgi_usage_of(const Tex *t) {
   UINT usage = 0;
@@ -154,8 +207,60 @@ static HRESULT STDMETHODCALLTYPE dsurf_Unmap(IDXGISurface2 *p) {
   ctx_Unmap(t->c.dev->ctx, (ID3D11Resource *)t, 0);
   return S_OK;
 }
-static HRESULT STDMETHODCALLTYPE dsurf_GetDC(IDXGISurface2 *p, BOOL discard, HDC *dc) { (void)p; (void)discard; if (dc) *dc = NULL; return DXGI_ERROR_INVALID_CALL; }      /* (no GDI-compatible surfaces) */
-static HRESULT STDMETHODCALLTYPE dsurf_ReleaseDC(IDXGISurface2 *p, RECT *dirty) { (void)p; (void)dirty; return DXGI_ERROR_INVALID_CALL; }
+/* GDI on a texture made GDI_COMPATIBLE (B8G8R8A8, one level, one sample): GetDC hands out a memory device context with a DIB section of the texels - the texture's own, or
+ * none with `discard` -, which GDI draws into; ReleaseDC puts them back into the texture (all of them: a dirty rectangle only says what changed) and the DC goes. One DC at
+ * a time; GetDC again, or ReleaseDC without one, is DXGI_ERROR_INVALID_CALL, as is a texture that is not GDI-compatible. */
+static HRESULT STDMETHODCALLTYPE dsurf_GetDC(IDXGISurface2 *p, BOOL discard, HDC *dc) {
+  Tex *t = tex_of_dxgi_surf(p);
+  Dev *d = t->c.dev;
+  if (!dc) return E_INVALIDARG;
+  if (!(t->desc.MiscFlags & D3D11_RESOURCE_MISC_GDI_COMPATIBLE)) return DXGI_ERROR_INVALID_CALL;
+  EnterCriticalSection(&d->lock);
+  if (t->gdi_dc) { LeaveCriticalSection(&d->lock); return DXGI_ERROR_INVALID_CALL; }
+  BITMAPINFO info;
+  memset(&info, 0, sizeof info);
+  info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+  info.bmiHeader.biWidth = (LONG)t->desc.Width;
+  info.bmiHeader.biHeight = -(LONG)t->desc.Height;      /* (top-down, as the texture's rows) */
+  info.bmiHeader.biPlanes = 1;
+  info.bmiHeader.biBitCount = 32;
+  info.bmiHeader.biCompression = BI_RGB;
+  void *bits = NULL;
+  HDC memory = CreateCompatibleDC(NULL);
+  HBITMAP bitmap = memory ? CreateDIBSection(memory, &info, DIB_RGB_COLORS, &bits, NULL, 0) : NULL;
+  HRESULT hr = bitmap && bits ? S_OK : E_OUTOFMEMORY;
+  if (SUCCEEDED(hr) && !discard) hr = tex_read(d, t, 0, 0, bits);      /* (rows of Width * 4 bytes: a 32-bit DIB's own pitch) */
+  if (FAILED(hr)) {
+    if (bitmap) DeleteObject(bitmap);
+    if (memory) DeleteDC(memory);
+    LeaveCriticalSection(&d->lock);
+    return hr;
+  }
+  t->gdi_previous = SelectObject(memory, bitmap);
+  t->gdi_dc = memory;
+  t->gdi_bitmap = bitmap;
+  t->gdi_bits = bits;
+  *dc = memory;
+  LeaveCriticalSection(&d->lock);
+  return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE dsurf_ReleaseDC(IDXGISurface2 *p, RECT *dirty) {
+  Tex *t = tex_of_dxgi_surf(p);
+  Dev *d = t->c.dev;
+  EnterCriticalSection(&d->lock);
+  if (!t->gdi_dc) { LeaveCriticalSection(&d->lock); return DXGI_ERROR_INVALID_CALL; }
+  (void)dirty;
+  GdiFlush();
+  const HRESULT hr = tex_write(d, t, 0, 0, 0, 0, t->desc.Width, t->desc.Height, t->gdi_bits, t->desc.Width * 4);
+  SelectObject(t->gdi_dc, t->gdi_previous);
+  DeleteObject(t->gdi_bitmap);
+  DeleteDC(t->gdi_dc);
+  t->gdi_dc = NULL;
+  t->gdi_bitmap = t->gdi_previous = NULL;
+  t->gdi_bits = NULL;
+  LeaveCriticalSection(&d->lock);
+  return hr;
+}
 static HRESULT STDMETHODCALLTYPE dsurf_GetResource(IDXGISurface2 *p, REFIID riid, void **out, UINT *subresource) {
   if (subresource) *subresource = 0;
   return tex_QueryInterface(tex_of_dxgi_surf(p), riid, out);

@@ -57,12 +57,12 @@ if [ ${#jobs[@]} -gt 0 ]; then
 fi
 g++ -pthread "${objs[@]}" -o "$work/$runner" -ldl
 
-# The shaders the programs use, as C arrays (tests/data/dxbc is the kernel's own set of fixtures).
+# The shaders the programs use, as C arrays (tests/data/dxbc is the kernel's own set of fixtures; tests/data/fx the effects of d3d10test, dx_<name>_fxo).
 python3 - "$work/dxfixtures.h" <<'PY'
 import sys
 out = open(sys.argv[1], "w")
 import glob, os
-for path in sorted(glob.glob("tests/data/dxbc/*.dxbc") + glob.glob("tests/data/dxbc/*.dxil")):      # (dx_<name>_dxbc, dx_<name>_dxil: as tests/d3d12_qemu.sh names them)
+for path in sorted(glob.glob("tests/data/dxbc/*.dxbc") + glob.glob("tests/data/dxbc/*.dxil") + glob.glob("tests/data/fx/*.fxo")):      # (dx_<name>_dxbc, dx_<name>_dxil: as tests/d3d12_qemu.sh names them)
     n = os.path.basename(path).replace(".", "_")
     data = open(path, "rb").read()
     out.write("static const unsigned char dx_%s[] = {%s};\n" % (n, ",".join(str(b) for b in data)))
@@ -73,7 +73,7 @@ programs=("$@")
 fail=0
 for src in "${programs[@]}"; do
   name=$(basename "${src%.*}")
-  x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -Wno-unused-parameter -I "$work" -o "$work/$name.exe" "$src" -ld3d11 -ld3d9 -ldxgi -ld3d12 -luuid -ldxguid -luser32 -lgdi32
+  x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -Wno-unused-parameter -I "$work" -o "$work/$name.exe" "$src" -ld3d10 -ld3d11 -ld3d9 -ldxgi -ld3d12 -luuid -ldxguid -luser32 -lgdi32
   echo "== $name"
   "$work/$runner" "$work/$name.exe" "$work/sys32" | tee "$work/$name.out"
   grep -q -e ", 0 failed" -e "all [0-9]* checks passed" "$work/$name.out" || fail=1

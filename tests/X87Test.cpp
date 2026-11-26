@@ -317,6 +317,7 @@ static long double rnd_range(long double lo, long double hi) { return lo + (hi -
 static int bad = 0; static double worst[8] = {};
 static void check(const char* name, int idx, long double arg1, long double arg2, Ext got, Ext want, double tol) {
   double u = ulps(got, want);
+  if (u != u) u = 1e300;      // (a NaN against a number: as bad as it gets - compared as a NaN it passed, and sin(1) was a NaN unnoticed)
   if (u > worst[idx]) worst[idx] = u;
   if (u > tol && bad++ < 20) printf("%s(%.21Lg, %.21Lg): got %.21Lg want %.21Lg (%.1f ulps)\n", name, arg1, arg2, to_ld(got), to_ld(want), u);
 }
@@ -521,6 +522,22 @@ static void test_transcendental_values() {
   double sd, cd;
   memcpy(&sd, &sbits, 8); memcpy(&cd, &cbits, 8);
   CHECK(std::fabs(sd - 0.5) < 1e-15 && std::fabs(cd - 0.8660254037844386) < 1e-15);
+  // past pi/4 the argument is reduced: sin and cos of 1, 2, 10, 100
+  {
+    const struct { int64_t x; double sine, cosine; } known[] = {
+        {1, 0.8414709848078965, 0.5403023058681398}, {2, 0.9092974268256817, -0.4161468365471424}, {10, -0.5440211108893698, -0.8390715290764524},
+        {100, -0.5063656411097588, 0.8623188722876839}};      // (not much further: the x87 reduces with a pi of 66 bits)
+    for (const auto& k : known) {
+      Env ek;
+      Ext ks, kc;
+      CHECK(sin_cos(from_integer(k.x), &ks, &kc, ek));
+      const uint64_t a = to_double(ks, ek), b = to_double(kc, ek);
+      double av, bv;
+      memcpy(&av, &a, 8);
+      memcpy(&bv, &b, 8);
+      CHECK(std::fabs(av - k.sine) < 1e-15 && std::fabs(bv - k.cosine) < 1e-15);
+    }
+  }
   // 2^0.5 - 1 = 0.41421356...
   Ext half = from_integer(1); half.se = uint16_t(half.se - 1);
   Env e3;
