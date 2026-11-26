@@ -927,7 +927,8 @@ static UINT pso_pipeline_locked(Pso *p, const UINT strides[8], UINT stencil_ref,
   r[w++] = p->depth.StencilWriteMask;
   r[w++] = stencil_ref & 0xFF;
   r[w++] = p->depth.DepthEnable ? cmp_func(p->depth.DepthFunc) : 7;
-  r[w++] = rt->BlendEnable ? 1 : 0;      /* custom */
+  /* custom: blending, or a write mask that leaves channels alone (the kernel writes every channel of a state that is not custom) */
+  r[w++] = rt->BlendEnable || (rt->RenderTargetWriteMask & format_write_mask(p->rtv_formats[0])) != format_write_mask(p->rtv_formats[0]) ? 1 : 0;
   r[w++] = rt->BlendEnable ? 1 : 0;
   r[w++] = blend_factor(rt->SrcBlend);
   r[w++] = blend_factor(rt->DestBlend);
@@ -944,7 +945,7 @@ static UINT pso_pipeline_locked(Pso *p, const UINT strides[8], UINT stencil_ref,
   r[w++] = p->blend.IndependentBlendEnable ? 1 : 0;
   for (UINT t = 1; t < 4; ++t) {
     const D3D12_RENDER_TARGET_BLEND_DESC *b = &p->blend.RenderTarget[p->blend.IndependentBlendEnable ? t : 0];
-    r[w++] = b->BlendEnable ? 1 : 0;
+    r[w++] = b->BlendEnable || (b->RenderTargetWriteMask & format_write_mask(p->rtv_formats[t])) != format_write_mask(p->rtv_formats[t]) ? 1 : 0;      /* (custom, as above) */
     r[w++] = b->BlendEnable ? 1 : 0;
     r[w++] = blend_factor(b->SrcBlend);
     r[w++] = blend_factor(b->DestBlend);
@@ -1002,7 +1003,7 @@ static UINT pso_pipeline_locked(Pso *p, const UINT strides[8], UINT stencil_ref,
     r[w++] = more_blends;
     for (UINT k = 0; k < more_blends; ++k) {
       const D3D12_RENDER_TARGET_BLEND_DESC *b = &p->blend.RenderTarget[4 + k];
-      r[w++] = b->BlendEnable ? 1 : 0;
+      r[w++] = b->BlendEnable || (b->RenderTargetWriteMask & format_write_mask(p->rtv_formats[4 + k])) != format_write_mask(p->rtv_formats[4 + k]) ? 1 : 0;      /* (custom, as above) */
       r[w++] = b->BlendEnable ? 1 : 0;
       r[w++] = blend_factor(b->SrcBlend);
       r[w++] = blend_factor(b->DestBlend);

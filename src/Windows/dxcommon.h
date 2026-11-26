@@ -202,6 +202,10 @@ __declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIQueryResourceInfo(void *);
 #define D3DKMTQueryResourceInfo NtGdiDdDDIQueryResourceInfo
 __declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIOpenResource(void *);
 #define D3DKMTOpenResource NtGdiDdDDIOpenResource
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIWaitForVerticalBlankEvent(void *);
+#define D3DKMTWaitForVerticalBlankEvent NtGdiDdDDIWaitForVerticalBlankEvent
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIGetScanLine(void *);
+#define D3DKMTGetScanLine NtGdiDdDDIGetScanLine
 #else
 NTSTATUS WINAPI D3DKMTEnumAdapters2(void *);
 NTSTATUS WINAPI D3DKMTOpenAdapterFromLuid(void *);
@@ -239,6 +243,8 @@ NTSTATUS WINAPI D3DKMTOpenKeyedMutexFromNtHandle(void *);
 NTSTATUS WINAPI D3DKMTOpenKeyedMutex(void *);
 NTSTATUS WINAPI D3DKMTQueryResourceInfo(void *);
 NTSTATUS WINAPI D3DKMTOpenResource(void *);
+NTSTATUS WINAPI D3DKMTWaitForVerticalBlankEvent(void *);
+NTSTATUS WINAPI D3DKMTGetScanLine(void *);
 #endif
 
 #pragma GCC diagnostic ignored "-Wunused-function"

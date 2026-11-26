@@ -612,7 +612,10 @@ class Adapter::StreamRunner {
     if (level[0] >= color->mip_levels() || (depth && level[graphics::kMaxColorTargets] >= depth->mip_levels())) return kBad;
     const uint32_t pass_w = graphics::mip_extent(color->desc().width, level[0]), pass_h = graphics::mip_extent(color->desc().height, level[0]);
     auto sized = [&](const Allocation* t, uint32_t l) { return graphics::mip_extent(t->desc().width, l) == pass_w && graphics::mip_extent(t->desc().height, l) == pass_h; };
-    if (depth && (!sized(depth, level[graphics::kMaxColorTargets]) || depth->desc().samples != color->desc().samples)) return kBad;
+    // (a depth target as large as the pass or larger: the pass uses its top left part, as Direct3D 9 and OpenGL have it; the software, virgl and Venus devices
+    // draw so, the others refuse it themselves)
+    auto covers = [&](const Allocation* t, uint32_t l) { return graphics::mip_extent(t->desc().width, l) >= pass_w && graphics::mip_extent(t->desc().height, l) >= pass_h; };
+    if (depth && (!covers(depth, level[graphics::kMaxColorTargets]) || depth->desc().samples != color->desc().samples)) return kBad;
     for (uint32_t n = 0; n < extra_count; ++n) {
       const Allocation* e = extras[n];
       if (!e->is_image() || !(e->desc().flags & kAllocRenderTarget) || e == color || e == depth || !use(extras[n], state::kRenderTarget)) return kBad;

@@ -42,7 +42,7 @@
  *
  * Refused (SM_UNSUPPORTED): of pixel shaders 1.x the bump environment instructions (texbem, texbeml, bem), the ones that look up a cube map
  * (texm3x3tex, texm3x3spec, texm3x3vspec) and the ones that write the depth (texdepth, texm3x2depth); loops, subroutines and predicates (loop, rep, call, label, setp, break*); integer constants;
- * samplers of a kind other than 2D, cube and volume; texldl and texldd; several render targets and the depth output; vPos and vFace; textures in a vertex shader. A malformed shader - a token stream that ends early, a register that is not there - is SM_INVALID. */
+ * samplers of a kind other than 2D, cube and volume; texldl and texldd; the depth output; vPos and vFace; textures in a vertex shader. A malformed shader - a token stream that ends early, a register that is not there - is SM_INVALID. */
 #ifndef TCOS_SM_TO_DXBC_H
 #define TCOS_SM_TO_DXBC_H
 
@@ -65,12 +65,14 @@ typedef struct SmShader {
   int relative;                         /* ... through a0 as well */
   int bools_used;                       /* b0 .. b15 follow the floats */
   unsigned constant_registers;          /* all of cb0: the floats, the bools if used, and a pixel shader's state registers */
-  unsigned state_register;              /* a pixel shader: the first of its SM_STATE_REGISTERS state registers */
+  unsigned state_register;              /* the first of its state registers: a pixel shader's SM_STATE_REGISTERS, a vertex shader's SM_VS_STATE_REGISTERS */
+  unsigned fill_register;               /* a pixel shader: the first of its fill registers after the state ones, one for each sampler up to the highest it reads */
   unsigned sampler_mask;
   uint8_t sampler_kind[16];             /* what each sampler of sampler_mask is: SM_SAMPLER_2D, SM_SAMPLER_VOLUME or SM_SAMPLER_CUBE (the kernel's TextureKind) */
   SmInput inputs[16];                   /* a vertex shader's declared inputs */
   unsigned input_count;
   unsigned varying_mask;                /* the slots (SM_SLOT_*) a vertex shader writes or a pixel shader reads */
+  unsigned target_mask;                 /* a pixel shader: the render targets it writes (oC0 .. oC3; oC0 always) */
   size_t tokens;                        /* the tokens of the shader, its end included */
   uint8_t dxbc[SM_DXBC_BYTES];
   size_t dxbc_size;
@@ -97,6 +99,9 @@ typedef struct SmShader {
 #define SM_STATE_FOG_SOURCE 4u          /* the factor is x * the vertex shader's + y * the linear + z * the exponential + w */
 
 /* The state registers of a draw with no alpha test and no fog. */
+/* The state register of a vertex shader, after its floats and bools: x, y what moves its position by half a pixel (times its w), so that the rasterizer's
+ * pixel centres, at halves, are where Direct3D 9 has them, at whole numbers: 1 / the viewport's width and -1 / its height. 0, 0 leaves the position as it is. */
+#define SM_VS_STATE_REGISTERS 1u
 static void sm_state_none(float state[SM_STATE_REGISTERS][4]) {
   memset(state, 0, sizeof(float) * 4 * SM_STATE_REGISTERS);
   state[SM_STATE_ALPHA][1] = 1.0f;
@@ -142,7 +147,9 @@ enum { DXT_TEMP = 0, DXT_INPUT = 1, DXT_OUTPUT = 2, DXT_IMMEDIATE = 4, DXT_SAMPL
 #define DX_TEMP_ADDRESS 32u             /* the integer copy of a0 */
 #define DX_TEMP_SCRATCH 33u             /* 33 .. 37: what a translated instruction needs for itself */
 #define DX_TEMP_COLOUR 38u              /* a pixel shader's colour (oC0) until its end */
-#define DX_TEMPS 39u
+#define DX_TEMP_POSITION 39u            /* a vertex shader's position (oPos) until its end */
+#define DX_TEMP_FILL 40u                /* 40, 41: a texture's sample, until the channels its format has not are made 1 (sm_sample_fill) */
+#define DX_TEMPS 42u
 #define DX_INPUT_POSITION 16u           /* a pixel shader's position, declared as such */
 #define DX_TEMP_PS1_TEXTURE 8u          /* a pixel shader 1.1 to 1.3: 8 .. 13 are its t0 .. t5 */
 #define DX_TEMP_PS1_SOURCE 16u          /* ... 16 .. 19: a source with one of its modifiers, worked out */
@@ -165,8 +172,11 @@ typedef struct SmContext {
   /* where the code reads a bool constant of the device's: the word that holds its element of cb0, which is known when the floats are counted */
   uint16_t bool_word[64];
   unsigned bool_words;
+  uint16_t fill_word[256];              /* the words that name a sampler's fill register by the sampler's number (sm_translate adds where they begin) */
+  unsigned fill_words;
   unsigned pad_rows;                    /* a pixel shader 1.x: the rows texm3x2pad / texm3x3pad have left so far */
 } SmContext;
+static void sm_sample_fill(SmContext *c, DxOperand d, unsigned saturate, unsigned n);
 
 static void sm_emit(SmContext *c, uint32_t opcode, uint32_t bits, const DxOperand *operands, unsigned count) {
   unsigned words = 1;
@@ -260,6 +270,11 @@ static unsigned sm_slot_of_usage(unsigned usage, unsigned index) {
 /* The Shader Model 4 modifier of a source's: 0 none, 1 negate, 2 abs, 3 negated abs; 255 for one that is not taken. */
 static unsigned sm_modifier(unsigned modifier) { return modifier == 0 ? 0u : modifier == 1 ? 1u : modifier == 11 ? 2u : modifier == 12 ? 3u : 255u; }
 
+/* The float constants a shader of its version has (c0 .. c<limit - 1>): a vertex shader 256 (D3DCAPS9.MaxVertexShaderConst), a pixel shader 1.x 8, 2.x 32, 3.0 224;
+ * and whether it has bool and integer constants (all but pixel shaders 1.x and 2.0). A shader that names more cannot be made, as Direct3D 9 refuses it. */
+static unsigned sm_float_limit(const SmShader *s) { return s->vertex ? 256u : s->major == 1 ? 8u : s->major == 2 ? 32u : 224u; }
+static int sm_has_bools_ints(const SmShader *s) { return s->vertex || s->major == 3 || (s->major == 2 && s->minor > 0); }
+
 /* A source parameter as an operand; SM_OK, or why not. `negate`: with its sign turned (sub). */
 static int sm_source(SmContext *c, const SmParam *p, int negate, DxOperand *o) {
   SmShader *s = c->out;
@@ -294,7 +309,7 @@ static int sm_source(SmContext *c, const SmParam *p, int negate, DxOperand *o) {
       *o = dx_src(DXT_INPUT, SM_SLOT_TEXCOORD + p->number, p->swizzle, modifier);
       return SM_OK;
     case SMR_CONST: {
-      if (p->number >= 256) return SM_INVALID;
+      if (p->number >= sm_float_limit(s)) return SM_INVALID;
       if (p->relative) {
         if (!s->vertex || p->number >= SM_RELATIVE_REGISTERS) return SM_UNSUPPORTED;
         s->relative = 1;
@@ -353,8 +368,12 @@ static int sm_destination(SmContext *c, const SmParam *p, DxOperand *o) {
       if (slot == 255) return SM_UNSUPPORTED;
       break;
     case SMR_COLOROUT:
-      if (s->vertex) return SM_INVALID;
-      if (p->number != 0) return SM_UNSUPPORTED;
+      if (s->vertex || p->number >= 4 || (p->number && s->major < 2)) return SM_INVALID;
+      if (p->number) {      /* oC1 .. oC3: the other render targets, written as they are (the alpha test and fog are oC0's) */
+        s->target_mask |= 1u << p->number;
+        *o = dx_dst(DXT_OUTPUT, p->number, p->mask);
+        return SM_OK;
+      }
       *o = dx_dst(DXT_TEMP, DX_TEMP_COLOUR, p->mask);      /* (the end of the shader does the alpha test and fog, and writes it out) */
       return SM_OK;
     default:
@@ -366,6 +385,10 @@ static int sm_destination(SmContext *c, const SmParam *p, DxOperand *o) {
   }
   if (slot >= SM_SLOTS) return SM_UNSUPPORTED;
   s->varying_mask |= 1u << slot;
+  if (slot == SM_SLOT_POSITION) {      /* (the end of the shader moves it by half a pixel, and writes it out) */
+    *o = dx_dst(DXT_TEMP, DX_TEMP_POSITION, p->mask);
+    return SM_OK;
+  }
   *o = dx_dst(DXT_OUTPUT, slot, p->mask);
   return SM_OK;
 }
@@ -582,7 +605,7 @@ static int sm_instruction(SmContext *c, unsigned op, unsigned flags, const SmPar
       sm_emit3(c, DXO_ADD, saturate, d, dx_temp(DX_TEMP_SCRATCH, 0), e);
       return SM_OK;
     case SMO_IF:      /* a bool constant: the shader's own, or one of the device's */
-      if (count != 1 || p[0].type != SMR_CONSTBOOL || p[0].number >= 16) return count == 1 && p[0].type == SMR_PREDICATE ? SM_UNSUPPORTED : SM_INVALID;
+      if (count != 1 || p[0].type != SMR_CONSTBOOL || p[0].number >= 16 || !sm_has_bools_ints(s)) return count == 1 && p[0].type == SMR_PREDICATE ? SM_UNSUPPORTED : SM_INVALID;
       if (c->defb_set[p[0].number]) {
         sm_emit2(c, DXO_MOV, 0, sm_scratch(0, 0x1), dx_immediate_bits(c->defb_value[p[0].number] ? 0xFFFFFFFFu : 0u));
         sm_emit1(c, DXO_IF, DX_NONZERO, dx_scalar(DXT_TEMP, DX_TEMP_SCRATCH, 0));
@@ -642,11 +665,13 @@ static int sm_instruction(SmContext *c, unsigned op, unsigned flags, const SmPar
       sampler.n = 2;
       sm_emit2(c, DXO_MOV, 0, sm_scratch(1, 0xF), a);
       if (project) sm_emit3(c, DXO_DIV, 0, sm_scratch(1, 0x7), sm_scratch_source(1), dx_temp(DX_TEMP_SCRATCH + 1, SM_SWIZZLE_OF(3)));
+      const DxOperand fill = dx_dst(DXT_TEMP, DX_TEMP_FILL, 0xF);
       if (bias) {
         DxOperand o[5];
-        o[0] = d; o[1] = sm_scratch_source(1); o[2] = resource; o[3] = sampler; o[4] = dx_scalar(DXT_TEMP, DX_TEMP_SCRATCH + 1, 3);
-        sm_emit(c, DXO_SAMPLE_B, saturate, o, 5);
-      } else sm_emit4(c, DXO_SAMPLE, saturate, d, sm_scratch_source(1), resource, sampler);
+        o[0] = fill; o[1] = sm_scratch_source(1); o[2] = resource; o[3] = sampler; o[4] = dx_scalar(DXT_TEMP, DX_TEMP_SCRATCH + 1, 3);
+        sm_emit(c, DXO_SAMPLE_B, 0, o, 5);
+      } else sm_emit4(c, DXO_SAMPLE, 0, fill, sm_scratch_source(1), resource, sampler);
+      sm_sample_fill(c, d, saturate, p[2].number);
       return SM_OK;
     }
     default:
@@ -671,8 +696,19 @@ static int sm_ps1_sample(SmContext *c, DxOperand d, DxOperand at, unsigned n) {
   sampler.w[0] = ((unsigned)DXT_SAMPLER << 12) | (1u << 20);
   sampler.w[1] = n;
   sampler.n = 2;
-  sm_emit4(c, DXO_SAMPLE, 0, d, at, dx_src(DXT_RESOURCE, n, DX_SWIZZLE_XYZW, 0), sampler);
+  sm_emit4(c, DXO_SAMPLE, 0, dx_dst(DXT_TEMP, DX_TEMP_FILL, 0xF), at, dx_src(DXT_RESOURCE, n, DX_SWIZZLE_XYZW, 0), sampler);
+  sm_sample_fill(c, d, 0, n);
   return SM_OK;
+}
+/* After a sample into DX_TEMP_FILL: the channels the texture's format has not become 1, where Direct3D 9 reads 1 and Direct3D 12 0 - by sampler n's fill register
+ * (1 where so; the draw fills it in from the format) - and the sample goes to `d`: d = s - s * fill + fill. */
+static void sm_sample_fill(SmContext *c, DxOperand d, unsigned saturate, unsigned n) {
+  if (c->fill_words + 2 > 256) { c->failed = 1; return; }
+  sm_emit3(c, DXO_MUL, 0, dx_dst(DXT_TEMP, DX_TEMP_FILL + 1, 0xF), dx_temp(DX_TEMP_FILL, DX_SWIZZLE_XYZW), dx_constant(n, DX_SWIZZLE_XYZW, 0, 0, 0));
+  if (!c->failed) c->fill_word[c->fill_words++] = (uint16_t)(c->words - 1);      /* (the constant's element is the last word) */
+  sm_emit3(c, DXO_ADD, 0, dx_dst(DXT_TEMP, DX_TEMP_FILL + 1, 0xF), dx_temp(DX_TEMP_FILL, DX_SWIZZLE_XYZW), dx_src(DXT_TEMP, DX_TEMP_FILL + 1, DX_SWIZZLE_XYZW, 1));
+  sm_emit3(c, DXO_ADD, saturate, d, dx_temp(DX_TEMP_FILL + 1, DX_SWIZZLE_XYZW), dx_constant(n, DX_SWIZZLE_XYZW, 0, 0, 0));
+  if (!c->failed) c->fill_word[c->fill_words++] = (uint16_t)(c->words - 1);
 }
 /* The sources of an instruction that have one of the modifiers of pixel shaders 1.x: each is worked out into a temporary of its own, and the
  * parameter becomes that temporary (with the swizzle it had, and negated where the modifier says so). */
@@ -950,6 +986,11 @@ static int sm_translate(const uint32_t *tokens, size_t available, SmShader *out,
   if (out->major < 1 || out->major > 3) return SM_INVALID;
   if (!out->vertex && out->major == 1 && (out->minor < 1 || out->minor > 4)) return SM_INVALID;
   if (available > SM_MAX_TOKENS) available = SM_MAX_TOKENS;
+  /* (a vertex shader below 3.0 whose oD0 is not written gives white, as Direct3D 9 has it: it starts written so) */
+  if (out->vertex && out->major < 3) {
+    sm_emit2(c, DXO_MOV, 0, dx_dst(DXT_OUTPUT, SM_SLOT_COLOR, 0xF), dx_immediate(1, 1, 1, 1));
+    out->varying_mask |= 1u << SM_SLOT_COLOR;
+  }
 
   while (at < available) {
     const uint32_t t = tokens[at];
@@ -1002,14 +1043,14 @@ static int sm_translate(const uint32_t *tokens, size_t available, SmShader *out,
       type = ((r >> 28) & 7) | ((r >> 8) & 0x18);
       number = r & 0x7FF;
       if (op == SMO_DEF) {
-        if (type != SMR_CONST || number >= 256) return SM_INVALID;
+        if (type != SMR_CONST || number >= sm_float_limit(out)) return SM_INVALID;
         memcpy(c->def_value[number], &tokens[at + 1], 16);
         c->def_set[number] = 1;
       } else if (op == SMO_DEFB) {
-        if (type != SMR_CONSTBOOL || number >= 16) return SM_INVALID;
+        if (type != SMR_CONSTBOOL || number >= 16 || !sm_has_bools_ints(out)) return SM_INVALID;
         c->defb_set[number] = 1;
         c->defb_value[number] = tokens[at + 1] != 0;
-      }      /* (defi: integer constants are for loops, which are refused where they are met) */
+      } else if (type != SMR_CONSTINT || number >= 16 || !sm_has_bools_ints(out)) return SM_INVALID;      /* (defi: integer constants are for loops) */
       at += 1 + values;
       continue;
     }
@@ -1037,9 +1078,17 @@ static int sm_translate(const uint32_t *tokens, size_t available, SmShader *out,
     if (c->failed) return SM_UNSUPPORTED;      /* (too long) */
   }
   if (!ended) return SM_INVALID;
-  if (!out->vertex) {      /* (a pixel shader's state registers come after its floats and bools, which are all known now) */
-    out->state_register = out->float_registers + (out->bools_used ? SM_BOOL_REGISTERS : 0u);
+  /* (the state registers come after the floats and bools, which are all known now - all 224 of a vertex shader that addresses them through a0) */
+  out->state_register = (out->vertex && out->relative ? SM_RELATIVE_REGISTERS : out->float_registers) + (out->bools_used ? SM_BOOL_REGISTERS : 0u);
+  if (!out->vertex) {
     sm_pixel_end(c, out->state_register);
+    out->fill_register = out->state_register + SM_STATE_REGISTERS;
+  }
+  else if (out->varying_mask & 1u) {
+    /* the position out, moved by half a pixel: xy + (state.xy * w) */
+    sm_emit4(c, DXO_MAD, 0, dx_dst(DXT_OUTPUT, SM_SLOT_POSITION, 0x3), dx_temp(DX_TEMP_POSITION, SM_SWIZZLE_OF(3)), dx_constant(out->state_register, DX_SWIZZLE_XYZW, 0, 0, 0),
+             dx_temp(DX_TEMP_POSITION, DX_SWIZZLE_XYZW));
+    sm_emit2(c, DXO_MOV, 0, dx_dst(DXT_OUTPUT, SM_SLOT_POSITION, 0xC), dx_temp(DX_TEMP_POSITION, DX_SWIZZLE_XYZW));
   }
   sm_emit(c, DXO_RET, 0, NULL, 0);
   if (c->failed) return SM_UNSUPPORTED;
@@ -1050,9 +1099,12 @@ static int sm_translate(const uint32_t *tokens, size_t available, SmShader *out,
     if (out->float_registers > SM_RELATIVE_REGISTERS) return SM_UNSUPPORTED;
     out->float_registers = SM_RELATIVE_REGISTERS;
   }
-  out->constant_registers = out->float_registers + (out->bools_used ? SM_BOOL_REGISTERS : 0u) + (out->vertex ? 0u : SM_STATE_REGISTERS);
-  if (out->constant_registers > 256) return SM_UNSUPPORTED;
+  unsigned fills = 0;
+  for (unsigned i = 0; i < 16; ++i) if (out->sampler_mask >> i & 1) fills = i + 1;
+  out->constant_registers = out->float_registers + (out->bools_used ? SM_BOOL_REGISTERS : 0u) + (out->vertex ? SM_VS_STATE_REGISTERS : SM_STATE_REGISTERS + fills);
+  if (out->constant_registers > 512) return SM_UNSUPPORTED;      /* (more than any version has: 256 + 16 + 1, 224 + 16 + 5 + 16) */
   for (unsigned i = 0; i < c->bool_words; ++i) c->code[c->bool_word[i]] += out->float_registers;      /* (the bools' elements were written as their numbers) */
+  for (unsigned i = 0; i < c->fill_words; ++i) c->code[c->fill_word[i]] += out->fill_register;      /* (and the fills' as their samplers') */
 
   /* the container: the two signatures, then the program with its declarations */
   {
@@ -1080,9 +1132,12 @@ static int sm_translate(const uint32_t *tokens, size_t available, SmShader *out,
           element[elements++].reg = out->inputs[i].reg;
         }
       } else {
-        element[elements].name = target_name;
-        element[elements].index = 0;
-        element[elements++].reg = 0;
+        for (unsigned target = 0; target < 4; ++target) {
+          if (!((out->target_mask | 1u) >> target & 1)) continue;
+          element[elements].name = target_name;
+          element[elements].index = target;
+          element[elements++].reg = target;
+        }
       }
       chunk_at[chunk] = size;
       start = b + size;

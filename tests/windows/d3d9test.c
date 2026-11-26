@@ -25,7 +25,9 @@
 #define COBJMACROS
 #include <windows.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <initguid.h>      /* (the interfaces' identifiers, defined here) */
 #include <d3d9.h>
 #include "d3d9test_shaders.h"
 
@@ -121,6 +123,7 @@ static int make_device(void) {
   pp.Windowed = TRUE;
   pp.EnableAutoDepthStencil = TRUE;
   pp.AutoDepthStencilFormat = D3DFMT_D24S8;
+  pp.Flags = D3DPRESENTFLAG_LOCKABLE_BACKBUFFER;      /* (read_back locks the back buffer) */
   const HRESULT hr = g_window ? IDirect3D9_CreateDevice(g_d3d, 0, D3DDEVTYPE_HAL, g_window, D3DCREATE_HARDWARE_VERTEXPROCESSING, &pp, &g_device) : E_FAIL;
   check(g_window && hr == D3D_OK && g_device, "a window, and CreateDevice on it");
   if (!g_device) return 0;
@@ -1430,6 +1433,7 @@ static void test_present_and_reset(void) {
   pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
   pp.hDeviceWindow = g_window;
   pp.Windowed = TRUE;
+  pp.Flags = D3DPRESENTFLAG_LOCKABLE_BACKBUFFER;
   IDirect3DSurface9 *back = NULL;
   D3DSURFACE_DESC desc;
   DWORD z = 9;
@@ -1769,6 +1773,8 @@ static void test_declaration_types_and_instancing(void) {
   IDirect3DVertexShader9_Release(offset);
 }
 
+#include "d3d9test_api.inc"
+
 int main(void) {
   test_object();
   if (g_d3d && make_device()) {
@@ -1787,6 +1793,7 @@ int main(void) {
     test_cube_and_volume();
     test_compressed();
     test_declaration_types_and_instancing();
+    test_api();
     test_present_and_reset();
     check(IDirect3DDevice9_Release(g_device) == 0, "the device is gone with its last reference");
   }

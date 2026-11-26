@@ -20,7 +20,7 @@
 #include "Process/Win32k/Dxg/DxgLayouts.hpp"
 
 // Adapters, devices, display modes, adapter queries and video memory: NtGdiDdDDIOpenAdapterFrom*, EnumAdapters(2/3), CloseAdapter, QueryAdapterInfo, QueryVideoMemoryInfo,
-// CreateDevice, DestroyDevice, GetDeviceState, GetDisplayModeList, SetDisplayMode, WaitForVerticalBlankEvent, SetQueuedLimit, WaitForIdle, TrimProcessCommitment.
+// CreateDevice, DestroyDevice, GetDeviceState, GetDisplayModeList, SetDisplayMode, WaitForVerticalBlankEvent, GetScanLine, SetQueuedLimit, WaitForIdle, TrimProcessCommitment.
 namespace process::win32k::dxg {
 
 namespace {
@@ -499,6 +499,28 @@ uint32_t wait_for_vertical_blank(Session& s, Call& call, uint64_t arg) {
   return status::kSuccess;
 }
 
+// The scan line the display is at, on the same 60 Hz model as wait_for_vertical_blank: a frame is the lines of the current mode and a vertical blank of a twentieth of
+// them (at least one line) after them, swept evenly over the frame time of the monotonic clock. In the blank InVerticalBlank is set and ScanLine counts on past the
+// mode's height.
+uint32_t get_scan_line(Session& s, Call& call, uint64_t arg) {
+  UserBlock b;
+  if (!b.load(call, arg, sizeof_get_scan_line)) return load_failure(arg);
+  const dxgk::Handle adapter = b.u32(0);
+  if (adapter == 0 || b.u32(4) != 0) return kStatusInvalidParameter;
+  uint32_t index = 0;
+  uint32_t st = s.kernel().current_display_mode(s.pid(), adapter, &index);
+  if (st != status::kSuccess) return st;
+  dxgk::DisplayModeInfo m;
+  st = s.kernel().display_mode(s.pid(), adapter, index, &m);
+  if (st != status::kSuccess) return st;
+  constexpr uint64_t kFrameNs = 1000000000ull / kRefreshHz;
+  const uint64_t lines = uint64_t{m.height} + (m.height / 20 ? m.height / 20 : 1);
+  const uint64_t line = (call.process().host().monotonic_ns() % kFrameNs) * lines / kFrameNs;
+  const bool blank = line >= m.height;
+  if (!put32(call, arg, 8, blank ? 1u : 0u) || !put32(call, arg, 12, static_cast<uint32_t>(line))) return kStatusAccessViolation;
+  return status::kSuccess;
+}
+
 uint32_t set_queued_limit(Session& s, Call& call, uint64_t arg) {
   UserBlock b;
   if (!b.load(call, arg, sizeof_set_queued_limit)) return load_failure(arg);
@@ -632,6 +654,7 @@ void register_adapters() {
   add<get_display_mode_list>(N::NtGdiDdDDIGetDisplayModeList);
   add<set_display_mode>(N::NtGdiDdDDISetDisplayMode);
   add<wait_for_vertical_blank>(N::NtGdiDdDDIWaitForVerticalBlankEvent);
+  add<get_scan_line>(N::NtGdiDdDDIGetScanLine);
   add<set_queued_limit>(N::NtGdiDdDDISetQueuedLimit);
   add<wait_for_idle>(N::NtGdiDdDDIWaitForIdle);
   add<trim_process_commitment>(N::NtGdiDdDDITrimProcessCommitment);

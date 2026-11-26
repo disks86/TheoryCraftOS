@@ -10883,8 +10883,13 @@ void test_mipmapped_layers() {
     sized.begin_pass_levels(0, {}, 1, kPassClearColor | kPassClearDepth, {0, 0, 0, 0}, 1, 0, {}, {1, 1});
     sized.end_pass();
     CHECK(e.render(sized, {rt, depth}) == status::kSuccess);
+    // (a depth level larger than the pass is taken - its top left part, as Direct3D 9 and OpenGL have it -, a smaller one is not)
+    CommandWriter larger(e.allocator);
+    larger.begin_pass_levels(0, {}, 1, kPassClearColor | kPassClearDepth, {0, 0, 0, 0}, 1, 0, {}, {1, 0});
+    larger.end_pass();
+    CHECK(e.render(larger, {rt, depth}) == status::kSuccess);
     CommandWriter unsized(e.allocator);
-    unsized.begin_pass_levels(0, {}, 1, kPassClearColor | kPassClearDepth, {0, 0, 0, 0}, 1, 0, {}, {1, 0});
+    unsized.begin_pass_levels(0, {}, 1, kPassClearColor | kPassClearDepth, {0, 0, 0, 0}, 1, 0, {}, {0, 1});
     unsized.end_pass();
     CHECK(e.render(unsized, {rt, depth}) == status::kInvalidParameter);
     // (layers of a level of a volume: level 1 of four slices has two)

@@ -438,7 +438,7 @@ bool Replay::begin_pass(const RenderPassBegin& p) {
   if (depth && (depth->format() != Format::D32Float || !(depth->desc().usage & kImageDepthAttachment))) return false;
   if (p.level[0] >= color->mip_levels() || (depth && p.level[kMaxColorTargets] >= depth->mip_levels())) return false;
   const Extent2D e = {mip_extent(color->extent().width, p.level[0]), mip_extent(color->extent().height, p.level[0])};
-  if (depth && (mip_extent(depth->extent().width, p.level[kMaxColorTargets]) != e.width || mip_extent(depth->extent().height, p.level[kMaxColorTargets]) != e.height)) return false;
+  if (depth && (mip_extent(depth->extent().width, p.level[kMaxColorTargets]) < e.width || mip_extent(depth->extent().height, p.level[kMaxColorTargets]) < e.height)) return false;      // (a larger depth target: its top left part, the render area)
   if (depth && depth->desc().samples != color->desc().samples) return false;
   targets_[0] = color;
   target_count_ = 1;
