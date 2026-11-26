@@ -75,6 +75,7 @@ build_one() {
         d3d11) imports="$imports gdi32 win32u d3d12 dxgi" ;;
         d3d9) imports="$imports gdi32 user32 win32u d3d12" ;;      # (Direct3D 9 is a layer on d3d12.dll; gdi32 and user32 to put the picture into the window)      # (Direct3D 11 is a layer on d3d12.dll; dxgi for the adapter and the swap chain)
         d3d8) imports="$imports d3d9" ;;      # (Direct3D 8 is a layer on d3d9.dll's interfaces)
+        ddraw) imports="$imports gdi32 user32 advapi32 win32u" ;;      # (DirectDraw: GDI for the primary surface, user32 for the windows, the registry; win32u: the D3DKMT services, src/Windows/dxcommon.h)
         d3d10|d3d10_1) imports="$imports d3d10core dxgi" ;;      # (Direct3D 10's device is d3d11.dll's: d3d10core.dll forwards D3D10CoreCreateDevice to it)
         d3d10core) imports="$imports d3d11" ;;
         imm32) imports="$imports win32u" ;;
@@ -95,7 +96,7 @@ build_one() {
 # The first fourteen in the order they need each other; the rest need only those (and bcrypt before crypt32). Not built for i386: vulkan-1, whose
 # source does not compile for it yet (a 32-bit program's Vulkan handles are 64-bit numbers, not pointers; docs/Wow64.md).
 LIBRARIES="ntdll kernel32 msvcrt advapi32 win32u gdi32 user32 comctl32 version oleaut32 ole32 shlwapi shcore shell32
-           rpcrt4 secur32 bcrypt crypt32 ncrypt userenv setupapi iphlpapi psapi wininet winhttp wintrust netapi32 dwmapi uxtheme mswsock gdiplus msimg32 opengl32 glu32 dnsapi mpr wtsapi32 powrprof cfgmgr32 dxgi d3d12 d3d9 d3d8 d3d11 d3d10core d3d10 d3d10_1 dwrite avrt winspool wevtapi pdh winmm dsound mmdevapi xaudio2_8 xaudio2_9 imm32 dbghelp wldap32 urlmon msi propsys hid usp10 winscard odbc32 xinput1_4 dinput8 d2d1 d3dcompiler_47 lz32 oleacc oledlg credui ntdsapi samlib activeds normaliz sensapi authz rasapi32 bcryptprimitives combase mfplat mf mfreadwrite dcomp uiautomationcore dhcpcsvc esent ndfapi tbs winusb cryptui bthprops comdlg32 ws2_32 shfolder msxml3 msxml6 cabinet"
+           rpcrt4 secur32 bcrypt crypt32 ncrypt userenv setupapi iphlpapi psapi wininet winhttp wintrust netapi32 dwmapi uxtheme mswsock gdiplus msimg32 opengl32 glu32 dnsapi mpr wtsapi32 powrprof cfgmgr32 dxgi d3d12 d3d9 d3d8 ddraw d3d11 d3d10core d3d10 d3d10_1 dwrite avrt winspool wevtapi pdh winmm dsound mmdevapi xaudio2_8 xaudio2_9 imm32 dbghelp wldap32 urlmon msi propsys hid usp10 winscard odbc32 xinput1_4 dinput8 d2d1 d3dcompiler_47 lz32 oleacc oledlg credui ntdsapi samlib activeds normaliz sensapi authz rasapi32 bcryptprimitives combase mfplat mf mfreadwrite dcomp uiautomationcore dhcpcsvc esent ndfapi tbs winusb cryptui bthprops comdlg32 ws2_32 shfolder msxml3 msxml6 cabinet"
 # The libraries others are linked against are built one after the other; the rest, which nothing here imports from, side by side.
 ordered=" ntdll kernel32 msvcrt advapi32 win32u gdi32 user32 comctl32 version oleaut32 ole32 shlwapi shcore shell32 bcrypt dxgi d3d12 d3d9 d3d11 d3d10core "      # (dxgi, d3d12: d3d11 is linked against them; d3d9: d3d8; d3d11, d3d10core: d3d10 and d3d10_1)
 pids=()

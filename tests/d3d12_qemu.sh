@@ -22,7 +22,7 @@
 # blob=on, hostmem: the host's Vulkan), and the kernel's 3D device is then the Venus device (docs/Venus.md) unless GPU_BACKEND=VIRGL keeps virgl on it (AUTO: the kernel decides).
 # Passes if the program's checks all pass, it says the device it drew on was not the CPU renderer (GPU=virgl), and the autorun sees it end with exit code 0.
 # Uses its own build folder (build-d3d12-qemu) so the normal build keeps no autorun.
-# Usage: [ARGS="..."] tests/d3d12_qemu.sh [program]      (default d3d12test; the source is tests/windows/<program>.c; d3d11test, d3d9test and d3d8test run Direct3D 11, 9 and 8 there
+# Usage: [ARGS="..."] tests/d3d12_qemu.sh [program]      (default d3d12test; the source is tests/windows/<program>.c; d3d11test, d3d9test and d3d8test run Direct3D 11, 9 and 8 there, ddrawtest DirectDraw
 # too; ARGS="processes" d3dsharetest shares resources and fences with a second process it starts; opengltest runs opengl32.dll's checks)
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -42,7 +42,7 @@ for path in sorted(glob.glob("tests/data/dxbc/*.dxbc") + glob.glob("tests/data/d
 PY
 # (mingw-w64 has no 64-bit libd3d8.a - 64-bit Windows has the library, mingw only the 32-bit import library: one made from the OS's d3d8.def)
 x86_64-w64-mingw32-dlltool -d src/Windows/d3d8/d3d8.def -l "$work/libd3d8.a"
-x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -Wno-unused-parameter -Wno-unused-const-variable -I "$work" -L "$work" -o "$work/$program.exe" "tests/windows/$program.c" -ld3d10 -ld3d11 -ld3d9 -ld3d8 -ldxgi -ld3d12 -luuid -ldxguid -luser32 -lopengl32 -lgdi32
+x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -Wno-unused-parameter -Wno-unused-const-variable -I "$work" -L "$work" -o "$work/$program.exe" "tests/windows/$program.c" -ld3d10 -ld3d11 -ld3d9 -ld3d8 -lddraw -ldxgi -ld3d12 -luuid -ldxguid -luser32 -lopengl32 -lgdi32
 if [ "$gpu" = venus ]; then backend=${GPU_BACKEND:-VENUS}; else backend=${GPU_BACKEND:-AUTO}; fi
 cmake -S . -B "$build" -G Ninja "-DTCOS_AUTORUN=/Windows/$program.exe" "-DTCOS_AUTORUN_ARGUMENTS=${ARGS:-}" -DTCOS_AUTORUN_ELEVATED=OFF "-DTCOS_TRACE_SERVICE_FAILURES=${TRACE:-OFF}" \
   "-DTCOS_GPU_BACKEND=$backend" >/dev/null
@@ -70,6 +70,6 @@ status=0
 # (d3d11test says "all N checks passed" and ends with 42, and does not name its device)
 grep -a -q -E "^$program: ([0-9]* checks, 0 failed|all [0-9]* checks passed)" "$build/debugcon.log" || status=1
 grep -a -q -E "autorun: ended, result 0, exit code 0x0*(2a)? " "$build/debugcon.log" || status=1
-if { [ "$gpu" = virgl ] || [ "$gpu" = venus ]; } && [ "$program" != d3d11test ] && [ "$program" != d3d10test ] && [ "$program" != d3d11videotest ] && [ "$program" != d3d9test ] && [ "$program" != d3d8test ] && [ "$program" != d3dsharetest ] && [ "$program" != opengltest ]; then grep -a -q "^device: hardware" "$build/debugcon.log" || { echo "the program did not draw on the 3D hardware"; status=1; }; fi
+if { [ "$gpu" = virgl ] || [ "$gpu" = venus ]; } && [ "$program" != d3d11test ] && [ "$program" != d3d10test ] && [ "$program" != d3d11videotest ] && [ "$program" != d3d9test ] && [ "$program" != d3d8test ] && [ "$program" != ddrawtest ] && [ "$program" != d3dsharetest ] && [ "$program" != opengltest ]; then grep -a -q "^device: hardware" "$build/debugcon.log" || { echo "the program did not draw on the 3D hardware"; status=1; }; fi
 [ $status -eq 0 ] && echo "d3d12 qemu ($gpu): passed" || echo "d3d12 qemu ($gpu): FAILED"
 exit $status

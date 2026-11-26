@@ -1,0 +1,27 @@
+LIBRARY ddraw.dll
+EXPORTS
+; The exports of Windows' ddraw.dll (Windows XP .. 11; Wine's ddraw.spec has the same names). The ordinals are the linker's: programs take these by name.
+AcquireDDThreadLock
+CompleteCreateSysmemSurface
+D3DParseUnknownCommand
+DDGetAttachedSurfaceLcl
+DDInternalLock
+DDInternalUnlock
+DSoundHelp
+DirectDrawCreate
+DirectDrawCreateClipper
+DirectDrawCreateEx
+DirectDrawEnumerateA
+DirectDrawEnumerateExA
+DirectDrawEnumerateExW
+DirectDrawEnumerateW
+DllCanUnloadNow PRIVATE
+DllGetClassObject PRIVATE
+DllRegisterServer PRIVATE
+DllUnregisterServer PRIVATE
+GetDDSurfaceLocal
+GetOLEThunkData
+GetSurfaceFromDC
+RegisterSpecialCase
+ReleaseDDThreadLock
+SetAppCompatData
