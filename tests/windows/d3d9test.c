@@ -1264,6 +1264,16 @@ static void test_stages(void) {
   IDirect3DDevice9_SetTextureStageState(g_device, 0, D3DTSS_CONSTANT, 0xFF102030);
   stage(0, D3DTOP_SELECTARG1, D3DTA_CONSTANT, D3DTA_CURRENT, D3DTOP_SELECTARG1, D3DTA_DIFFUSE, D3DTA_CURRENT);
   check((caps.PrimitiveMiscCaps & D3DPMISCCAPS_PERSTAGECONSTANT) && near_colour(staged_pixel(0xFFFFFFFF, 0), 0x10, 0x20, 0x30), "a stage's own constant as its argument");
+  /* the constants of stages that are not used (white) are not what a sampling stage reads: a shader that reads no constants has its state and fill
+   * registers where they would be */
+  for (DWORD n = 1; n < 8; ++n) IDirect3DDevice9_SetTextureStageState(g_device, n, D3DTSS_CONSTANT, 0xFFFFFFFF);
+  IDirect3DDevice9_SetTexture(g_device, 0, (IDirect3DBaseTexture9 *)dim);
+  stage(0, D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE);
+  const int unused_constants = near_colour(staged_pixel(0xFFFFFFFF, 0), 0x20, 0x20, 0x20);
+  IDirect3DDevice9_SetTexture(g_device, 0, (IDirect3DBaseTexture9 *)thin);
+  stage(0, D3DTOP_SELECTARG1, D3DTA_TEXTURE | D3DTA_ALPHAREPLICATE, D3DTA_CURRENT, D3DTOP_SELECTARG1, D3DTA_TEXTURE, D3DTA_CURRENT);
+  check(unused_constants && near_colour(staged_pixel(0xFFFFFFFF, 0), 0x40, 0x40, 0x40), "the constants of later stages do not change what a stage samples");
+  for (DWORD n = 1; n < 8; ++n) IDirect3DDevice9_SetTextureStageState(g_device, n, D3DTSS_CONSTANT, 0);
   IDirect3DDevice9_SetTexture(g_device, 0, (IDirect3DBaseTexture9 *)thin);
   stage(0, D3DTOP_SELECTARG1, D3DTA_TEXTURE | D3DTA_COMPLEMENT, D3DTA_CURRENT, D3DTOP_SELECTARG1, D3DTA_DIFFUSE, D3DTA_CURRENT);
   const int complement = near_colour(staged_pixel(0xFFFFFFFF, 0), 0x00, 0xCF, 0xFF);

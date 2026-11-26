@@ -160,7 +160,7 @@ Colour reference(const FfsKey& key, const Inputs& in) {
 
 struct Program {
   UniquePointer<D3d9Program> program;
-  unsigned state_register = 0, samplers = 0;
+  unsigned float_registers = 0, state_register = 0, fill_register = 0, samplers = 0;
 };
 bool make(HostAllocator& allocator, const FfsKey& key, Program* out) {
   uint32_t tokens[FFS_MAX_TOKENS];
@@ -168,18 +168,26 @@ bool make(HostAllocator& allocator, const FfsKey& key, Program* out) {
   if (!count || sm_translate(tokens, count, &g_shader, &g_context) != SM_OK || g_shader.vertex || g_shader.major != 2) return false;
   if (g_shader.float_registers > FFS_CONSTANTS || g_shader.tokens != count) return false;
   if (D3d9Program::compile_dxbc(allocator, ConstByteView(g_shader.dxbc, g_shader.dxbc_size), &out->program) != status::kSuccess || !out->program) return false;
+  out->float_registers = g_shader.float_registers;
   out->state_register = g_shader.state_register;
+  out->fill_register = g_shader.fill_register;
   out->samplers = g_shader.sampler_mask;
   return true;
 }
 Colour run(const Program& p, const Inputs& in) {
   static uint8_t constants[4096];
   memset(constants, 0, sizeof constants);
-  memcpy(constants, in.factor.v, 16);
-  for (unsigned n = 0; n < FFS_STAGES; ++n) memcpy(constants + (2 + n) * 16, in.constant[n].v, 16);
+  // As draw.inc lays them out: only the float registers the shader reads (the factor c0, the stages' constants c2 ..), then its state registers, then
+  // one fill register a sampler (what its texture lacks of the channels read as 1: none, the test's textures have all four). A shader that reads
+  // fewer floats has its state and fill registers where the later constants would be, so those must not be written there.
+  float floats[FFS_CONSTANTS][4] = {};
+  memcpy(floats[0], in.factor.v, 16);
+  for (unsigned n = 0; n < FFS_STAGES; ++n) memcpy(floats[2 + n], in.constant[n].v, 16);
+  memcpy(constants, floats, (p.float_registers < FFS_CONSTANTS ? p.float_registers : FFS_CONSTANTS) * 16u);
   float state[SM_STATE_REGISTERS][4];
   sm_state_none(state);
   memcpy(constants + p.state_register * 16, state, sizeof state);
+  for (unsigned n = 0; p.samplers >> n; ++n) memset(constants + (p.fill_register + n) * 16, 0, 16);
   graphics::Vec4 varyings[graphics::kMaxVaryings] = {};
   varyings[0] = {in.diffuse.v[0], in.diffuse.v[1], in.diffuse.v[2], in.diffuse.v[3]};
   varyings[1] = {in.specular.v[0], in.specular.v[1], in.specular.v[2], in.specular.v[3]};
