@@ -85,6 +85,10 @@ Checks that failed (Wine commit f343ca6), before the implementation of the libra
 | ws2_32 protocol | did not start (the runner split `ws2_32_protocol` at the wrong underscore), then 80 and a hang | 1287, ends in a crash at a table the test reads without checking: `inet_pton`/`inet_ntop`, `getaddrinfo`/`GetAddrInfoW` without DNS, `getnameinfo`, `WSALookupService*` finding nothing (the stub "succeeded" forever); left: `WSAEnumProtocols`, `WSAStringToAddress`/`WSAAddressToString`, legacy `inet_addr` forms, `getservbyname` |
 | iphlpapi iphlpapi | 6, then a crash | 4, then a crash in `GetIpForwardTable` (the test reads the table without checking the error): `GetAdaptersAddresses`, `GetIfTable`, `GetIpAddrTable`, `GetIfEntry(2)` done; routing/neighbour/connection tables answer `ERROR_NOT_SUPPORTED` |
 | own: user32 tcos_input, winmm tcos_gameinput, ws2_32 tcos_resolve | not written | 0 of each (keyboard/DPI/display configuration; winmm, xinput, dinput8, avrt, iphlpapi; addresses and name resolution) |
+| d3d9 device | 5, then an access violation in test_fvf_decl_conversion (the 3rd test of 100) | (measuring) |
+| d3d9 d3d9ex | 3 (27 tests skipped: Direct3DCreate9Ex answers D3DERR_NOTAVAILABLE) | (measuring) |
+| d3d9 stateblock | 540, runs to the end (11818 checks) | (measuring) |
+| d3d9 visual | 193, then an access violation in clear_test (the 7th test) | (measuring) |
 
 Everything else was measured once and has not been worked on: ntdll alpc 1684, directory 784, file 354, sync 246, threadpool 244, reg 133 (the NT registry services), path 279;
 shlwapi UrlHash/HashData (need Wine's 256-byte table); mpr 211, psapi 123, userenv 68, secur32 53. Most of those are
