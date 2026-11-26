@@ -317,7 +317,7 @@ static void chain_flip(Dev *d, SwapChain *c) {
   for (UINT i = 0; i < c->count; ++i) {
     tex_make_view(d, c->buffer[i]);
     ++c->buffer[i]->generation;
-    for (UINT s = 0; s < MAX_SUBS; ++s) { mem_free(c->buffer[i]->shadow[s]); c->buffer[i]->shadow[s] = NULL; }
+    tex_free_shadows(c->buffer[i]);
   }
   d->targets_dirty = 1;
   d->tables_valid = 0;

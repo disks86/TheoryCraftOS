@@ -44,7 +44,11 @@ static DXGI_FORMAT dxt_dxgi(D3DFORMAT format) {
   return format == D3DFMT_DXT1 ? DXGI_FORMAT_BC1_UNORM : format == D3DFMT_DXT2 || format == D3DFMT_DXT3 ? DXGI_FORMAT_BC2_UNORM : DXGI_FORMAT_BC3_UNORM;
 }
 /* The bytes of a row of a level `w` pixels wide as the program has it (a row of blocks of a compressed format), and the rows of a level `h` high. */
-static UINT format_pitch(D3DFORMAT format, UINT w) { return dxt_block(format) ? (w + 3) / 4 * dxt_block(format) : w * format_bytes(format); }
+/* The packed YUV formats (YUY2, UYVY: two pixels in four bytes): resources of the scratch pool only, which the device never draws or samples (CheckDeviceFormat refuses them). */
+static BOOL format_is_yuv(D3DFORMAT format) { return format == D3DFMT_YUY2 || format == D3DFMT_UYVY; }
+static UINT format_pitch(D3DFORMAT format, UINT w) {
+  return dxt_block(format) ? (w + 3) / 4 * dxt_block(format) : format_is_yuv(format) ? (w + 1) / 2 * 4 : w * format_bytes(format);
+}
 static UINT format_rows(D3DFORMAT format, UINT h) { return dxt_block(format) ? (h + 3) / 4 : h; }
 static BOOL format_is_depth(D3DFORMAT format) {
   return format == D3DFMT_D16 || format == D3DFMT_D24S8 || format == D3DFMT_D24X8 || format == D3DFMT_D32 || format == D3DFMT_D16_LOCKABLE || format == D3DFMT_D24X4S4 ||

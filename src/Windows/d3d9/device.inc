@@ -675,7 +675,7 @@ static HRESULT device_create(Direct3D *o, UINT adapter, D3DDEVTYPE type, HWND fo
                              Dev **out) {
   *out = NULL;
   if (adapter != 0 || !parameters || (type != D3DDEVTYPE_HAL && type != D3DDEVTYPE_REF && type != D3DDEVTYPE_SW)) return D3DERR_INVALIDCALL;
-  if (!focus && !parameters->hDeviceWindow) return D3DERR_INVALIDCALL;
+  if (!focus && !parameters->hDeviceWindow && !(ex && parameters->Windowed)) return D3DERR_INVALIDCALL;      /* (a windowed 9Ex device may have no window at all: PresentEx names one) */
   /* (exactly one way of processing vertices) */
   const DWORD vp = behaviour & (D3DCREATE_SOFTWARE_VERTEXPROCESSING | D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MIXED_VERTEXPROCESSING);
   if (vp != D3DCREATE_SOFTWARE_VERTEXPROCESSING && vp != D3DCREATE_HARDWARE_VERTEXPROCESSING && vp != D3DCREATE_MIXED_VERTEXPROCESSING) return D3DERR_INVALIDCALL;

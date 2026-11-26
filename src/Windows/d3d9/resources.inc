@@ -212,8 +212,36 @@ static SIZE_T tex_sub_bytes(const Tex *t, UINT sub) {
 static BOOL tex_device_owned(const Tex *t) { return t->res && (t->target || t->depth || t->shared); }
 /* The program's copy of a subresource, made (zeroed) if there was none. */
 static BYTE *tex_shadow(Tex *t, UINT sub) {
-  if (!t->shadow[sub]) t->shadow[sub] = mem_alloc(tex_sub_bytes(t, sub));
+  if (t->shadow[sub]) return t->shadow[sub];
+  /* (the first copy made: one block for every subresource, each where the ones before it end; a texture whose copies were made one by one - the device's
+   * own white ones, a 9Ex surface on the program's memory - goes on so) */
+  BOOL none = !t->user_memory;
+  for (UINT i = 0; i < MAX_SUBS && none; ++i) none = t->shadow[i] == NULL;
+  const UINT subs = tex_subresources(t);
+  if (none && subs <= MAX_SUBS) {
+    SIZE_T total = 0;
+    for (UINT i = 0; i < subs; ++i) total += tex_sub_bytes(t, i);
+    t->shadow_block = mem_alloc(total);
+    if (!t->shadow_block) return NULL;
+    SIZE_T at = 0;
+    for (UINT i = 0; i < subs; ++i) {
+      t->shadow[i] = t->shadow_block + at;
+      at += tex_sub_bytes(t, i);
+    }
+    return t->shadow[sub];
+  }
+  t->shadow[sub] = mem_alloc(tex_sub_bytes(t, sub));
   return t->shadow[sub];
+}
+/* Frees the program's copies of a texture's subresources (not the program's own memory). */
+static void tex_free_shadows(Tex *t) {
+  /* (a block holds every copy there is, or there is none and each was made on its own: tex_shadow) */
+  for (UINT i = 0; i < MAX_SUBS; ++i) {
+    if (!t->shadow_block && t->shadow[i] != t->user_memory) mem_free(t->shadow[i]);
+    t->shadow[i] = NULL;
+  }
+  mem_free(t->shadow_block);
+  t->shadow_block = NULL;
 }
 /* The Direct3D 12 subresource of a subresource (the kernel keeps all levels of a 2D texture, one of a cube's or a volume's). */
 static UINT tex_d12_sub(const Tex *t, UINT sub) { return sub_level(t, sub) + sub_face(t, sub) * t->kmips; }
@@ -348,8 +376,8 @@ static void tex_destroy(DxObj *o) {
   if (t->depth && t->res && d->dsv_free_count < DSV_SLOTS) d->dsv_free[d->dsv_free_count++] = t->dsv_slot;
   for (UINT i = 0; i < MAX_SUBS; ++i) {
     if (t->surface[i]) obj_free(OBJ(t->surface[i]));
-    if (t->shadow[i] != t->user_memory) mem_free(t->shadow[i]);
   }
+  tex_free_shadows(t);
   for (UINT i = 0; i < MAX_LEVELS; ++i) if (t->volume[i]) obj_free(OBJ(t->volume[i]));
   if (t->res) ID3D12Resource_Release(t->res);
   d->video_bytes -= t->video;
@@ -382,7 +410,8 @@ static HRESULT tex_make_kind(Dev *d, UINT kind, UINT width, UINT height, UINT sl
                              Tex **out) {
   *out = NULL;
   const BOOL depth = format_is_depth(format), memory_only = (flags & TEX_MEMORY) != 0;
-  if (width == 0 || height == 0 || width > 4096 || height > 4096 || (!depth && !format_bytes(format) && !dxt_block(format))) return D3DERR_INVALIDCALL;
+  if (width == 0 || height == 0 || width > 4096 || height > 4096 || (!depth && !format_bytes(format) && !dxt_block(format) && !format_is_yuv(format))) return D3DERR_INVALIDCALL;
+  if (format_is_yuv(format) && pool != D3DPOOL_SCRATCH) return D3DERR_INVALIDCALL;      /* (YUY2, UYVY: memory of the scratch pool alone) */
   /* (compressed: sampled 2D textures and cubes, and volumes of the scratch pool, which the device never sees; Windows answers D3DERR_INVALIDCALL for the others) */
   if (dxt_block(format) && ((kind == 1 && pool != D3DPOOL_SCRATCH) || (usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)) || existing)) return D3DERR_INVALIDCALL;
   if (kind == 1 && (slices == 0 || slices > 256)) return D3DERR_INVALIDCALL;
@@ -513,7 +542,7 @@ static HRESULT tex_lock(Tex *t, UINT sub, D3DLOCKED_RECT *out, const RECT *rect,
   const UINT bytes = format_bytes(t->format), block = dxt_block(t->format);
   if (sub >= tex_subresources(t) || (t->locked[sub] & 0x80000000u) || !tex_lockable(t)) return D3DERR_INVALIDCALL;
   if (t->depth && !format_depth_lockable(t->format)) return D3DERR_INVALIDCALL;
-  if (!t->depth && !bytes && !block) return D3DERR_INVALIDCALL;
+  if (!t->depth && !bytes && !block && !format_is_yuv(t->format)) return D3DERR_INVALIDCALL;
   const UINT w = sub_width(t, sub), h = sub_height(t, sub);
   /* (Direct3D 9 checks the rectangle of a compressed level only in the default pool: in the others any rectangle locks - Wine's test_surface_blocks
    * holds what Windows does -, and one that is not inside the level, or not on its blocks, hands out the level's first block) */
@@ -538,7 +567,7 @@ static HRESULT tex_lock(Tex *t, UINT sub, D3DLOCKED_RECT *out, const RECT *rect,
   out->Pitch = (INT)format_pitch(t->format, w);
   /* (a rectangle of a compressed level starts at its block) */
   const BOOL at_rect = rect && rect_inside;
-  const SIZE_T row = at_rect ? (SIZE_T)(block ? (UINT)rect->top / 4 : (UINT)rect->top) : 0, column = at_rect ? (block ? (SIZE_T)rect->left / 4 * block : (SIZE_T)rect->left * bytes) : 0;
+  const SIZE_T row = at_rect ? (SIZE_T)(block ? (UINT)rect->top / 4 : (UINT)rect->top) : 0, column = at_rect ? (block ? (SIZE_T)rect->left / 4 * block : format_is_yuv(t->format) ? (SIZE_T)rect->left / 2 * 4 : (SIZE_T)rect->left * bytes) : 0;
   out->pBits = t->shadow[sub] + row * (SIZE_T)out->Pitch + column;
   return D3D_OK;
 }
@@ -718,7 +747,7 @@ static HRESULT volume_lock(Tex *t, UINT level, D3DLOCKED_BOX *out, const D3DBOX 
   Dev *d = t->c.dev;
   if (!out) return D3DERR_INVALIDCALL;
   const UINT bytes = format_bytes(t->format), block = dxt_block(t->format);
-  if (level >= t->levels || (!bytes && !block) || (t->locked[level] & 0x80000000u) || !tex_lockable(t)) {
+  if (level >= t->levels || (!bytes && !block && !format_is_yuv(t->format)) || (t->locked[level] & 0x80000000u) || !tex_lockable(t)) {
     out->pBits = NULL;
     out->RowPitch = out->SlicePitch = 0;
     return D3DERR_INVALIDCALL;
@@ -753,7 +782,7 @@ static HRESULT volume_lock(Tex *t, UINT level, D3DLOCKED_BOX *out, const D3DBOX 
   out->RowPitch = (INT)format_pitch(t->format, w);
   out->SlicePitch = (INT)(format_pitch(t->format, w) * format_rows(t->format, h));
   out->pBits = shadow + (box ? (SIZE_T)box->Front * (SIZE_T)out->SlicePitch + (SIZE_T)(block ? box->Top / 4 : box->Top) * (SIZE_T)out->RowPitch +
-                               (SIZE_T)(block ? box->Left / 4 * block : box->Left * bytes) : 0);
+                               (SIZE_T)(block ? box->Left / 4 * block : format_is_yuv(t->format) ? box->Left / 2 * 4 : box->Left * bytes) : 0);
   return D3D_OK;
 }
 static HRESULT STDMETHODCALLTYPE vol_LockBox(Tex *t, UINT level, D3DLOCKED_BOX *out, const D3DBOX *box, DWORD flags) { return volume_lock(t, level, out, box, flags); }

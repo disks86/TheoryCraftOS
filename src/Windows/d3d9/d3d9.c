@@ -177,6 +177,7 @@ struct Tex {
   void *user_memory;             /* (9Ex) a system-memory texture of one level whose pixels are the program's memory (pSharedHandle of D3DPOOL_SYSTEMMEM) */
   /* By subresource, face * levels + level (a cube's six faces; one for the others): */
   BYTE *shadow[MAX_SUBS];        /* the pixels of a level as the program has them, once it was locked (a volume's: its slices one after the other) */
+  BYTE *shadow_block;            /* ... all of them in one allocation, face after face and level after level, as Windows lays a texture out (test_lockrect_offset) */
   DWORD locked[MAX_SUBS];        /* the flags of the lock, | 0x80000000 while it is locked */
   Surface *surface[MAX_SUBS];    /* the level as a surface, once a program asked for it (it counts with the texture) */
   Volume *volume[MAX_LEVELS];    /* ... as a volume */

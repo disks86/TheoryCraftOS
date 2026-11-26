@@ -41,8 +41,8 @@ static Child *binding_of(void *object) {
 
 /* pSharedHandle of the Create methods that take no part in sharing (buffers): D3DERR_NOTAVAILABLE for system-memory buffers, D3DERR_INVALIDCALL else (Windows since 7). */
 static HRESULT shared_refused(Dev *d, HANDLE *shared, D3DPOOL pool) {
-  (void)d;
   if (!shared) return D3D_OK;
+  if (!d->ex) return E_NOTIMPL;      /* (a device that is not 9Ex shares nothing: E_NOTIMPL, as for textures and surfaces) */
   return pool == D3DPOOL_SYSTEMMEM ? D3DERR_NOTAVAILABLE : D3DERR_INVALIDCALL;
 }
 /* Opens the texture a global share handle names, which must have been made with the same description (by a Direct3D 9 device; or a Direct3D 10, 11 or 12 one,
@@ -81,12 +81,15 @@ static HRESULT texture_create(Dev *d, UINT kind, UINT width, UINT height, UINT s
   if (!pool_valid(d, pool) || (usage & ~(DWORD)TEXTURE_USAGES)) return D3DERR_INVALIDCALL;
   if ((usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)) && pool != D3DPOOL_DEFAULT) return D3DERR_INVALIDCALL;
   if ((usage & D3DUSAGE_DYNAMIC) && (pool == D3DPOOL_MANAGED || (usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)))) return D3DERR_INVALIDCALL;
+  if ((usage & D3DUSAGE_DYNAMIC) && kind == 1 && pool == D3DPOOL_SCRATCH) return D3DERR_INVALIDCALL;      /* (a dynamic volume is not of the scratch pool: test_volume_lock) */
+  /* (a compressed resource's top level is whole blocks, whatever its kind: test_surface_blocks, test_volume_blocks) */
+  if (dxt_block(format) && ((width & 3) || (height & 3))) return D3DERR_INVALIDCALL;
   if ((usage & D3DUSAGE_AUTOGENMIPMAP) && (pool == D3DPOOL_SYSTEMMEM || kind == 1 || levels > 1)) return D3DERR_INVALIDCALL;
   if ((usage & D3DUSAGE_DEPTHSTENCIL) && kind == 1) return D3DERR_INVALIDCALL;
   if (kind == 1 && format_is_depth(format)) return D3DERR_INVALIDCALL;
   UINT flags = 0;
   if (shared) {
-    if (!d->ex) return D3DERR_INVALIDCALL;      /* (sharing is 9Ex's) */
+    if (!d->ex) return E_NOTIMPL;      /* (sharing is 9Ex's: a device that is not answers E_NOTIMPL, as Windows 10 does - older ones D3DERR_INVALIDCALL) */
     if (pool == D3DPOOL_SYSTEMMEM) {
       /* (a 2D texture of one level whose pixels are the program's memory) */
       if (kind != 0 || levels != 1 || !*shared) return D3DERR_INVALIDCALL;
@@ -122,7 +125,7 @@ static HRESULT surface_create(Dev *d, UINT width, UINT height, DWORD usage, D3DF
   if (samples != D3DMULTISAMPLE_NONE) return D3DERR_INVALIDCALL;      /* (CheckDeviceMultiSampleType: no multisampling here, of any kind) */
   if (dxt_block(format) && ((width & 3) || (height & 3))) return D3DERR_INVALIDCALL;      /* (a compressed surface of its own is whole blocks; a texture's levels need not be) */
   if (!shared) return surface_alone(d, width, height, usage, format, pool, flags, samples, quality, out);
-  if (!d->ex) return D3DERR_INVALIDCALL;
+  if (!d->ex) return E_NOTIMPL;      /* (as for textures) */
   if (pool == D3DPOOL_SYSTEMMEM) {
     if (!*shared || (usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL))) return D3DERR_INVALIDCALL;
     HRESULT hr = surface_alone(d, width, height, usage, format, pool, flags | TEX_MEMORY, samples, quality, out);
