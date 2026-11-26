@@ -115,10 +115,31 @@ static HRESULT STDMETHODCALLTYPE dev_CreateAdditionalSwapChain(Device8 *d, D3DPR
   return D3D_OK;
 }
 
+/* Whether a full screen of these parameters is a mode the adapter has (of the display format the back buffer goes with). */
+static BOOL full_screen_mode_exists(Device8 *d, const D3DPRESENT_PARAMETERS9 *p9) {
+  if (p9->Windowed) return TRUE;
+  D3DDEVICE_CREATION_PARAMETERS creation;
+  if (FAILED(CALL9(D9(d), GetCreationParameters, &creation))) return FALSE;
+  const D3DFORMAT display = p9->BackBufferFormat == D3DFMT_A8R8G8B8 ? D3DFMT_X8R8G8B8 : p9->BackBufferFormat == D3DFMT_A1R5G5B5 ? D3DFMT_X1R5G5B5 : p9->BackBufferFormat;
+  IDirect3D9 *d3d9 = d->parent->d9;
+  const UINT modes = CALL9(d3d9, GetAdapterModeCount, creation.AdapterOrdinal, display);
+  for (UINT i = 0; i < modes; ++i) {
+    D3DDISPLAYMODE mode;
+    if (SUCCEEDED(CALL9(d3d9, EnumAdapterModes, creation.AdapterOrdinal, display, i, &mode)) && mode.Width == p9->BackBufferWidth && mode.Height == p9->BackBufferHeight)
+      return TRUE;
+  }
+  return FALSE;
+}
+
 static HRESULT STDMETHODCALLTYPE dev_Reset(Device8 *d, D3DPRESENT_PARAMETERS *parameters) {
   D3DPRESENT_PARAMETERS9 p9;
   HRESULT hr = present_to9(parameters, &p9, TRUE);
   if (FAILED(hr)) return hr;
+  /* A full screen of no mode the adapter has is refused, and the device is not reset (as a Reset that fails leaves it). */
+  if (!full_screen_mode_exists(d, &p9)) {
+    d->not_reset = TRUE;
+    return D3DERR_INVALIDCALL;
+  }
   EnterCriticalSection(&d->lock);
   /* Direct3D 9 resets only when the program holds none of the swap chain's buffers: the implicit surfaces the program holds no reference of
    * let theirs go (and take the new ones after); one the program holds keeps the Reset from happening, as in Direct3D 8. */
@@ -154,6 +175,7 @@ static HRESULT STDMETHODCALLTYPE dev_Present(Device8 *d, const RECT *source, con
 }
 static HRESULT STDMETHODCALLTYPE dev_GetBackBuffer(Device8 *d, UINT index, D3DBACKBUFFER_TYPE type, IDirect3DSurface8 **out) {
   if (!out) return D3DERR_INVALIDCALL;
+  *out = NULL;      /* (the device's sets NULL when it fails, as Wine's test_swapchain finds Windows doing; a swap chain's leaves the pointer) */
   if (index >= 3) return D3DERR_INVALIDCALL;
   IDirect3DSurface9 *s9 = NULL;
   const HRESULT hr = CALL9(D9(d), GetBackBuffer, 0, index, type, &s9);
