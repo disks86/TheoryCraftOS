@@ -171,7 +171,12 @@ static UINT STDMETHODCALLTYPE dev_GetAvailableTextureMem(Dev *d) {
     kmt_segment_sizes(adapter, sizes);
     kmt_close_adapter(adapter);
   }
-  UINT64 total = sizes[0] + sizes[2];
+  /* (the adapter's own memory and the system memory it may use; as on Windows, half of the computer's memory counts as shared where the adapter names less) */
+  MEMORYSTATUSEX memory;
+  memset(&memory, 0, sizeof memory);
+  memory.dwLength = sizeof memory;
+  const UINT64 half = GlobalMemoryStatusEx(&memory) ? memory.ullTotalPhys / 2 : 0;
+  UINT64 total = sizes[0] + sizes[1] + (sizes[2] > half ? sizes[2] : half);
   const UINT64 used = d->video_bytes;
   total = total > used ? total - used : 0;
   if (total > 0xFFF00000ull) total = 0xFFF00000ull;

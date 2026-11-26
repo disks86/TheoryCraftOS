@@ -453,9 +453,10 @@ static HRESULT chain_front_buffer(SwapChain *c, Surface *s) {
     if (memory) DeleteDC(memory);
     ReleaseDC(NULL, screen);
   }
-  if (!captured) {
-    memset(out, 0, (SIZE_T)w * h * 4);
-    if (c->pixels && c->presents) {
+  /* (the picture this swap chain showed last is put where its window is: the compositor may not have drawn it yet when this is asked right after Present) */
+  if (!captured) memset(out, 0, (SIZE_T)w * h * 4);
+  {
+    if (c->pixels && c->presents && (!captured || (c->pp.Windowed && c->window && IsWindowVisible(c->window) && !IsIconic(c->window)))) {
       POINT corner = {0, 0};
       if (c->pp.Windowed && c->window) ClientToScreen(c->window, &corner);
       for (UINT y = 0; y < c->pp.BackBufferHeight; ++y) {
