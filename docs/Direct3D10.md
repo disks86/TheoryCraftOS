@@ -92,7 +92,7 @@ on a Direct3D 10 device.
 
 ## Tests
 
-- `tests/windows/d3d10test.c` (RESULTS_D3D10TEST): the device and its faces (10 <-> 11, DXGI, `ID3D10Multithread`, `D3D10CreateDevice1` at 10_1), clears and
+- `tests/windows/d3d10test.c` (121 checks, all passing on the emulator, under QEMU on the CPU renderer and on virgl, and as a 32-bit program under WoW64): the device and its faces (10 <-> 11, DXGI, `ID3D10Multithread`, `D3D10CreateDevice1` at 10_1), clears and
   draws read back by pixel (a triangle, a constant buffer's matrix, indexed draws, a viewport), a sampled texture and its update, blend, depth and
   depth-stencil states, a geometry shader, stream output of a vertex shader's positions with its statistics query, occlusion, event, pipeline statistics and
   timestamp queries, predication, `Map` of buffers and textures, copies with a Direct3D 10 box, the 10 <-> 11 `QueryInterface` identity of a texture (one count,
@@ -105,7 +105,7 @@ on a Direct3D 10 device.
 - Host tests (ASan/UBSan): `tests/run_host_tests.sh Fx4ParserTest` (the fx_4 parser, expressions and listing over the fixtures of `tests/data/fx`, every
   truncation and every bit flip) and `tests/run_host_tests.sh DxbcReflectTest` (containers, checksums, reflection parsing, the disassembler and the preprocessor,
   truncations and bit flips).
-- Wine's conformance tests (`tests/windows/wine/d3d10core`, `d3d10_1`, `d3d10`; RESULTS_WINE): `tests/windows/wine.py build <out> d3d10core d3d10_1 d3d10`, then
+- Wine's conformance tests (`tests/windows/wine/d3d10core`, `d3d10_1`, `d3d10`; numbers in [the README](../tests/windows/wine/README.md): device 0 of 218, reflection 0 of 624, effect 51 of 5041 with precompiled blobs, d3d10_1 1, d3d10core 2 then the buffer render target view crash): `tests/windows/wine.py build <out> d3d10core d3d10_1 d3d10`, then
   each program with the emulator's `emurun`, or `scripts/winetest.sh d3d10core` under QEMU.
 - The effect fixtures (`tests/data/fx/*.fx`, compiled `*.fxo`) are compiled with Microsoft's d3dcompiler_47 under Wine, as `scripts/hlsl-compile.sh` does for
   shaders (`TCOS_D3DCOMPILER`), with the profile fx_4_0 or fx_4_1 and no entry point.

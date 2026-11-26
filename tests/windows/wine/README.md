@@ -88,6 +88,12 @@ Checks that failed (Wine commit f343ca6), before the implementation of the libra
 | ws2_32 protocol | did not start (the runner split `ws2_32_protocol` at the wrong underscore), then 80 and a hang | 1287, ends in a crash at a table the test reads without checking: `inet_pton`/`inet_ntop`, `getaddrinfo`/`GetAddrInfoW` without DNS, `getnameinfo`, `WSALookupService*` finding nothing (the stub "succeeded" forever); left: `WSAEnumProtocols`, `WSAStringToAddress`/`WSAAddressToString`, legacy `inet_addr` forms, `getservbyname` |
 | iphlpapi iphlpapi | 6, then a crash | 4, then a crash in `GetIpForwardTable` (the test reads the table without checking the error): `GetAdaptersAddresses`, `GetIfTable`, `GetIpAddrTable`, `GetIfEntry(2)` done; routing/neighbour/connection tables answer `ERROR_NOT_SUPPORTED` |
 | own: user32 tcos_input, winmm tcos_gameinput, ws2_32 tcos_resolve | not written | 0 of each (keyboard/DPI/display configuration; winmm, xinput, dinput8, avrt, iphlpapi; addresses and name resolution) |
+| d3d10 device (state block masks, state blocks) | not run (no d3d10.dll) | 0 of 218 |
+| d3d10 reflection, d3d10_1 reflection (D3D10ReflectShader) | not run | 0 of 624 each |
+| d3d10 effect | not run | stops at effect.c:140: D3D10CompileEffectFromMemory is E_NOTIMPL (no HLSL compiler) and the test uses the NULL blob. With the run-time compiles replaced by blobs of Microsoft's d3dcompiler_47: 51 of 5041, all from that compiler leaving out the empty `$Globals` buffer d3d10's own emits |
+| d3d10_1 d3d10_1 | did not link | 1 (d3d10_1.c:1069, the same missing compiler), then the test crashes on the NULL blob |
+| d3d10core d3d10core | not run | 2, then a crash in test_create_rendertarget_view (a buffer's render target view is refused: docs/Direct3D10.md). Without that test it runs to test_cube_maps within the emulator's 1800 s: 448, nearly all drawing of the kernel's gaps - 410 in test_texture (formats), 23 layered rendering (SV_RenderTargetArrayIndex), 12 test_texture1d, cube maps, 1 blend |
+| d3d11 d3d11 (after the Direct3D 10 work) | 41, then the crash at the depth view arrays | 7 (a child process, three texture formats), then a crash at a buffer's render target view (d3d11.c:4398) |
 
 Everything else was measured once and has not been worked on: ntdll alpc 1684, directory 784, file 354, sync 246, threadpool 244, reg 133 (the NT registry services), path 279;
 shlwapi UrlHash/HashData (need Wine's 256-byte table); mpr 211, psapi 123, userenv 68, secur32 53. Most of those are
