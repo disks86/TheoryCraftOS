@@ -79,29 +79,11 @@ static DWORD get_pixel(IDirectDrawSurface7 *s, int x, int y) {
   IDirectDrawSurface7_Unlock(s, NULL);
   return v;
 }
-/* A texture: through IDirectDraw7 on 32-bit Windows; 64-bit Windows' IDirectDraw7 has no Direct3D and refuses textures (E_NOINTERFACE), so there
- * through IDirectDraw4, the surface then asked for its IDirectDrawSurface7. */
+/* A texture through IDirectDraw7 (64-bit Windows' IDirectDraw7 refuses them with E_NOINTERFACE, having no Direct3D; this ddraw.dll has its Direct3D 7 on
+ * both widths, as 32-bit Windows). */
 static HRESULT create_texture(DDSURFACEDESC2 *d, IDirectDrawSurface7 **out) {
   *out = NULL;
-#ifdef _WIN64
-  IDirectDrawSurface7 *t = NULL;
-  HRESULT hr = IDirectDraw7_CreateSurface(g_dd, d, &t, NULL);
-  check(hr == E_NOINTERFACE && !t, "64-bit IDirectDraw7 refuses textures with E_NOINTERFACE, as Windows");
-  if (t) IDirectDrawSurface7_Release(t);
-  IDirectDraw4 *dd4 = NULL;
-  hr = IDirectDraw7_QueryInterface(g_dd, &IID_IDirectDraw4, (void **)&dd4);
-  if (FAILED(hr)) return hr;
-  IDirectDrawSurface4 *s4 = NULL;
-  hr = IDirectDraw4_CreateSurface(dd4, d, &s4, NULL);
-  if (SUCCEEDED(hr)) {
-    hr = IDirectDrawSurface4_QueryInterface(s4, &IID_IDirectDrawSurface7, (void **)out);
-    IDirectDrawSurface4_Release(s4);
-  }
-  IDirectDraw4_Release(dd4);
-  return hr;
-#else
   return IDirectDraw7_CreateSurface(g_dd, d, out, NULL);
-#endif
 }
 static void fill(IDirectDrawSurface7 *s, RECT *r, DWORD colour) {
   DDBLTFX fx;

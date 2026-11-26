@@ -262,8 +262,8 @@ typedef struct DdD3dHooks {
 } DdD3dHooks;
 static DdD3dHooks g_d3d;
 
-/* The Direct3D part's registration, if it is in this library (a weak symbol: without it there is nothing of Direct3D). */
-__attribute__((weak)) void dd_d3d_register(DdD3dHooks *hooks);
+/* The Direct3D part's registration (d3d_vtbl.inc). */
+void dd_d3d_register(DdD3dHooks *hooks);
 
 /* ---- small helpers --------------------------------------------------------------------------------------------------------------------------------- */
 
@@ -352,6 +352,14 @@ static UINT driver_kind(const GUID *guid) {
 #include "ddobj.inc"
 #include "vtbl.inc"
 #include "legacy.inc"
+/* the Direct3D part (Direct3D 1, 2, 3 and 7 on d3d9.dll: d3d.inc) */
+#include "d3d.inc"
+#include "d3d_state.inc"
+#include "d3d_draw.inc"
+#include "d3d_device.inc"
+#include "d3d_methods.inc"
+#include "d3d_objects.inc"
+#include "d3d_vtbl.inc"
 
 /* ---- creation -------------------------------------------------------------------------------------------------------------------------------------- */
 
@@ -602,7 +610,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
   if (reason == DLL_PROCESS_ATTACH) {
     g_module = instance;
     InitializeCriticalSection(&g_lock);
-    if (dd_d3d_register) dd_d3d_register(&g_d3d);
+    dd_d3d_register(&g_d3d);      /* (the Direct3D part: d3d.inc) */
   }
   return TRUE;
 }

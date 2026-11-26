@@ -288,8 +288,78 @@ static HRESULT tex_upload_rows(Dev *d, Tex *t, UINT sub, const RECT *rect, const
   ID3D12Resource_Release(upload);
   return D3D_OK;
 }
+/* The depth of a lockable depth buffer (D16_LOCKABLE, D32F_LOCKABLE and D32_LOCKABLE are D32_FLOAT in Direct3D 12) between the device and the program's copy:
+ * the whole buffer through a buffer of floats (Direct3D 12 copies depth buffers whole), converted to the lock's format (16 or 32 bits of the depth range, or floats). */
+static HRESULT tex_depth_copy(Dev *d, Tex *t, UINT sub, BOOL to_device) {
+  BYTE *shadow = tex_shadow(t, sub);
+  if (!shadow) return E_OUTOFMEMORY;
+  if (!t->res || !t->depth || !format_depth_lockable(t->format) || t->kind != 0) return D3D_OK;
+  const UINT w = sub_width(t, sub), h = sub_height(t, sub), pitch = format_pitch(t->format, w);
+  const UINT row_pitch = (w * 4u + 255u) & ~255u;
+  ID3D12Resource *buffer = make_buffer(d, to_device ? D3D12_HEAP_TYPE_UPLOAD : D3D12_HEAP_TYPE_READBACK, (UINT64)row_pitch * h);
+  if (!buffer) return E_OUTOFMEMORY;
+  BYTE *memory = NULL;
+  HRESULT hr = D3D_OK;
+  if (to_device) {
+    hr = ID3D12Resource_Map(buffer, 0, NULL, (void **)&memory);
+    if (SUCCEEDED(hr) && memory) {
+      for (UINT y = 0; y < h; ++y) {
+        float *row = (float *)(memory + (SIZE_T)y * row_pitch);
+        const BYTE *in = shadow + (SIZE_T)y * pitch;
+        for (UINT x = 0; x < w; ++x) {
+          if (t->format == D3DFMT_D16_LOCKABLE) row[x] = ((const WORD *)in)[x] / 65535.0f;
+          else if (t->format == D3DFMT_D32_LOCKABLE) row[x] = (float)(((const DWORD *)in)[x] / 4294967295.0);
+          else memcpy(&row[x], in + (SIZE_T)x * 4, 4);
+        }
+      }
+      ID3D12Resource_Unmap(buffer, 0, NULL);
+    } else if (SUCCEEDED(hr)) hr = E_FAIL;
+    if (FAILED(hr)) { ID3D12Resource_Release(buffer); return hr; }
+    /* (what the program wrote is the depth: a clear waiting for the next pass would undo it) */
+    for (UINT i = 0; i < d->clear_count;) {
+      if (d->clears[i].depth == t) d->clears[i] = d->clears[--d->clear_count]; else ++i;
+    }
+  }
+  D3D12_TEXTURE_COPY_LOCATION tex, buf;
+  memset(&tex, 0, sizeof tex);
+  memset(&buf, 0, sizeof buf);
+  tex.pResource = t->res;
+  tex.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  tex.SubresourceIndex = tex_d12_sub(t, sub);
+  buf.pResource = buffer;
+  buf.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  buf.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32_TYPELESS;
+  buf.PlacedFootprint.Footprint.Width = w;
+  buf.PlacedFootprint.Footprint.Height = h;
+  buf.PlacedFootprint.Footprint.Depth = 1;
+  buf.PlacedFootprint.Footprint.RowPitch = row_pitch;
+  if (to_device) ID3D12GraphicsCommandList_CopyTextureRegion(d->list, &tex, 0, 0, 0, &buf, NULL);
+  else ID3D12GraphicsCommandList_CopyTextureRegion(d->list, &buf, 0, 0, 0, &tex, NULL);
+  t->used = d->epoch;
+  d->recorded = 1;
+  flush(d);
+  if (!to_device) {
+    hr = ID3D12Resource_Map(buffer, 0, NULL, (void **)&memory);
+    if (SUCCEEDED(hr) && memory) {
+      for (UINT y = 0; y < h; ++y) {
+        const float *row = (const float *)(memory + (SIZE_T)y * row_pitch);
+        BYTE *out = shadow + (SIZE_T)y * pitch;
+        for (UINT x = 0; x < w; ++x) {
+          const float z = row[x] < 0.0f ? 0.0f : row[x] > 1.0f ? 1.0f : row[x];
+          if (t->format == D3DFMT_D16_LOCKABLE) ((WORD *)out)[x] = (WORD)(z * 65535.0f + 0.5f);
+          else if (t->format == D3DFMT_D32_LOCKABLE) ((DWORD *)out)[x] = (DWORD)(z * 4294967295.0 + 0.5);
+          else memcpy(out + (SIZE_T)x * 4, &row[x], 4);
+        }
+      }
+      ID3D12Resource_Unmap(buffer, 0, NULL);
+    } else if (SUCCEEDED(hr)) hr = E_FAIL;
+  }
+  ID3D12Resource_Release(buffer);
+  return hr;
+}
 /* Sends a subresource's pixels (the program's copy) to the Direct3D 12 texture: converted to B8G8R8A8 (through the current palette for P8 and A8P8). */
 static HRESULT tex_upload(Dev *d, Tex *t, UINT sub) {
+  if (t->depth && t->res && t->shadow[sub] && format_depth_lockable(t->format)) return tex_depth_copy(d, t, sub, TRUE);
   if (!t->res || t->depth || !t->shadow[sub] || sub_level(t, sub) >= t->kmips) return D3D_OK;
   const UINT w = sub_width(t, sub), h = sub_height(t, sub), slices = tex_slices(t, sub), bytes = format_bytes(t->format);
   if (dxt_block(t->format)) return tex_upload_rows(d, t, sub, NULL, t->shadow[sub], format_pitch(t->format, w), format_pitch(t->format, w) * format_rows(t->format, h));
@@ -346,6 +416,7 @@ static HRESULT tex_download(Dev *d, Tex *t, UINT sub, BYTE *rows, UINT pitch) {
 static HRESULT tex_fetch(Dev *d, Tex *t, UINT sub) {
   BYTE *shadow = tex_shadow(t, sub);
   if (!shadow) return E_OUTOFMEMORY;
+  if (t->depth && t->res && format_depth_lockable(t->format)) return tex_depth_copy(d, t, sub, FALSE);
   if (!tex_device_owned(t) || t->depth) return D3D_OK;
   const UINT w = sub_width(t, sub), h = sub_height(t, sub);
   if (format_is_wide(t->format)) {

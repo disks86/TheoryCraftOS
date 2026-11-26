@@ -46,7 +46,11 @@ static DXGI_FORMAT dxt_dxgi(D3DFORMAT format) {
 /* The bytes of a row of a level `w` pixels wide as the program has it (a row of blocks of a compressed format), and the rows of a level `h` high. */
 /* The packed YUV formats (YUY2, UYVY: two pixels in four bytes): resources of the scratch pool only, which the device never draws or samples (CheckDeviceFormat refuses them). */
 static BOOL format_is_yuv(D3DFORMAT format) { return format == D3DFMT_YUY2 || format == D3DFMT_UYVY; }
+static BOOL format_is_depth(D3DFORMAT format);
+/* The bytes of a depth buffer's pixel as a lock gives it (the 16-bit formats 2, the others 4). */
+static UINT depth_bytes(D3DFORMAT format) { return format == D3DFMT_D16 || format == D3DFMT_D16_LOCKABLE || format == D3DFMT_D15S1 ? 2 : 4; }
 static UINT format_pitch(D3DFORMAT format, UINT w) {
+  if (format_is_depth(format)) return w * depth_bytes(format);
   return dxt_block(format) ? (w + 3) / 4 * dxt_block(format) : format_is_yuv(format) ? (w + 1) / 2 * 4 : w * format_bytes(format);
 }
 static UINT format_rows(D3DFORMAT format, UINT h) { return dxt_block(format) ? (h + 3) / 4 : h; }
