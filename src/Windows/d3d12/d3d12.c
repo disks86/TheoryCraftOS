@@ -60,7 +60,7 @@
  *     tiles), tier 1 on virgl (TGSI has no residency feedback or lookup clamp); reserved depth buffers
  *     of D32_FLOAT and D16_UNORM where the kernel's device moves depth planes (base.inc format_tiled_depth; not D24S8 / D32S8: two planes), no multisampled reserved textures (no
  *     device moves a multisampled image's samples to or from memory: no backing for the tiles, no tiled quality level); the status of buffer and UAV loads (ld_raw_s /
- *     ld_structured_s / ld_uav_typed_s) where there is residency feedback; heaps shared across adapters (DXGI_ERROR_UNSUPPORTED; shared handles of one adapter's resources and heaps, and of fences of any
+ *     ld_structured_s / ld_uav_typed_s) on the CPU renderer (refused on Venus, whose SPIR-V has no residency of buffers: the shader is not made); heaps shared across adapters (DXGI_ERROR_UNSUPPORTED; shared handles of one adapter's resources and heaps, and of fences of any
  *     adapter, are made: device.inc), resource state validation (barriers are accepted and not looked at, except aliasing), the debug layer
  *   - of the later interfaces (ID3D12Device1 .. 14, ID3D12GraphicsCommandList1 .. 10: device1.inc, cmdlist1.inc, library.inc, rootsig.inc; what mingw lacks of them is in
  *     d3d12_types.h), the features reported at their "not supported" tier: ray tracing, mesh shaders, sampler feedback, work graphs, protected sessions, meta commands

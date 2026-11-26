@@ -8057,7 +8057,10 @@ static void test_tiled_loads(Scene *c) {
   const UINT regs[5] = {0, 1, 0, 1, 2};
   ID3D12RootSignature *rs = ranges_signature(dev, 5, types, regs, NULL, 0);
   ID3D12PipelineState *pso = NULL;
-  if (rs && opts.TiledResourcesTier >= D3D12_TILED_RESOURCES_TIER_2) {
+  /* (the Venus device has residency feedback for the lookups of textures only: SPIR-V has no residency of a buffer's words, and the kernel refuses a status of a buffer or
+   * storage image load there rather than report every tile resident) */
+  const int buffer_status = opts.TiledResourcesTier >= D3D12_TILED_RESOURCES_TIER_2 && !g_venus;
+  if (rs && buffer_status) {
     pso = compute_pso(dev, rs, dx_cs_tiled_loads_dxbc, sizeof dx_cs_tiled_loads_dxbc);
   } else if (rs) {
     D3D12_COMPUTE_PIPELINE_STATE_DESC cd;      /* (made by hand: compute_pso checks that it is made) */
@@ -8068,8 +8071,8 @@ static void test_tiled_loads(Scene *c) {
     ID3D12Device_CreateComputePipelineState(dev, &cd, &IID_ID3D12PipelineState, (void **)&pso);
   }
   printf("tiled loads: tier %d, pipeline %s\n", (int)opts.TiledResourcesTier, pso ? "made" : "refused");
-  if (opts.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_2) {
-    CHECK(!pso);      /* (no residency feedback there) */
+  if (!buffer_status) {
+    CHECK(!pso);      /* (no residency feedback there, or none of buffers and storage images) */
     if (pso) ID3D12PipelineState_Release(pso);
     if (rs) ID3D12RootSignature_Release(rs);
     return;

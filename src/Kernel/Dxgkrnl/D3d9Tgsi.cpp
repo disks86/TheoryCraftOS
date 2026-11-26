@@ -820,6 +820,12 @@ bool TgsiEmitter::instruction(const Instr& ins) {
     unsupported_ = true;
     return true;
   }
+  // (the status of a buffer or storage image load - ld_raw_s, ld_structured_s, ld_uav_typed_s -: the Venus device's reader makes only the lookups of sampled images sparse
+  // ones; SPIR-V has no residency of a buffer's words, so the status would say resident for an unmapped tile. The shader is refused, as on a device without feedback)
+  if (ins.op == kBufLoad || ins.op == kImgLoad) {
+    unsupported_ = true;
+    return true;
+  }
   if (ins.has_clamp) {
     const String clamp = component(ins.clamp, 0, 3);
     line("SPARSE_BEGIN", &clamp);
