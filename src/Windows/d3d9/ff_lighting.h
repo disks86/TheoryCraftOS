@@ -35,7 +35,7 @@
 #ifndef TCOS_D3D9_FF_LIGHTING_H
 #define TCOS_D3D9_FF_LIGHTING_H
 
-#define FFL_LIGHTS 8u      /* the lights that shine at once (D3DCAPS9.MaxActiveLights) */
+#define FFL_LIGHTS 32u     /* the lights that shine at once (D3DCAPS9.MaxActiveLights) */
 
 enum { FFL_DIRECTIONAL = 0, FFL_POINT = 1, FFL_SPOT = 2 };
 

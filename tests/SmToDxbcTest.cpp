@@ -140,8 +140,10 @@ struct Result { float position[4]; float colour[4]; bool alive; bool ok; };
 float g_depth = 0.0f, g_inverse_w = 0.0f;
 // What a pixel shader's state registers hold in the tests that do not say: no alpha test, no fog.
 float g_state[SM_STATE_REGISTERS][4];
+// (a vertex shader's state register: no half-pixel move, so that its position is the kernel's own compiler's)
 void put_state(uint8_t* constants) {
   if (!g_shader.vertex) memcpy(constants + g_shader.state_register * 16, g_state, sizeof g_state);
+  else memset(constants + g_shader.state_register * 16, 0, 16 * SM_VS_STATE_REGISTERS);
 }
 
 // Translates, compiles and runs: a vertex shader's position and COLOR0, a pixel shader's colour. `bools`: the device's bool constants (bit n: b<n>).
@@ -293,7 +295,7 @@ void test_instructions(HostAllocator& allocator) {
   };
   CHECK(colour_is(run_vertex_body(allocator, branch(0)), 0.25f, -0.5f, 0.75f, 1.0f));
   CHECK(colour_is(run_vertex_body(allocator, branch(1), 1u << 5), 0.25f, -0.5f, 0.75f, 1.0f));
-  CHECK(g_shader.bools_used && g_shader.constant_registers == g_shader.float_registers + SM_BOOL_REGISTERS);
+  CHECK(g_shader.bools_used && g_shader.constant_registers == g_shader.float_registers + SM_BOOL_REGISTERS + SM_VS_STATE_REGISTERS);
   CHECK(colour_is(run_vertex_body(allocator, branch(1), ~(1u << 5)), 0.3f, -0.6f, 2.4f, 0.5f));
   CHECK(colour_is(run_vertex_body(allocator, branch(2)), 0.25f, -0.5f, 0.75f, 1.0f));      // 0.3 < 0.5
   CHECK(colour_is(run_vertex_body(allocator, branch(3)), 0.3f, -0.6f, 2.4f, 0.5f));        // 0.3 > 0.5 is not so

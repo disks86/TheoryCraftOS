@@ -39,6 +39,7 @@ constexpr uint64_t sizeof_get_display_mode_list = 24;       // { hAdapter @0; Vi
 constexpr uint64_t sizeof_display_mode = 32;                // D3DKMT_DISPLAYMODE: Width, Height, Format, IntegerRefreshRate, ScanLineOrdering, DisplayOrientation, DisplayFixedOutput, Flags
 constexpr uint64_t sizeof_set_display_mode = 8;             // { hDevice @0; hPrimaryAllocation @4; ... }
 constexpr uint64_t sizeof_wait_vblank = 12;                 // { hAdapter @0; hDevice @4; VidPnSourceId @8 }
+constexpr uint64_t sizeof_get_scan_line = 16;               // D3DKMT_GETSCANLINE { hAdapter @0; VidPnSourceId @4; InVerticalBlank (BOOLEAN) @8; ScanLine @12 }
 constexpr uint64_t sizeof_set_queued_limit = 12;            // { hDevice @0; Type @4; QueuedPresentLimit @8 }
 constexpr uint64_t sizeof_set_vidpn_source_owner = 32;     // { hDevice @0; pType @8; pVidPnSourceId @16; VidPnSourceCount @24 }
 constexpr uint64_t sizeof_check_vidpn_exclusive_ownership = 8;   // { hAdapter @0; VidPnSourceId @4 }

@@ -16,36 +16,50 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-/* Part of d3d9.c: the device itself - its targets, Present, the copies between surfaces, how it is made and reset - the Direct3D object a program
- * asks about the adapter, and the entry points of the library. */
+/* Part of d3d9.c: the device itself - what it can do, its targets, when it is lost, how it is made and reset (and 9Ex's ResetEx and the rest of
+ * IDirect3DDevice9Ex) - the Direct3D object a program asks about the adapter (IDirect3D9, IDirect3D9Ex), and the entry points of the library. */
 
 /* ---- what the device can do -------------------------------------------------------------------------------------------------------------------------- */
 
 static void caps_fill(D3DCAPS9 *caps) {
   memset(caps, 0, sizeof *caps);
   caps->DeviceType = D3DDEVTYPE_HAL;
-  caps->Caps2 = D3DCAPS2_DYNAMICTEXTURES | D3DCAPS2_CANAUTOGENMIPMAP;
-  caps->Caps3 = D3DCAPS3_ALPHA_FULLSCREEN_FLIP_OR_DISCARD;
-  caps->PresentationIntervals = D3DPRESENT_INTERVAL_IMMEDIATE | D3DPRESENT_INTERVAL_ONE;
+  caps->Caps = D3DCAPS_READ_SCANLINE;
+  caps->Caps2 = D3DCAPS2_DYNAMICTEXTURES | D3DCAPS2_CANAUTOGENMIPMAP | D3DCAPS2_FULLSCREENGAMMA;
+  caps->Caps3 = D3DCAPS3_ALPHA_FULLSCREEN_FLIP_OR_DISCARD | D3DCAPS3_COPY_TO_VIDMEM | D3DCAPS3_COPY_TO_SYSTEMMEM;
+  caps->PresentationIntervals = D3DPRESENT_INTERVAL_IMMEDIATE | D3DPRESENT_INTERVAL_ONE | D3DPRESENT_INTERVAL_TWO | D3DPRESENT_INTERVAL_THREE | D3DPRESENT_INTERVAL_FOUR;
+  caps->CursorCaps = D3DCURSORCAPS_COLOR;
   caps->DevCaps = D3DDEVCAPS_DRAWPRIMITIVES2EX | D3DDEVCAPS_DRAWPRIMTLVERTEX | D3DDEVCAPS_HWTRANSFORMANDLIGHT | D3DDEVCAPS_HWRASTERIZATION | D3DDEVCAPS_TEXTUREVIDEOMEMORY |
-                  D3DDEVCAPS_TLVERTEXVIDEOMEMORY | D3DDEVCAPS_TLVERTEXSYSTEMMEMORY;
+                  D3DDEVCAPS_TLVERTEXVIDEOMEMORY | D3DDEVCAPS_TLVERTEXSYSTEMMEMORY | D3DDEVCAPS_EXECUTEVIDEOMEMORY | D3DDEVCAPS_EXECUTESYSTEMMEMORY |
+                  D3DDEVCAPS_TEXTURESYSTEMMEMORY | D3DDEVCAPS_CANRENDERAFTERFLIP | D3DDEVCAPS_DRAWPRIMITIVES2 | D3DDEVCAPS_PUREDEVICE | D3DDEVCAPS_CANBLTSYSTONONLOCAL;
+  caps->DevCaps2 = D3DDEVCAPS2_CAN_STRETCHRECT_FROM_TEXTURES | D3DDEVCAPS2_STREAMOFFSET | D3DDEVCAPS2_VERTEXELEMENTSCANSHARESTREAMOFFSET;
   caps->PrimitiveMiscCaps = D3DPMISCCAPS_MASKZ | D3DPMISCCAPS_CULLNONE | D3DPMISCCAPS_CULLCW | D3DPMISCCAPS_CULLCCW | D3DPMISCCAPS_COLORWRITEENABLE | D3DPMISCCAPS_BLENDOP |
-                            D3DPMISCCAPS_SEPARATEALPHABLEND | D3DPMISCCAPS_TSSARGTEMP | D3DPMISCCAPS_PERSTAGECONSTANT;
+                            D3DPMISCCAPS_SEPARATEALPHABLEND | D3DPMISCCAPS_TSSARGTEMP | D3DPMISCCAPS_PERSTAGECONSTANT | D3DPMISCCAPS_MRTINDEPENDENTBITDEPTHS;
   caps->MaxActiveLights = FFL_LIGHTS;
-  caps->VertexProcessingCaps = D3DVTXPCAPS_DIRECTIONALLIGHTS | D3DVTXPCAPS_POSITIONALLIGHTS | D3DVTXPCAPS_MATERIALSOURCE7 | D3DVTXPCAPS_LOCALVIEWER | D3DVTXPCAPS_TEXGEN | D3DVTXPCAPS_TEXGEN_SPHEREMAP;
+  caps->VertexProcessingCaps = D3DVTXPCAPS_DIRECTIONALLIGHTS | D3DVTXPCAPS_POSITIONALLIGHTS | D3DVTXPCAPS_MATERIALSOURCE7 | D3DVTXPCAPS_LOCALVIEWER | D3DVTXPCAPS_TEXGEN |
+                               D3DVTXPCAPS_TEXGEN_SPHEREMAP | D3DVTXPCAPS_TWEENING;
+  /* (vertex blending of up to four matrices a vertex, of the 256 world matrices with indices: done where the vertices are decoded) */
+  caps->MaxVertexBlendMatrices = 4;
+  caps->MaxVertexBlendMatrixIndex = 255;
   caps->RasterCaps = D3DPRASTERCAPS_ZTEST | D3DPRASTERCAPS_SCISSORTEST | D3DPRASTERCAPS_MIPMAPLODBIAS | D3DPRASTERCAPS_FOGVERTEX | D3DPRASTERCAPS_FOGTABLE | D3DPRASTERCAPS_FOGRANGE | D3DPRASTERCAPS_ZFOG | D3DPRASTERCAPS_WFOG |
                      D3DPRASTERCAPS_DEPTHBIAS | D3DPRASTERCAPS_SLOPESCALEDEPTHBIAS | D3DPRASTERCAPS_ANISOTROPY;
-  caps->ZCmpCaps = caps->AlphaCmpCaps = 0xFF;      /* (all eight comparisons; of the alpha test the ones that keep the higher alphas work) */
+  caps->ZCmpCaps = caps->AlphaCmpCaps = 0xFF;      /* (all eight comparisons) */
   caps->SrcBlendCaps = caps->DestBlendCaps = D3DPBLENDCAPS_ZERO | D3DPBLENDCAPS_ONE | D3DPBLENDCAPS_SRCCOLOR | D3DPBLENDCAPS_INVSRCCOLOR | D3DPBLENDCAPS_SRCALPHA |
                                              D3DPBLENDCAPS_INVSRCALPHA | D3DPBLENDCAPS_DESTALPHA | D3DPBLENDCAPS_INVDESTALPHA | D3DPBLENDCAPS_DESTCOLOR | D3DPBLENDCAPS_INVDESTCOLOR |
                                              D3DPBLENDCAPS_SRCALPHASAT | D3DPBLENDCAPS_BOTHSRCALPHA | D3DPBLENDCAPS_BOTHINVSRCALPHA | D3DPBLENDCAPS_BLENDFACTOR;
-  caps->ShadeCaps = D3DPSHADECAPS_COLORGOURAUDRGB | D3DPSHADECAPS_ALPHAGOURAUDBLEND;
-  caps->TextureCaps = D3DPTEXTURECAPS_ALPHA | D3DPTEXTURECAPS_MIPMAP | D3DPTEXTURECAPS_PERSPECTIVE | D3DPTEXTURECAPS_PROJECTED;
-  caps->TextureFilterCaps = D3DPTFILTERCAPS_MINFPOINT | D3DPTFILTERCAPS_MINFLINEAR | D3DPTFILTERCAPS_MAGFPOINT | D3DPTFILTERCAPS_MAGFLINEAR | D3DPTFILTERCAPS_MIPFPOINT |
-                            D3DPTFILTERCAPS_MIPFLINEAR | D3DPTFILTERCAPS_MINFANISOTROPIC;
+  caps->ShadeCaps = D3DPSHADECAPS_COLORGOURAUDRGB | D3DPSHADECAPS_ALPHAGOURAUDBLEND | D3DPSHADECAPS_SPECULARGOURAUDRGB | D3DPSHADECAPS_FOGGOURAUD;
+  caps->TextureCaps = D3DPTEXTURECAPS_ALPHA | D3DPTEXTURECAPS_MIPMAP | D3DPTEXTURECAPS_PERSPECTIVE | D3DPTEXTURECAPS_PROJECTED | D3DPTEXTURECAPS_CUBEMAP | D3DPTEXTURECAPS_VOLUMEMAP |
+                      D3DPTEXTURECAPS_ALPHAPALETTE | D3DPTEXTURECAPS_TEXREPEATNOTSCALEDBYSIZE;
+  caps->TextureFilterCaps = caps->CubeTextureFilterCaps = caps->VolumeTextureFilterCaps =
+      D3DPTFILTERCAPS_MINFPOINT | D3DPTFILTERCAPS_MINFLINEAR | D3DPTFILTERCAPS_MAGFPOINT | D3DPTFILTERCAPS_MAGFLINEAR | D3DPTFILTERCAPS_MIPFPOINT | D3DPTFILTERCAPS_MIPFLINEAR;
+  caps->TextureFilterCaps |= D3DPTFILTERCAPS_MINFANISOTROPIC;
+  caps->StretchRectFilterCaps = D3DPTFILTERCAPS_MINFPOINT | D3DPTFILTERCAPS_MINFLINEAR | D3DPTFILTERCAPS_MAGFPOINT | D3DPTFILTERCAPS_MAGFLINEAR;
   /* (wrap, mirror, clamp, border - D3DSAMP_BORDERCOLOR -, mirror once, each direction its own) */
-  caps->TextureAddressCaps = D3DPTADDRESSCAPS_WRAP | D3DPTADDRESSCAPS_MIRROR | D3DPTADDRESSCAPS_CLAMP | D3DPTADDRESSCAPS_BORDER | D3DPTADDRESSCAPS_MIRRORONCE | D3DPTADDRESSCAPS_INDEPENDENTUV;
+  caps->TextureAddressCaps = caps->VolumeTextureAddressCaps =
+      D3DPTADDRESSCAPS_WRAP | D3DPTADDRESSCAPS_MIRROR | D3DPTADDRESSCAPS_CLAMP | D3DPTADDRESSCAPS_BORDER | D3DPTADDRESSCAPS_MIRRORONCE | D3DPTADDRESSCAPS_INDEPENDENTUV;
+  caps->LineCaps = D3DLINECAPS_TEXTURE | D3DLINECAPS_ZTEST | D3DLINECAPS_BLEND | D3DLINECAPS_ALPHACMP | D3DLINECAPS_FOG;
   caps->MaxTextureWidth = caps->MaxTextureHeight = 4096;
+  caps->MaxVolumeExtent = 256;
   caps->MaxTextureRepeat = 8192;
   caps->MaxTextureAspectRatio = 4096;
   caps->MaxAnisotropy = 16;
@@ -62,12 +76,15 @@ static void caps_fill(D3DCAPS9 *caps) {
                         D3DTEXOPCAPS_MODULATEINVCOLOR_ADDALPHA | D3DTEXOPCAPS_DOTPRODUCT3 | D3DTEXOPCAPS_MULTIPLYADD | D3DTEXOPCAPS_LERP;
   caps->MaxTextureBlendStages = STAGES;
   caps->MaxSimultaneousTextures = STAGES;
+  caps->MaxUserClipPlanes = 0;
   caps->MaxPrimitiveCount = INDEX_RING / 12;
   caps->MaxVertexIndex = 0x00FFFFFF;
   caps->MaxStreams = STREAMS;
   caps->MaxStreamStride = 508;
-  caps->MaxPointSize = 1.0f;
+  caps->MaxPointSize = MAX_POINT_SIZE;
   caps->NumSimultaneousRTs = 1;
+  caps->MasterAdapterOrdinal = caps->AdapterOrdinal = 0;
+  caps->NumberOfAdaptersInGroup = 1;
   caps->DeclTypes = D3DDTCAPS_UBYTE4 | D3DDTCAPS_UBYTE4N | D3DDTCAPS_SHORT2N | D3DDTCAPS_SHORT4N | D3DDTCAPS_USHORT2N | D3DDTCAPS_USHORT4N | D3DDTCAPS_FLOAT16_2 | D3DDTCAPS_FLOAT16_4 | D3DDTCAPS_UDEC3 | D3DDTCAPS_DEC3N;
   /* The program's shaders: what the translator takes (sm_to_dxbc.h), which is not everything of the version here. */
   caps->VertexShaderVersion = D3DVS_VERSION(3, 0);
@@ -83,8 +100,52 @@ static void caps_fill(D3DCAPS9 *caps) {
 
 /* ---- the device's own methods ----------------------------------------------------------------------------------------------------------------------- */
 
-static HRESULT STDMETHODCALLTYPE dev_TestCooperativeLevel(Dev *d) { (void)d; return D3D_OK; }
-static UINT STDMETHODCALLTYPE dev_GetAvailableTextureMem(Dev *d) { (void)d; return 256u << 20; }
+static int display_mode_same(const DEVMODEW *a, const DEVMODEW *b) {
+  return a->dmPelsWidth == b->dmPelsWidth && a->dmPelsHeight == b->dmPelsHeight && a->dmBitsPerPel == b->dmBitsPerPel;
+}
+static void display_devmode(DEVMODEW *dm) {
+  memset(dm, 0, sizeof *dm);
+  dm->dmSize = sizeof *dm;
+  EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, dm);
+}
+/* Whether the device is lost, by Direct3D 9's rules: a full-screen device when its window is not in front or is minimized, any device when the display mode
+ * changed from the one it was made or reset in (another program's full-screen mode); once lost, it stays "not reset" until Reset. A 9Ex device is never lost. */
+static HRESULT device_lost_state(Dev *d) {
+  if (d->ex) return D3D_OK;
+  if (!d->lost) {
+    DEVMODEW now;
+    display_devmode(&now);
+    BOOL lose = !display_mode_same(&now, &d->lost_mode);
+    if (d->chain && !d->chain->pp.Windowed) {
+      HWND focus = d->creation.hFocusWindow ? d->creation.hFocusWindow : d->chain->window;
+      if (focus && (IsIconic(focus) || GetForegroundWindow() != focus)) lose = TRUE;
+    }
+    if (lose) d->lost = d->not_reset = 1;
+  }
+  if (!d->lost) return D3D_OK;
+  /* (lost while what lost it lasts; then waiting for Reset) */
+  if (d->chain && !d->chain->pp.Windowed) {
+    HWND focus = d->creation.hFocusWindow ? d->creation.hFocusWindow : d->chain->window;
+    if (focus && (IsIconic(focus) || GetForegroundWindow() != focus)) return D3DERR_DEVICELOST;
+  }
+  return D3DERR_DEVICENOTRESET;
+}
+static HRESULT STDMETHODCALLTYPE dev_TestCooperativeLevel(Dev *d) { return device_lost_state(d); }
+/* The texture memory there is: the adapter's memory (video and shared) less what this device holds, rounded down to a megabyte as Direct3D 9 gives it. */
+static UINT STDMETHODCALLTYPE dev_GetAvailableTextureMem(Dev *d) {
+  UINT adapter = 0;
+  UINT64 sizes[3] = {0, 0, 0};
+  if (KMT_OK(kmt_open_adapter(ID3D12Device_GetAdapterLuid(d->d12), &adapter))) {
+    kmt_segment_sizes(adapter, sizes);
+    kmt_close_adapter(adapter);
+  }
+  UINT64 total = sizes[0] + sizes[2];
+  const UINT64 used = d->video_bytes;
+  total = total > used ? total - used : 0;
+  if (total > 0xFFF00000ull) total = 0xFFF00000ull;
+  return (UINT)(total & ~0xFFFFFull);
+}
+/* (managed resources are in the device's memory and the program's both: there is nothing to put out, and nothing to bring in later) */
 static HRESULT STDMETHODCALLTYPE dev_EvictManagedResources(Dev *d) { (void)d; return D3D_OK; }
 static HRESULT STDMETHODCALLTYPE dev_GetDirect3D(Dev *d, IDirect3D9 **out) {
   if (!out) return D3DERR_INVALIDCALL;
@@ -98,61 +159,39 @@ static HRESULT STDMETHODCALLTYPE dev_GetDeviceCaps(Dev *d, D3DCAPS9 *caps) {
   caps_fill(caps);
   return D3D_OK;
 }
-static void display_mode(D3DDISPLAYMODE *mode) {
-  mode->Width = (UINT)GetSystemMetrics(SM_CXSCREEN);
-  mode->Height = (UINT)GetSystemMetrics(SM_CYSCREEN);
-  if (!mode->Width || !mode->Height) { mode->Width = 1024; mode->Height = 768; }
-  mode->RefreshRate = 60;
-  mode->Format = D3DFMT_X8R8G8B8;
-}
-static HRESULT STDMETHODCALLTYPE dev_GetDisplayMode(Dev *d, UINT chain, D3DDISPLAYMODE *mode) {
-  (void)d;
-  if (chain != 0 || !mode) return D3DERR_INVALIDCALL;
-  display_mode(mode);
-  return D3D_OK;
-}
 static HRESULT STDMETHODCALLTYPE dev_GetCreationParameters(Dev *d, D3DDEVICE_CREATION_PARAMETERS *parameters) {
   if (!parameters) return D3DERR_INVALIDCALL;
   *parameters = d->creation;
   return D3D_OK;
 }
-static void STDMETHODCALLTYPE dev_SetCursorPosition(Dev *d, int x, int y, DWORD flags) { (void)d; (void)x; (void)y; (void)flags; }
-static BOOL STDMETHODCALLTYPE dev_ShowCursor(Dev *d, BOOL show) { (void)d; (void)show; return FALSE; }
-static UINT STDMETHODCALLTYPE dev_GetNumberOfSwapChains(Dev *d) { (void)d; return 1; }
-static HRESULT STDMETHODCALLTYPE dev_SetDialogBoxMode(Dev *d, BOOL enable) { (void)d; (void)enable; return D3D_OK; }
-static void STDMETHODCALLTYPE dev_SetGammaRamp(Dev *d, UINT chain, DWORD flags, const D3DGAMMARAMP *ramp) { (void)d; (void)chain; (void)flags; (void)ramp; }
-static void STDMETHODCALLTYPE dev_GetGammaRamp(Dev *d, UINT chain, D3DGAMMARAMP *ramp) {
-  (void)d; (void)chain;
-  if (!ramp) return;
-  for (UINT i = 0; i < 256; ++i) ramp->red[i] = ramp->green[i] = ramp->blue[i] = (WORD)(i * 257);
+/* ValidateDevice: one pass, unless a stage has an operation the device has not (D3DTOP_BUMPENVMAP, BUMPENVMAPLUMINANCE, PREMODULATE) or an argument that is none. */
+static HRESULT STDMETHODCALLTYPE dev_ValidateDevice(Dev *d, DWORD *passes) {
+  for (UINT i = 0; i < STAGES; ++i) {
+    const DWORD *t = d->state.stage[i];
+    if (t[D3DTSS_COLOROP] == D3DTOP_DISABLE) break;
+    if (t[D3DTSS_COLOROP] == D3DTOP_BUMPENVMAP || t[D3DTSS_COLOROP] == D3DTOP_BUMPENVMAPLUMINANCE || t[D3DTSS_COLOROP] == D3DTOP_PREMODULATE || t[D3DTSS_COLOROP] > D3DTOP_LERP)
+      return D3DERR_UNSUPPORTEDCOLOROPERATION;
+    if (t[D3DTSS_ALPHAOP] == D3DTOP_BUMPENVMAP || t[D3DTSS_ALPHAOP] == D3DTOP_BUMPENVMAPLUMINANCE || t[D3DTSS_ALPHAOP] == D3DTOP_PREMODULATE || t[D3DTSS_ALPHAOP] > D3DTOP_LERP)
+      return D3DERR_UNSUPPORTEDALPHAOPERATION;
+    if ((t[D3DTSS_COLORARG1] & D3DTA_SELECTMASK) > D3DTA_CONSTANT || (t[D3DTSS_COLORARG2] & D3DTA_SELECTMASK) > D3DTA_CONSTANT) return D3DERR_UNSUPPORTEDCOLORARG;
+    if ((t[D3DTSS_ALPHAARG1] & D3DTA_SELECTMASK) > D3DTA_CONSTANT || (t[D3DTSS_ALPHAARG2] & D3DTA_SELECTMASK) > D3DTA_CONSTANT) return D3DERR_UNSUPPORTEDALPHAARG;
+  }
+  if (passes) *passes = 1;
+  return D3D_OK;
 }
-static HRESULT STDMETHODCALLTYPE dev_ValidateDevice(Dev *d, DWORD *passes) { (void)d; if (passes) *passes = 1; return D3D_OK; }
 
 /* ---- what is drawn into ----------------------------------------------------------------------------------------------------------------------------- */
 
-static Surface *surface_of(IDirect3DSurface9 *surface) {
-  if (!surface || ((DxObj *)surface)->lpVtbl != (const void *)&surf_vtbl) return NULL;
-  return (Surface *)surface;
-}
-static HRESULT STDMETHODCALLTYPE dev_GetBackBuffer(Dev *d, UINT chain, UINT index, D3DBACKBUFFER_TYPE type, IDirect3DSurface9 **out) {
-  (void)type;
-  if (!out) return D3DERR_INVALIDCALL;
-  *out = NULL;
-  if (chain != 0 || index != 0) return D3DERR_INVALIDCALL;
-  dx_AddRef(OBJ(d->back_surface));
-  *out = (IDirect3DSurface9 *)d->back_surface;
-  return D3D_OK;
-}
 static HRESULT STDMETHODCALLTYPE dev_SetRenderTarget(Dev *d, DWORD index, IDirect3DSurface9 *surface) {
   Surface *s = surface_of(surface);
-  if (index != 0) return surface ? D3DERR_INVALIDCALL : D3D_OK;
-  if (!s || !s->tex->target || s->level != 0) return D3DERR_INVALIDCALL;
+  if (index >= TARGETS || index >= 1u) return index == 0 || surface ? D3DERR_INVALIDCALL : D3D_OK;      /* (one target at a time: D3DCAPS9.NumSimultaneousRTs) */
+  if (!s || s->c.dev != d || !s->tex->target) return D3DERR_INVALIDCALL;
   EnterCriticalSection(&d->lock);
-  bind(&d->target, s);
-  /* (as Direct3D 9 does: the viewport becomes the whole of the new target) */
-  const D3DVIEWPORT9 viewport = {0, 0, s->tex->width, s->tex->height, 0.0f, 1.0f};
+  bind(&d->target[index], s);
+  /* (as Direct3D 9 does: the viewport and the scissor rectangle become the whole of the new target) */
+  const D3DVIEWPORT9 viewport = {0, 0, sub_width(s->tex, s->sub), sub_height(s->tex, s->sub), 0.0f, 1.0f};
   d->state.viewport = viewport;
-  SetRect(&d->state.scissor, 0, 0, (int)s->tex->width, (int)s->tex->height);
+  SetRect(&d->state.scissor, 0, 0, (int)viewport.Width, (int)viewport.Height);
   d->targets_dirty = 1;
   LeaveCriticalSection(&d->lock);
   return D3D_OK;
@@ -160,14 +199,15 @@ static HRESULT STDMETHODCALLTYPE dev_SetRenderTarget(Dev *d, DWORD index, IDirec
 static HRESULT STDMETHODCALLTYPE dev_GetRenderTarget(Dev *d, DWORD index, IDirect3DSurface9 **out) {
   if (!out) return D3DERR_INVALIDCALL;
   *out = NULL;
-  if (index != 0 || !d->target) return D3DERR_NOTFOUND;
-  dx_AddRef(OBJ(d->target));
-  *out = (IDirect3DSurface9 *)d->target;
+  if (index >= TARGETS) return D3DERR_INVALIDCALL;
+  if (!d->target[index]) return D3DERR_NOTFOUND;
+  child_AddRef(&d->target[index]->c);
+  *out = (IDirect3DSurface9 *)d->target[index];
   return D3D_OK;
 }
 static HRESULT STDMETHODCALLTYPE dev_SetDepthStencilSurface(Dev *d, IDirect3DSurface9 *surface) {
   Surface *s = surface_of(surface);
-  if (surface && (!s || !s->tex->depth)) return D3DERR_INVALIDCALL;
+  if (surface && (!s || s->c.dev != d || !s->tex->depth)) return D3DERR_INVALIDCALL;
   EnterCriticalSection(&d->lock);
   bind(&d->depth, s);
   d->targets_dirty = 1;
@@ -178,193 +218,163 @@ static HRESULT STDMETHODCALLTYPE dev_GetDepthStencilSurface(Dev *d, IDirect3DSur
   if (!out) return D3DERR_INVALIDCALL;
   *out = NULL;
   if (!d->depth) return D3DERR_NOTFOUND;
-  dx_AddRef(OBJ(d->depth));
+  child_AddRef(&d->depth->c);
   *out = (IDirect3DSurface9 *)d->depth;
   return D3D_OK;
 }
 
-/* ---- copies between surfaces ------------------------------------------------------------------------------------------------------------------------ */
+/* ---- the implicit swap chain, Reset ----------------------------------------------------------------------------------------------------------------- */
 
-/* The pixels of a surface in the program's memory, there if they were not; NULL when there is no memory for them. */
-static BYTE *surface_pixels(Surface *s) {
-  Tex *t = s->tex;
-  const UINT bytes = format_bytes(t->format);
-  if (!bytes) return NULL;
-  if (!t->shadow[s->level]) t->shadow[s->level] = mem_alloc((SIZE_T)level_size(t->width, s->level) * level_size(t->height, s->level) * bytes);
-  return t->shadow[s->level];
-}
-/* A target's pixels into a surface in memory of the same size (32 bits a pixel). */
-static HRESULT STDMETHODCALLTYPE dev_GetRenderTargetData(Dev *d, IDirect3DSurface9 *from, IDirect3DSurface9 *to) {
-  Surface *source = surface_of(from), *dest = surface_of(to);
-  if (!source || !dest || !source->tex->target || dest->tex->res || format_bytes(dest->tex->format) != 4) return D3DERR_INVALIDCALL;
-  const UINT w = level_size(dest->tex->width, dest->level), h = level_size(dest->tex->height, dest->level);
-  if (w != level_size(source->tex->width, source->level) || h != level_size(source->tex->height, source->level)) return D3DERR_INVALIDCALL;
-  BYTE *pixels = surface_pixels(dest);
-  if (!pixels) return E_OUTOFMEMORY;
-  EnterCriticalSection(&d->lock);
-  const HRESULT hr = tex_download(d, source->tex, source->level, pixels, w * 4);
-  LeaveCriticalSection(&d->lock);
-  return hr;
-}
-/* A surface in memory into one of a texture, whole and of the same size and format (the other cases are not there). */
-static HRESULT STDMETHODCALLTYPE dev_UpdateSurface(Dev *d, IDirect3DSurface9 *from, const RECT *rect, IDirect3DSurface9 *to, const POINT *point) {
-  Surface *source = surface_of(from), *dest = surface_of(to);
-  if (!source || !dest || rect || (point && (point->x || point->y)) || source->tex->format != dest->tex->format || !source->tex->shadow[source->level]) return D3DERR_INVALIDCALL;
-  const UINT w = level_size(dest->tex->width, dest->level), h = level_size(dest->tex->height, dest->level), bytes = format_bytes(dest->tex->format);
-  if (w != level_size(source->tex->width, source->level) || h != level_size(source->tex->height, source->level) || !bytes) return D3DERR_INVALIDCALL;
-  BYTE *pixels = surface_pixels(dest);
-  if (!pixels) return E_OUTOFMEMORY;
-  memcpy(pixels, source->tex->shadow[source->level], (SIZE_T)w * h * bytes);
-  EnterCriticalSection(&d->lock);
-  const HRESULT hr = tex_upload(d, dest->tex, dest->level);
-  LeaveCriticalSection(&d->lock);
-  return hr;
-}
-static HRESULT STDMETHODCALLTYPE dev_UpdateTexture(Dev *d, IDirect3DBaseTexture9 *from, IDirect3DBaseTexture9 *to) {
-  if (!from || !to || ((DxObj *)from)->lpVtbl != (const void *)&tex_vtbl || ((DxObj *)to)->lpVtbl != (const void *)&tex_vtbl) return D3DERR_INVALIDCALL;
-  Tex *source = (Tex *)from, *dest = (Tex *)to;
-  const UINT bytes = format_bytes(dest->format);
-  if (source->format != dest->format || source->width != dest->width || source->height != dest->height || !bytes) return D3DERR_INVALIDCALL;
-  HRESULT hr = D3D_OK;
-  EnterCriticalSection(&d->lock);
-  for (UINT level = 0; SUCCEEDED(hr) && level < dest->levels && level < source->levels; ++level) {
-    const SIZE_T size = (SIZE_T)level_size(dest->width, level) * level_size(dest->height, level) * bytes;
-    if (!source->shadow[level]) continue;
-    if (!dest->shadow[level]) dest->shadow[level] = mem_alloc(size);
-    if (!dest->shadow[level]) { hr = E_OUTOFMEMORY; break; }
-    memcpy(dest->shadow[level], source->shadow[level], size);
-    hr = tex_upload(d, dest, level);
-  }
-  LeaveCriticalSection(&d->lock);
-  return hr;
-}
-/* One target into another, whole and of one size (no stretching, no part). */
-static HRESULT STDMETHODCALLTYPE dev_StretchRect(Dev *d, IDirect3DSurface9 *from, const RECT *from_rect, IDirect3DSurface9 *to, const RECT *to_rect, D3DTEXTUREFILTERTYPE filter) {
-  (void)filter;
-  Surface *source = surface_of(from), *dest = surface_of(to);
-  if (!source || !dest || from_rect || to_rect || !source->tex->res || !dest->tex->res || source->tex->depth || dest->tex->depth || source->tex == dest->tex) return D3DERR_INVALIDCALL;
-  if (source->tex->levels != 1 || dest->tex->levels != 1 || source->tex->width != dest->tex->width || source->tex->height != dest->tex->height) return D3DERR_INVALIDCALL;
-  EnterCriticalSection(&d->lock);
-  ID3D12GraphicsCommandList_CopyResource(d->list, dest->tex->res, source->tex->res);
-  source->tex->used = dest->tex->used = d->epoch;
-  d->recorded = 1;
-  LeaveCriticalSection(&d->lock);
-  return D3D_OK;
-}
-static HRESULT STDMETHODCALLTYPE dev_ColorFill(Dev *d, IDirect3DSurface9 *surface, const RECT *rect, D3DCOLOR colour) {
-  Surface *s = surface_of(surface);
-  if (!s || rect || !s->tex->target) return D3DERR_INVALIDCALL;
-  const float c[4] = {((colour >> 16) & 255) / 255.0f, ((colour >> 8) & 255) / 255.0f, (colour & 255) / 255.0f, (colour >> 24) / 255.0f};
-  EnterCriticalSection(&d->lock);
-  ID3D12GraphicsCommandList_ClearRenderTargetView(d->list, s->tex->view, c, 0, NULL);
-  s->tex->used = d->epoch;
-  d->recorded = 1;
-  LeaveCriticalSection(&d->lock);
-  return D3D_OK;
-}
-
-/* ---- the back buffer and Present -------------------------------------------------------------------------------------------------------------------- */
-
-/* The device's own objects hold no reference of the device (they go with it). */
-static void forget_device_reference(Dev *d) { InterlockedDecrement(&d->o.ref); }
-static void take_device_reference(Dev *d) { InterlockedIncrement(&d->o.ref); }
-
+/* The device's swap chain and depth buffer go (Reset, the device's end). */
 static void targets_release(Dev *d) {
-  bind(&d->target, NULL);
+  for (UINT i = 0; i < TARGETS; ++i) bind(&d->target[i], NULL);
   bind(&d->depth, NULL);
   d->clear_count = 0;
-  if (d->back_surface) { take_device_reference(d); dx_Release(OBJ(d->back_surface)); d->back_surface = NULL; }
-  if (d->depth_surface) { take_device_reference(d); dx_Release(OBJ(d->depth_surface)); d->depth_surface = NULL; }
-  if (d->back) { take_device_reference(d); dx_Release(OBJ(d->back)); d->back = NULL; }
-  if (d->auto_depth) { take_device_reference(d); dx_Release(OBJ(d->auto_depth)); d->auto_depth = NULL; }
+  if (d->auto_depth) { Tex *t = d->auto_depth->tex; obj_free(OBJ(d->auto_depth)); obj_free(OBJ(t)); d->auto_depth = NULL; }
+  if (d->chain) { obj_free(OBJ(d->chain)); d->chain = NULL; }
 }
-/* Makes the back buffer (the Direct3D 12 queue's, as dxgi.dll's swap chains have theirs) and the depth buffer the parameters ask for. */
-static HRESULT targets_make(Dev *d) {
-  D3DPRESENT_PARAMETERS *pp = &d->present;
-  const HWND window = pp->hDeviceWindow ? pp->hDeviceWindow : d->creation.hFocusWindow;
-  if (pp->BackBufferWidth == 0 || pp->BackBufferHeight == 0) {
-    RECT client = {0, 0, 0, 0};
-    if (window) GetClientRect(window, &client);
-    if (!pp->BackBufferWidth) pp->BackBufferWidth = client.right > client.left ? (UINT)(client.right - client.left) : 8;
-    if (!pp->BackBufferHeight) pp->BackBufferHeight = client.bottom > client.top ? (UINT)(client.bottom - client.top) : 8;
-  }
-  if (pp->BackBufferWidth > 4096 || pp->BackBufferHeight > 4096) return D3DERR_INVALIDCALL;
-  if (pp->BackBufferFormat == D3DFMT_UNKNOWN) pp->BackBufferFormat = D3DFMT_X8R8G8B8;
-  if (format_bytes(pp->BackBufferFormat) != 4) pp->BackBufferFormat = D3DFMT_X8R8G8B8;      /* (the 16-bit modes: the buffer has 32 bits all the same) */
-  pp->BackBufferCount = 1;
-  ITcosPresenter *presenter = NULL;
-  IUnknown *made = NULL;
-  if (FAILED(ID3D12CommandQueue_QueryInterface(d->queue, &IID_ITcosPresenter, (void **)&presenter))) return D3DERR_NOTAVAILABLE;
-  HRESULT hr = presenter->lpVtbl->CreateBackBuffers(presenter, 1, pp->BackBufferWidth, pp->BackBufferHeight, DXGI_FORMAT_B8G8R8A8_UNORM, 0, &made);
-  presenter->lpVtbl->Release(presenter);
-  if (FAILED(hr) || !made) return D3DERR_NOTAVAILABLE;
-  hr = tex_make(d, pp->BackBufferWidth, pp->BackBufferHeight, 1, D3DUSAGE_RENDERTARGET, pp->BackBufferFormat, D3DPOOL_DEFAULT, FALSE, (ID3D12Resource *)made, &d->back);
-  made->lpVtbl->Release(made);
+/* Makes the implicit swap chain and the depth buffer the parameters ask for, and sets them. */
+static HRESULT targets_make(Dev *d, D3DPRESENT_PARAMETERS *pp) {
+  SwapChain *c = NULL;
+  HRESULT hr = chain_create(d, pp, 1, &c);
   if (FAILED(hr)) return hr;
-  forget_device_reference(d);
-  d->back_surface = surface_make(d, d->back, 0, 1);
-  if (!d->back_surface) return E_OUTOFMEMORY;
-  forget_device_reference(d);
-  bind(&d->target, d->back_surface);
+  d->chain = c;
+  bind(&d->target[0], c->surface[0]);
   if (pp->EnableAutoDepthStencil) {
-    hr = tex_make(d, pp->BackBufferWidth, pp->BackBufferHeight, 1, D3DUSAGE_DEPTHSTENCIL, format_is_depth(pp->AutoDepthStencilFormat) ? pp->AutoDepthStencilFormat : D3DFMT_D24S8,
-                  D3DPOOL_DEFAULT, FALSE, NULL, &d->auto_depth);
+    Tex *t = NULL;
+    hr = tex_make(d, pp->BackBufferWidth, pp->BackBufferHeight, 1, D3DUSAGE_DEPTHSTENCIL, pp->AutoDepthStencilFormat, D3DPOOL_DEFAULT, TEX_IMPLICIT, NULL, &t);
     if (FAILED(hr)) return hr;
-    forget_device_reference(d);
-    d->depth_surface = surface_make(d, d->auto_depth, 0, 1);
-    if (!d->depth_surface) return E_OUTOFMEMORY;
-    forget_device_reference(d);
-    bind(&d->depth, d->depth_surface);
+    d->auto_depth = surface_make(d, t, SURFACE_IMPLICIT, NULL);
+    if (!d->auto_depth) { obj_free(OBJ(t)); return E_OUTOFMEMORY; }
+    bind(&d->depth, d->auto_depth);
   }
+  display_devmode(&d->lost_mode);
   d->targets_dirty = 1;
   return D3D_OK;
 }
-
-static HRESULT STDMETHODCALLTYPE dev_Present(Dev *d, const RECT *source, const RECT *dest, HWND window_override, const RGNDATA *dirty) {
-  (void)source; (void)dest; (void)dirty;      /* (the whole back buffer, at the window's corner) */
-  const HWND window = window_override ? window_override : d->present.hDeviceWindow ? d->present.hDeviceWindow : d->creation.hFocusWindow;
-  const UINT w = d->back->width, h = d->back->height;
-  ITcosPresenter *presenter = NULL;
-  BYTE *pixels = mem_alloc((SIZE_T)w * h * 4);
-  if (!pixels) return E_OUTOFMEMORY;
-  if (FAILED(ID3D12CommandQueue_QueryInterface(d->queue, &IID_ITcosPresenter, (void **)&presenter))) { mem_free(pixels); return D3DERR_DEVICELOST; }
-  EnterCriticalSection(&d->lock);
-  flush(d);
-  const HRESULT hr = presenter->lpVtbl->ReadBackBuffer(presenter, (IUnknown *)d->back->res, pixels, w * 4);
-  LeaveCriticalSection(&d->lock);
-  presenter->lpVtbl->Release(presenter);
-  HDC dc = SUCCEEDED(hr) && window ? GetDC(window) : NULL;
-  if (dc) {
-    BITMAPINFO info;
-    memset(&info, 0, sizeof info);
-    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    info.bmiHeader.biWidth = (LONG)w;
-    info.bmiHeader.biHeight = -(LONG)h;      /* (top-down) */
-    info.bmiHeader.biPlanes = 1;
-    info.bmiHeader.biBitCount = 32;
-    info.bmiHeader.biCompression = BI_RGB;
-    SetDIBitsToDevice(dc, 0, 0, w, h, 0, 0, 0, h, pixels, &info, DIB_RGB_COLORS);
-    ReleaseDC(window, dc);
-  }
-  mem_free(pixels);
-  return SUCCEEDED(hr) ? D3D_OK : D3DERR_DEVICELOST;
-}
-
-static HRESULT STDMETHODCALLTYPE dev_Reset(Dev *d, D3DPRESENT_PARAMETERS *parameters) {
+/* Reset: new buffers of the new parameters and the state of a new device. A device that is not 9Ex is reset only when the program holds no resource of the
+ * default pool (and no additional swap chain): else it fails and stays lost. */
+static HRESULT device_reset(Dev *d, D3DPRESENT_PARAMETERS *parameters, const D3DDISPLAYMODEEX *mode) {
   if (!parameters) return D3DERR_INVALIDCALL;
+  HRESULT hr = present_parameters_check(d, parameters, d->creation.hFocusWindow);
+  if (FAILED(hr)) { if (!d->ex) d->lost = d->not_reset = 1; return hr; }
   EnterCriticalSection(&d->lock);
-  flush(d);
-  state_release(&d->state);
-  targets_release(d);
-  d->present = *parameters;
-  HRESULT hr = targets_make(d);
-  if (SUCCEEDED(hr)) {
-    state_defaults(&d->state, d->auto_depth != NULL, d->back->width, d->back->height);
-    *parameters = d->present;
+  /* (the program may hold no buffer of the swap chain, and - not 9Ex - no resource of the default pool) */
+  BOOL held = d->auto_depth && d->auto_depth->c.o.ref > 0;
+  for (UINT i = 0; d->chain && i < d->chain->count; ++i) held = held || d->chain->surface[i]->c.o.ref > 0;
+  if (held || (!d->ex && d->default_resources > 0)) {
+    d->lost = d->not_reset = 1;
+    LeaveCriticalSection(&d->lock);
+    return D3DERR_INVALIDCALL;
   }
+  flush(d);
+  if (d->recording) { obj_free(OBJ(d->recording)); dx_Release(OBJ(d)); d->recording = NULL; }
+  /* (a 9Ex device keeps its state through a reset, but for the viewport and the scissor rectangle, which become the new back buffer's) */
+  if (!d->ex) state_release(&d->state);
+  const BOOL was_fullscreen = d->chain && !d->chain->pp.Windowed;
+  targets_release(d);
+  if (was_fullscreen && parameters->Windowed) display_set(NULL);
+  D3DPRESENT_PARAMETERS pp = *parameters;
+  if (mode && !pp.Windowed) { pp.BackBufferWidth = mode->Width; pp.BackBufferHeight = mode->Height; pp.FullScreen_RefreshRateInHz = mode->RefreshRate; }
+  hr = targets_make(d, &pp);
+  if (SUCCEEDED(hr)) {
+    if (!d->ex) state_defaults(&d->state, d->auto_depth != NULL, pp.BackBufferWidth, pp.BackBufferHeight);
+    else {
+      d->state.viewport.X = d->state.viewport.Y = 0;
+      d->state.viewport.Width = pp.BackBufferWidth;
+      d->state.viewport.Height = pp.BackBufferHeight;
+      SetRect(&d->state.scissor, 0, 0, (int)pp.BackBufferWidth, (int)pp.BackBufferHeight);
+    }
+    *parameters = pp;
+    d->lost = d->not_reset = 0;
+  } else if (!d->ex) d->lost = d->not_reset = 1;
   d->in_scene = 0;
   LeaveCriticalSection(&d->lock);
-  return SUCCEEDED(hr) ? D3D_OK : D3DERR_INVALIDCALL;
+  return SUCCEEDED(hr) ? D3D_OK : hr == E_OUTOFMEMORY || hr == D3DERR_OUTOFVIDEOMEMORY ? hr : D3DERR_INVALIDCALL;
+}
+static HRESULT STDMETHODCALLTYPE dev_Reset(Dev *d, D3DPRESENT_PARAMETERS *parameters) { return device_reset(d, parameters, NULL); }
+/* (9Ex) ResetEx: a full-screen swap chain takes the mode given (which a windowed one must not have) */
+static HRESULT STDMETHODCALLTYPE dev_ResetEx(Dev *d, D3DPRESENT_PARAMETERS *parameters, D3DDISPLAYMODEEX *mode) {
+  if (!parameters) return D3DERR_INVALIDCALL;
+  if ((parameters->Windowed && mode) || (!parameters->Windowed && !mode)) return D3DERR_INVALIDCALL;
+  if (mode && (mode->Size != sizeof *mode || mode->Width != parameters->BackBufferWidth || mode->Height != parameters->BackBufferHeight)) return D3DERR_INVALIDCALL;
+  return device_reset(d, parameters, mode);
+}
+
+/* ---- the rest of IDirect3DDevice9Ex ----------------------------------------------------------------------------------------------------------------- */
+
+static HRESULT STDMETHODCALLTYPE dev_PresentEx(Dev *d, const RECT *src, const RECT *dst, HWND window, const RGNDATA *dirty, DWORD flags) {
+  if (!d->chain) return D3DERR_INVALIDCALL;
+  return chain_Present(d->chain, src, dst, window, dirty, flags);
+}
+static HRESULT STDMETHODCALLTYPE dev_GetGPUThreadPriority(Dev *d, INT *priority) {
+  if (!priority) return D3DERR_INVALIDCALL;
+  *priority = d->gpu_priority;
+  return D3D_OK;
+}
+/* The priority of the device's work against other devices' (-7 .. 7): kept; the kernel's queue runs work in order. */
+static HRESULT STDMETHODCALLTYPE dev_SetGPUThreadPriority(Dev *d, INT priority) {
+  if (priority < -7 || priority > 7) return D3DERR_INVALIDCALL;
+  d->gpu_priority = priority;
+  return D3D_OK;
+}
+static HRESULT STDMETHODCALLTYPE dev_WaitForVBlank(Dev *d, UINT chain) {
+  if (chain != 0) return D3DERR_INVALIDCALL;
+  wait_for_vblank(d, 1);
+  return D3D_OK;
+}
+/* Whether resources are in video memory: they all are (the device's textures are its own, the rest is sent when drawn). */
+static HRESULT STDMETHODCALLTYPE dev_CheckResourceResidency(Dev *d, IDirect3DResource9 **resources, UINT32 count) {
+  (void)d;
+  if (count > 65535 || (count && !resources)) return D3DERR_INVALIDCALL;
+  return D3D_OK;
+}
+/* The frames the device may be ahead of the display: 1 .. 30, 0 the default of 3. (The queue here runs each list before it returns: the device is never ahead.) */
+static HRESULT STDMETHODCALLTYPE dev_SetMaximumFrameLatency(Dev *d, UINT latency) {
+  if (latency > 30) return D3DERR_INVALIDCALL;
+  d->max_frame_latency = latency ? latency : 3;
+  return D3D_OK;
+}
+static HRESULT STDMETHODCALLTYPE dev_GetMaximumFrameLatency(Dev *d, UINT *latency) {
+  if (!latency) return D3DERR_INVALIDCALL;
+  *latency = d->max_frame_latency;
+  return D3D_OK;
+}
+/* CheckDeviceState: S_OK, or S_PRESENT_OCCLUDED for a window that cannot be seen (minimized, hidden, or a full-screen device not in front), or
+ * S_PRESENT_MODE_CHANGED when the display is in another mode than a full-screen swap chain's. */
+static HRESULT STDMETHODCALLTYPE dev_CheckDeviceState(Dev *d, HWND window) {
+  HWND w = window ? window : d->chain ? d->chain->window : NULL;
+  if (w && (!IsWindow(w))) return D3DERR_INVALIDCALL;
+  if (w && (IsIconic(w) || !IsWindowVisible(w))) return S_PRESENT_OCCLUDED;
+  if (d->chain && !d->chain->pp.Windowed) {
+    D3DDISPLAYMODEEX now;
+    display_current(&now);
+    if (now.Width != d->chain->mode.Width || now.Height != d->chain->mode.Height) return S_PRESENT_MODE_CHANGED;
+    HWND focus = d->creation.hFocusWindow ? d->creation.hFocusWindow : d->chain->window;
+    if (focus && GetForegroundWindow() != focus) return S_PRESENT_OCCLUDED;
+  }
+  return D3D_OK;
+}
+/* The kernel of a monochrome convolution (ComposeRects' filtering): kept; a row and a column of weights of the width and height, or the box filter for NULL. */
+static HRESULT STDMETHODCALLTYPE dev_SetConvolutionMonoKernel(Dev *d, UINT width, UINT height, float *rows, float *columns) {
+  if (width == 0 || height == 0 || width > 7 || height > 7) return D3DERR_INVALIDCALL;
+  d->conv_width = width;
+  d->conv_height = height;
+  for (UINT i = 0; i < width; ++i) d->conv_rows[i] = rows ? rows[i] : 1.0f / (float)width;
+  for (UINT i = 0; i < height; ++i) d->conv_columns[i] = columns ? columns[i] : 1.0f / (float)height;
+  return D3D_OK;
+}
+/* ComposeRects: rectangles of a D3DFMT_A1 surface (glyphs) composed into a target, as the D3DCOMPOSERECTDESC and D3DCOMPOSERECTDESTINATION vertex buffers say. The
+ * device has no D3DFMT_A1 surfaces (CheckDeviceFormat refuses the format), so there is no source a program could give: D3DERR_INVALIDCALL, as for any other
+ * surface. */
+static HRESULT STDMETHODCALLTYPE dev_ComposeRects(Dev *d, IDirect3DSurface9 *src, IDirect3DSurface9 *dst, IDirect3DVertexBuffer9 *src_descs, UINT count,
+                                                  IDirect3DVertexBuffer9 *dst_descs, D3DCOMPOSERECTSOP op, INT x, INT y) {
+  (void)x; (void)y;
+  Surface *s = surface_of(src), *t = surface_of(dst);
+  if (!s || !t || s->c.dev != d || t->c.dev != d || !vb_of(src_descs) || !vb_of(dst_descs) || count > 0xFFFF || op < D3DCOMPOSERECTS_COPY || op > D3DCOMPOSERECTS_NEG)
+    return D3DERR_INVALIDCALL;
+  if (s->tex->format != D3DFMT_A1) return D3DERR_INVALIDCALL;
+  return D3DERR_INVALIDCALL;
 }
 
 /* ---- making a device ---------------------------------------------------------------------------------------------------------------------------------- */
@@ -373,12 +383,19 @@ static void dev_destroy(DxObj *o) {
   Dev *d = (Dev *)o;
   InterlockedExchange(&d->o.ref, 1 << 20);      /* (the references given back below are not the last again) */
   if (d->list) flush(d);
+  if (d->recording) { obj_free(OBJ(d->recording)); d->recording = NULL; }
   state_release(&d->state);
   targets_release(d);
-  if (d->blank) { take_device_reference(d); dx_Release(OBJ(d->blank)); }
-  for (UINT k = 0; k < 4; ++k) if (d->blank_kind[k]) { take_device_reference(d); dx_Release(OBJ(d->blank_kind[k])); }
-  for (UINT i = 0; i < d->fixed_count; ++i) { take_device_reference(d); dx_Release(OBJ(d->fixed[i].shader)); }
+  if (d->cursor) DestroyCursor(d->cursor);
+  for (UINT i = 0; i < d->fvf_decl_count; ++i) obj_free(OBJ(d->fvf_decls[i].decl));
+  mem_free(d->fvf_decls);
+  if (d->blank) obj_free(OBJ(d->blank));
+  for (UINT k = 0; k < 4; ++k) if (d->blank_kind[k]) obj_free(OBJ(d->blank_kind[k]));
+  for (UINT i = 0; i < d->fixed_count; ++i) obj_free(OBJ(d->fixed[i].shader));
   for (UINT i = 0; i < d->pipeline_count; ++i) if (d->pipelines[i].state) ID3D12PipelineState_Release(d->pipelines[i].state);
+  queries_stop(d);
+  mem_free(d->palettes);
+  mem_free(d->palette_set);
   if (d->vertex_ring) ID3D12Resource_Release(d->vertex_ring);
   if (d->index_ring) ID3D12Resource_Release(d->index_ring);
   if (d->constant_ring) ID3D12Resource_Release(d->constant_ring);
@@ -408,8 +425,8 @@ static BOOL make_ring(Dev *d, UINT bytes, ID3D12Resource **ring, BYTE **data) {
   return TRUE;
 }
 
-/* The Direct3D 12 half of a device. */
-static HRESULT dev_start(Dev *d) {
+/* The Direct3D 12 half of a device, and its swap chain. */
+static HRESULT dev_start(Dev *d, D3DPRESENT_PARAMETERS *pp) {
   HRESULT hr = D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void **)&d->d12);
   if (FAILED(hr) || !d->d12) return D3DERR_NOTAVAILABLE;
   D3D12_COMMAND_QUEUE_DESC qd = {D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_PRIORITY_NORMAL, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
@@ -434,10 +451,12 @@ static HRESULT dev_start(Dev *d) {
     return E_OUTOFMEMORY;
   d->epoch = 1;
   d->targets_dirty = 1;
+  d->current_palette = 0xFFFF;
+  d->max_frame_latency = 3;
+  queries_start(d);
 
-  hr = tex_make(d, 1, 1, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, FALSE, NULL, &d->blank);
+  hr = tex_make(d, 1, 1, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, TEX_INTERNAL, NULL, &d->blank);
   if (FAILED(hr)) return hr;
-  forget_device_reference(d);
   d->blank->shadow[0] = mem_alloc(4);
   if (!d->blank->shadow[0]) return E_OUTOFMEMORY;
   memset(d->blank->shadow[0], 255, 4);
@@ -446,8 +465,7 @@ static HRESULT dev_start(Dev *d) {
   /* (and a white volume and cube, for samplers declared as those with nothing of their kind set; an adapter without them has none, and gets the 2D one) */
   for (UINT kind = 1; kind <= 3; kind += 2) {
     Tex *t = NULL;
-    if (FAILED(tex_make_kind(d, kind, 1, 1, 1, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, FALSE, NULL, &t))) continue;
-    forget_device_reference(d);
+    if (FAILED(tex_make_kind(d, kind, 1, 1, 1, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, TEX_INTERNAL, NULL, &t))) continue;
     d->blank_kind[kind] = t;
     for (UINT sub = 0; sub < tex_subresources(t); ++sub) {
       t->shadow[sub] = mem_alloc(4);
@@ -457,20 +475,20 @@ static HRESULT dev_start(Dev *d) {
       if (FAILED(hr)) return hr;
     }
   }
-  hr = targets_make(d);
+  hr = targets_make(d, pp);
   if (FAILED(hr)) return hr;
-  state_defaults(&d->state, d->auto_depth != NULL, d->back->width, d->back->height);
+  state_defaults(&d->state, d->auto_depth != NULL, pp->BackBufferWidth, pp->BackBufferHeight);
   return D3D_OK;
 }
 
 /* ---- the Direct3D object ------------------------------------------------------------------------------------------------------------------------------ */
 
-static HRESULT STDMETHODCALLTYPE d3d_RegisterSoftwareDevice(Direct3D *o, void *function) { (void)o; (void)function; return D3D_OK; }
+static HRESULT STDMETHODCALLTYPE d3d_RegisterSoftwareDevice(Direct3D *o, void *function) { (void)o; return function ? D3D_OK : D3DERR_INVALIDCALL; }
 static UINT STDMETHODCALLTYPE d3d_GetAdapterCount(Direct3D *o) { (void)o; return 1; }
 static HRESULT STDMETHODCALLTYPE d3d_GetAdapterIdentifier(Direct3D *o, UINT adapter, DWORD flags, D3DADAPTER_IDENTIFIER9 *id) {
-  (void)o; (void)flags;
+  (void)o;
   static const char driver[] = "d3d9.dll", description[] = "TheoryCraftOS Direct3D adapter", device[] = "\\\\.\\DISPLAY1";
-  if (adapter != 0 || !id) return D3DERR_INVALIDCALL;
+  if (adapter != 0 || !id || (flags & ~(DWORD)D3DENUM_WHQL_LEVEL)) return D3DERR_INVALIDCALL;
   memset(id, 0, sizeof *id);
   memcpy(id->Driver, driver, sizeof driver);
   memcpy(id->Description, description, sizeof description);
@@ -478,85 +496,177 @@ static HRESULT STDMETHODCALLTYPE d3d_GetAdapterIdentifier(Direct3D *o, UINT adap
   id->DriverVersion.QuadPart = 0x000A000000000000ll;
   id->VendorId = 0x1414;      /* (Microsoft's, as its software adapters have) */
   id->DeviceId = 0x008C;
+  /* (an identifier that stays the same for this adapter and driver: made of what describes them) */
+  static const GUID identifier = {0x7c0e5a10, 0x2d5e, 0x4a5d, {0x9a, 0x7e, 0x54, 0x43, 0x4f, 0x53, 0x09, 0x09}};
+  id->DeviceIdentifier = identifier;
+  id->WHQLLevel = (flags & D3DENUM_WHQL_LEVEL) ? 1 : 0;
   return D3D_OK;
 }
-static BOOL display_format(D3DFORMAT format) { return format == D3DFMT_X8R8G8B8 || format == D3DFMT_A8R8G8B8; }
-static UINT STDMETHODCALLTYPE d3d_GetAdapterModeCount(Direct3D *o, UINT adapter, D3DFORMAT format) { (void)o; return adapter == 0 && display_format(format) ? 1 : 0; }
+static UINT STDMETHODCALLTYPE d3d_GetAdapterModeCount(Direct3D *o, UINT adapter, D3DFORMAT format) { (void)o; return adapter == 0 ? display_mode_count(format) : 0; }
 static HRESULT STDMETHODCALLTYPE d3d_EnumAdapterModes(Direct3D *o, UINT adapter, D3DFORMAT format, UINT index, D3DDISPLAYMODE *mode) {
   (void)o;
-  if (adapter != 0 || !display_format(format) || index != 0 || !mode) return D3DERR_INVALIDCALL;
-  display_mode(mode);
-  mode->Format = format;
+  if (adapter != 0 || !mode) return D3DERR_INVALIDCALL;
+  if (!display_format(format)) return D3DERR_NOTAVAILABLE;
+  D3DDISPLAYMODEEX m;
+  if (!display_mode_at(format, index, &m)) return D3DERR_INVALIDCALL;
+  display_mode_plain(&m, mode);
   return D3D_OK;
 }
 static HRESULT STDMETHODCALLTYPE d3d_GetAdapterDisplayMode(Direct3D *o, UINT adapter, D3DDISPLAYMODE *mode) {
   (void)o;
   if (adapter != 0 || !mode) return D3DERR_INVALIDCALL;
-  display_mode(mode);
+  D3DDISPLAYMODEEX m;
+  display_current(&m);
+  display_mode_plain(&m, mode);
   return D3D_OK;
 }
-static HRESULT STDMETHODCALLTYPE d3d_CheckDeviceType(Direct3D *o, UINT adapter, D3DDEVTYPE type, D3DFORMAT display, D3DFORMAT back, BOOL windowed) {
-  (void)o; (void)type; (void)windowed;
-  if (adapter != 0) return D3DERR_INVALIDCALL;
-  return display_format(display) && (back == D3DFMT_UNKNOWN || display_format(back)) ? D3D_OK : D3DERR_NOTAVAILABLE;
+/* A back buffer format goes with a display format: the same pixels, or the same with alpha; windowed, any back buffer format the device has. */
+static BOOL backbuffer_on_display(D3DFORMAT display, D3DFORMAT back) {
+  if (back == display) return TRUE;
+  return (display == D3DFMT_X8R8G8B8 && back == D3DFMT_A8R8G8B8) || (display == D3DFMT_X1R5G5B5 && back == D3DFMT_A1R5G5B5);
 }
+static HRESULT STDMETHODCALLTYPE d3d_CheckDeviceType(Direct3D *o, UINT adapter, D3DDEVTYPE type, D3DFORMAT display, D3DFORMAT back, BOOL windowed) {
+  (void)o;
+  if (adapter != 0 || (type != D3DDEVTYPE_HAL && type != D3DDEVTYPE_REF && type != D3DDEVTYPE_SW)) return D3DERR_INVALIDCALL;
+  if (!display_format(display)) return windowed && display != D3DFMT_UNKNOWN ? D3DERR_NOTAVAILABLE : D3DERR_INVALIDCALL;
+  if (back == D3DFMT_UNKNOWN) return windowed ? D3D_OK : D3DERR_INVALIDCALL;
+  if (!backbuffer_format(back)) return D3DERR_NOTAVAILABLE;
+  return windowed || backbuffer_on_display(display, back) ? D3D_OK : D3DERR_NOTAVAILABLE;
+}
+/* What a format can be: a target, a depth buffer, a texture of the kinds, a volume; and what the device does with it (the D3DUSAGE_QUERY_* questions). */
 static HRESULT STDMETHODCALLTYPE d3d_CheckDeviceFormat(Direct3D *o, UINT adapter, D3DDEVTYPE type, D3DFORMAT display, DWORD usage, D3DRESOURCETYPE resource, D3DFORMAT format) {
-  (void)o; (void)type; (void)display;
+  (void)o; (void)type;
   if (adapter != 0) return D3DERR_INVALIDCALL;
-  if (resource != D3DRTYPE_SURFACE && resource != D3DRTYPE_TEXTURE && resource != D3DRTYPE_CUBETEXTURE && resource != D3DRTYPE_VOLUMETEXTURE) return D3DERR_NOTAVAILABLE;
-  const BOOL layered = resource == D3DRTYPE_CUBETEXTURE || resource == D3DRTYPE_VOLUMETEXTURE;      /* (sampled only: nothing draws into a cube or a volume here) */
-  if (usage & D3DUSAGE_DEPTHSTENCIL) return format_is_depth(format) && !layered ? D3D_OK : D3DERR_NOTAVAILABLE;
-  if (usage & D3DUSAGE_RENDERTARGET) return display_format(format) && !layered ? D3D_OK : D3DERR_NOTAVAILABLE;
-  if (dxt_block(format)) return resource != D3DRTYPE_VOLUMETEXTURE ? D3D_OK : D3DERR_NOTAVAILABLE;      /* (DXT1 .. DXT5: 2D textures and cubes) */
-  return format_bytes(format) ? D3D_OK : D3DERR_NOTAVAILABLE;
+  if (!display_format(display)) return D3DERR_NOTAVAILABLE;
+  if (resource == D3DRTYPE_VERTEXBUFFER) return format == D3DFMT_VERTEXDATA ? D3D_OK : D3DERR_NOTAVAILABLE;
+  if (resource == D3DRTYPE_INDEXBUFFER) return format == D3DFMT_INDEX16 || format == D3DFMT_INDEX32 ? D3D_OK : D3DERR_NOTAVAILABLE;
+  if (resource != D3DRTYPE_SURFACE && resource != D3DRTYPE_TEXTURE && resource != D3DRTYPE_CUBETEXTURE && resource != D3DRTYPE_VOLUMETEXTURE && resource != D3DRTYPE_VOLUME)
+    return D3DERR_INVALIDCALL;
+  const BOOL volume = resource == D3DRTYPE_VOLUMETEXTURE || resource == D3DRTYPE_VOLUME, cube = resource == D3DRTYPE_CUBETEXTURE;
+  const BOOL depth = format_is_depth(format), plain = format_bytes(format) != 0, block = dxt_block(format) != 0;
+  if (!depth && !plain && !block) return D3DERR_NOTAVAILABLE;
+  if ((usage & D3DUSAGE_DEPTHSTENCIL) && (!depth || volume || cube)) return D3DERR_NOTAVAILABLE;
+  if ((usage & D3DUSAGE_RENDERTARGET) && (!format_is_target(format) || volume || cube)) return D3DERR_NOTAVAILABLE;
+  if (depth && !(usage & D3DUSAGE_DEPTHSTENCIL) && resource != D3DRTYPE_SURFACE) return D3DERR_NOTAVAILABLE;
+  if (block && (volume || (usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)))) return D3DERR_NOTAVAILABLE;
+  if (format_is_palette(format) && (usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL | D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING))) return D3DERR_NOTAVAILABLE;
+  if (usage & (D3DUSAGE_DMAP | D3DUSAGE_QUERY_LEGACYBUMPMAP | D3DUSAGE_QUERY_SRGBREAD | D3DUSAGE_QUERY_SRGBWRITE | D3DUSAGE_QUERY_VERTEXTEXTURE)) return D3DERR_NOTAVAILABLE;
+  if ((usage & D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING) && !format_is_target(format)) return D3DERR_NOTAVAILABLE;
+  /* (the levels of a 2D texture are made from its top level; a cube's and a volume's are not kept: the texture is there, the levels are not made) */
+  if ((usage & D3DUSAGE_AUTOGENMIPMAP) && (block || depth || cube || volume)) return D3DOK_NOAUTOGEN;
+  return D3D_OK;
 }
 static HRESULT STDMETHODCALLTYPE d3d_CheckDeviceMultiSampleType(Direct3D *o, UINT adapter, D3DDEVTYPE type, D3DFORMAT format, BOOL windowed, D3DMULTISAMPLE_TYPE samples,
                                                                 DWORD *levels) {
-  (void)o; (void)type; (void)format; (void)windowed;
-  if (adapter != 0) return D3DERR_INVALIDCALL;
-  if (levels) *levels = samples == D3DMULTISAMPLE_NONE ? 1 : 0;
-  return samples == D3DMULTISAMPLE_NONE ? D3D_OK : D3DERR_NOTAVAILABLE;
+  (void)o; (void)type; (void)windowed;
+  if (adapter != 0 || (UINT)samples > D3DMULTISAMPLE_16_SAMPLES) return D3DERR_INVALIDCALL;
+  if (!format_is_target(format) && !format_is_depth(format)) { if (levels) *levels = 0; return D3DERR_NOTAVAILABLE; }
+  if (samples != D3DMULTISAMPLE_NONE) { if (levels) *levels = 0; return D3DERR_NOTAVAILABLE; }
+  if (levels) *levels = 1;
+  return D3D_OK;
 }
 static HRESULT STDMETHODCALLTYPE d3d_CheckDepthStencilMatch(Direct3D *o, UINT adapter, D3DDEVTYPE type, D3DFORMAT display, D3DFORMAT target, D3DFORMAT depth) {
-  (void)o; (void)type; (void)display;
+  (void)o; (void)type;
   if (adapter != 0) return D3DERR_INVALIDCALL;
-  return display_format(target) && format_is_depth(depth) ? D3D_OK : D3DERR_NOTAVAILABLE;
+  if (!display_format(display)) return D3DERR_NOTAVAILABLE;
+  return format_is_target(target) && format_is_depth(depth) ? D3D_OK : D3DERR_NOTAVAILABLE;
 }
+/* What StretchRect converts: from any colour format of a surface the device has into a target's format. */
 static HRESULT STDMETHODCALLTYPE d3d_CheckDeviceFormatConversion(Direct3D *o, UINT adapter, D3DDEVTYPE type, D3DFORMAT from, D3DFORMAT to) {
   (void)o; (void)type;
   if (adapter != 0) return D3DERR_INVALIDCALL;
-  return format_bytes(from) && display_format(to) ? D3D_OK : D3DERR_NOTAVAILABLE;
+  return format_bytes(from) && !format_is_palette(from) && format_is_target(to) ? D3D_OK : D3DERR_NOTAVAILABLE;
 }
 static HRESULT STDMETHODCALLTYPE d3d_GetDeviceCaps(Direct3D *o, UINT adapter, D3DDEVTYPE type, D3DCAPS9 *caps) {
-  (void)o; (void)type;
+  (void)o;
   if (adapter != 0 || !caps) return D3DERR_INVALIDCALL;
+  if (type != D3DDEVTYPE_HAL && type != D3DDEVTYPE_REF && type != D3DDEVTYPE_SW) return D3DERR_INVALIDCALL;
   caps_fill(caps);
+  caps->DeviceType = type;
   return D3D_OK;
 }
 static HMONITOR STDMETHODCALLTYPE d3d_GetAdapterMonitor(Direct3D *o, UINT adapter) {
   (void)o;
   return adapter == 0 ? MonitorFromWindow(GetDesktopWindow(), MONITOR_DEFAULTTOPRIMARY) : NULL;
 }
-static HRESULT STDMETHODCALLTYPE d3d_CreateDevice(Direct3D *o, UINT adapter, D3DDEVTYPE type, HWND focus, DWORD behaviour, D3DPRESENT_PARAMETERS *parameters, IDirect3DDevice9 **out) {
-  if (!out) return D3DERR_INVALIDCALL;
+static HRESULT device_create(Direct3D *o, UINT adapter, D3DDEVTYPE type, HWND focus, DWORD behaviour, D3DPRESENT_PARAMETERS *parameters, const D3DDISPLAYMODEEX *mode, int ex,
+                             Dev **out) {
   *out = NULL;
   if (adapter != 0 || !parameters || (type != D3DDEVTYPE_HAL && type != D3DDEVTYPE_REF && type != D3DDEVTYPE_SW)) return D3DERR_INVALIDCALL;
   if (!focus && !parameters->hDeviceWindow) return D3DERR_INVALIDCALL;
+  /* (exactly one way of processing vertices) */
+  const DWORD vp = behaviour & (D3DCREATE_SOFTWARE_VERTEXPROCESSING | D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MIXED_VERTEXPROCESSING);
+  if (vp != D3DCREATE_SOFTWARE_VERTEXPROCESSING && vp != D3DCREATE_HARDWARE_VERTEXPROCESSING && vp != D3DCREATE_MIXED_VERTEXPROCESSING) return D3DERR_INVALIDCALL;
+  if (ex && ((mode && parameters->Windowed) || (!mode && !parameters->Windowed))) return D3DERR_INVALIDCALL;
   Dev *d = mem_alloc(sizeof *d);
   if (!d) return E_OUTOFMEMORY;
-  dx_init(&d->o, &dev_vtbl, g_dev_iids, dev_destroy);
+  dx_init(&d->o, &dev_vtbl, ex ? g_dev_ex_iids : g_dev_iids, dev_destroy);
   InitializeCriticalSection(&d->lock);
   dx_AddRef(OBJ(o));
   d->parent = o;
+  d->ex = ex;
   d->creation.AdapterOrdinal = adapter;
   d->creation.DeviceType = type;
   d->creation.hFocusWindow = focus;
   d->creation.BehaviorFlags = behaviour;
-  d->present = *parameters;
-  const HRESULT hr = dev_start(d);
-  if (FAILED(hr)) { dx_Release(OBJ(d)); return hr == E_OUTOFMEMORY ? hr : D3DERR_NOTAVAILABLE; }
-  *parameters = d->present;      /* (the size and the format that were chosen) */
+  d->software_vp = vp == D3DCREATE_SOFTWARE_VERTEXPROCESSING;
+  D3DPRESENT_PARAMETERS pp = *parameters;
+  if (mode && !pp.Windowed) { pp.BackBufferWidth = mode->Width; pp.BackBufferHeight = mode->Height; pp.FullScreen_RefreshRateInHz = mode->RefreshRate; }
+  HRESULT hr = present_parameters_check(d, &pp, focus);
+  if (SUCCEEDED(hr)) hr = dev_start(d, &pp);
+  if (FAILED(hr)) { dx_Release(OBJ(d)); return hr == E_OUTOFMEMORY || hr == D3DERR_INVALIDCALL || hr == D3DERR_OUTOFVIDEOMEMORY ? hr : D3DERR_NOTAVAILABLE; }
+  *parameters = pp;      /* (the size and the format that were chosen) */
+  *out = d;
+  return D3D_OK;
+}
+static HRESULT STDMETHODCALLTYPE d3d_CreateDevice(Direct3D *o, UINT adapter, D3DDEVTYPE type, HWND focus, DWORD behaviour, D3DPRESENT_PARAMETERS *parameters, IDirect3DDevice9 **out) {
+  if (!out) return D3DERR_INVALIDCALL;
+  Dev *d = NULL;
+  const HRESULT hr = device_create(o, adapter, type, focus, behaviour, parameters, NULL, o->ex, &d);
   *out = (IDirect3DDevice9 *)d;
+  return hr;
+}
+/* (9Ex) */
+static HRESULT STDMETHODCALLTYPE d3d_CreateDeviceEx(Direct3D *o, UINT adapter, D3DDEVTYPE type, HWND focus, DWORD behaviour, D3DPRESENT_PARAMETERS *parameters, D3DDISPLAYMODEEX *mode,
+                                                   IDirect3DDevice9Ex **out) {
+  if (!out) return D3DERR_INVALIDCALL;
+  *out = NULL;
+  if (mode && mode->Size != sizeof *mode) return D3DERR_INVALIDCALL;
+  Dev *d = NULL;
+  const HRESULT hr = device_create(o, adapter, type, focus, behaviour, parameters, mode, 1, &d);
+  *out = (IDirect3DDevice9Ex *)d;
+  return hr;
+}
+static BOOL mode_filter_valid(const D3DDISPLAYMODEFILTER *filter) {
+  return filter && filter->Size == sizeof *filter && filter->ScanLineOrdering <= D3DSCANLINEORDERING_INTERLACED;
+}
+static UINT STDMETHODCALLTYPE d3d_GetAdapterModeCountEx(Direct3D *o, UINT adapter, const D3DDISPLAYMODEFILTER *filter) {
+  (void)o;
+  if (adapter != 0 || !mode_filter_valid(filter) || filter->ScanLineOrdering == D3DSCANLINEORDERING_INTERLACED) return 0;
+  return display_mode_count(filter->Format);
+}
+static HRESULT STDMETHODCALLTYPE d3d_EnumAdapterModesEx(Direct3D *o, UINT adapter, const D3DDISPLAYMODEFILTER *filter, UINT index, D3DDISPLAYMODEEX *mode) {
+  (void)o;
+  if (adapter != 0 || !mode_filter_valid(filter) || !mode || mode->Size != sizeof *mode) return D3DERR_INVALIDCALL;
+  if (!display_format(filter->Format)) return D3DERR_NOTAVAILABLE;
+  if (filter->ScanLineOrdering == D3DSCANLINEORDERING_INTERLACED || !display_mode_at(filter->Format, index, mode)) return D3DERR_INVALIDCALL;
+  return D3D_OK;
+}
+static HRESULT STDMETHODCALLTYPE d3d_GetAdapterDisplayModeEx(Direct3D *o, UINT adapter, D3DDISPLAYMODEEX *mode, D3DDISPLAYROTATION *rotation) {
+  (void)o;
+  if (adapter != 0 || (mode && mode->Size != sizeof *mode)) return D3DERR_INVALIDCALL;
+  if (mode) display_current(mode);
+  if (rotation) *rotation = display_rotation();
+  return D3D_OK;
+}
+/* The LUID of the adapter (the first of the kernel's, which D3D12CreateDevice takes for its default). */
+static HRESULT STDMETHODCALLTYPE d3d_GetAdapterLUID(Direct3D *o, UINT adapter, LUID *luid) {
+  (void)o;
+  if (adapter != 0 || !luid) return D3DERR_INVALIDCALL;
+  KmtAdapter adapters[1];
+  if (kmt_enum_adapters(adapters, 1, NULL) < 1) return D3DERR_NOTAVAILABLE;
+  *luid = adapters[0].luid;
+  kmt_close_adapter(adapters[0].handle);
   return D3D_OK;
 }
 
@@ -568,16 +678,20 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
   return TRUE;
 }
 
-EXPORT IDirect3D9 *WINAPI Direct3DCreate9(UINT sdk_version) {
-  (void)sdk_version;
+static Direct3D *direct3d_make(int ex) {
   Direct3D *o = mem_alloc(sizeof *o);
   if (!o) return NULL;
-  dx_init(&o->o, &d3d_vtbl, g_d3d_iids, NULL);
-  return (IDirect3D9 *)o;
+  dx_init(&o->o, &d3d_vtbl, ex ? g_d3d_ex_iids : g_d3d_iids, NULL);
+  o->ex = ex;
+  return o;
 }
-/* (the extended interfaces of Windows Vista: not there, a program takes the plain ones) */
+EXPORT IDirect3D9 *WINAPI Direct3DCreate9(UINT sdk_version) {
+  (void)sdk_version;
+  return (IDirect3D9 *)direct3d_make(0);
+}
 EXPORT HRESULT WINAPI Direct3DCreate9Ex(UINT sdk_version, IDirect3D9Ex **out) {
   (void)sdk_version;
-  if (out) *out = NULL;
-  return D3DERR_NOTAVAILABLE;
+  if (!out) return D3DERR_INVALIDCALL;
+  *out = (IDirect3D9Ex *)direct3d_make(1);
+  return *out ? D3D_OK : E_OUTOFMEMORY;
 }

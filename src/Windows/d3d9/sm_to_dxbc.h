@@ -65,7 +65,7 @@ typedef struct SmShader {
   int relative;                         /* ... through a0 as well */
   int bools_used;                       /* b0 .. b15 follow the floats */
   unsigned constant_registers;          /* all of cb0: the floats, the bools if used, and a pixel shader's state registers */
-  unsigned state_register;              /* a pixel shader: the first of its SM_STATE_REGISTERS state registers */
+  unsigned state_register;              /* the first of its state registers: a pixel shader's SM_STATE_REGISTERS, a vertex shader's SM_VS_STATE_REGISTERS */
   unsigned sampler_mask;
   uint8_t sampler_kind[16];             /* what each sampler of sampler_mask is: SM_SAMPLER_2D, SM_SAMPLER_VOLUME or SM_SAMPLER_CUBE (the kernel's TextureKind) */
   SmInput inputs[16];                   /* a vertex shader's declared inputs */
@@ -97,6 +97,9 @@ typedef struct SmShader {
 #define SM_STATE_FOG_SOURCE 4u          /* the factor is x * the vertex shader's + y * the linear + z * the exponential + w */
 
 /* The state registers of a draw with no alpha test and no fog. */
+/* The state register of a vertex shader, after its floats and bools: x, y what moves its position by half a pixel (times its w), so that the rasterizer's
+ * pixel centres, at halves, are where Direct3D 9 has them, at whole numbers: 1 / the viewport's width and -1 / its height. 0, 0 leaves the position as it is. */
+#define SM_VS_STATE_REGISTERS 1u
 static void sm_state_none(float state[SM_STATE_REGISTERS][4]) {
   memset(state, 0, sizeof(float) * 4 * SM_STATE_REGISTERS);
   state[SM_STATE_ALPHA][1] = 1.0f;
@@ -142,7 +145,8 @@ enum { DXT_TEMP = 0, DXT_INPUT = 1, DXT_OUTPUT = 2, DXT_IMMEDIATE = 4, DXT_SAMPL
 #define DX_TEMP_ADDRESS 32u             /* the integer copy of a0 */
 #define DX_TEMP_SCRATCH 33u             /* 33 .. 37: what a translated instruction needs for itself */
 #define DX_TEMP_COLOUR 38u              /* a pixel shader's colour (oC0) until its end */
-#define DX_TEMPS 39u
+#define DX_TEMP_POSITION 39u            /* a vertex shader's position (oPos) until its end */
+#define DX_TEMPS 40u
 #define DX_INPUT_POSITION 16u           /* a pixel shader's position, declared as such */
 #define DX_TEMP_PS1_TEXTURE 8u          /* a pixel shader 1.1 to 1.3: 8 .. 13 are its t0 .. t5 */
 #define DX_TEMP_PS1_SOURCE 16u          /* ... 16 .. 19: a source with one of its modifiers, worked out */
@@ -366,6 +370,10 @@ static int sm_destination(SmContext *c, const SmParam *p, DxOperand *o) {
   }
   if (slot >= SM_SLOTS) return SM_UNSUPPORTED;
   s->varying_mask |= 1u << slot;
+  if (slot == SM_SLOT_POSITION) {      /* (the end of the shader moves it by half a pixel, and writes it out) */
+    *o = dx_dst(DXT_TEMP, DX_TEMP_POSITION, p->mask);
+    return SM_OK;
+  }
   *o = dx_dst(DXT_OUTPUT, slot, p->mask);
   return SM_OK;
 }
@@ -950,6 +958,11 @@ static int sm_translate(const uint32_t *tokens, size_t available, SmShader *out,
   if (out->major < 1 || out->major > 3) return SM_INVALID;
   if (!out->vertex && out->major == 1 && (out->minor < 1 || out->minor > 4)) return SM_INVALID;
   if (available > SM_MAX_TOKENS) available = SM_MAX_TOKENS;
+  /* (a vertex shader below 3.0 whose oD0 is not written gives white, as Direct3D 9 has it: it starts written so) */
+  if (out->vertex && out->major < 3) {
+    sm_emit2(c, DXO_MOV, 0, dx_dst(DXT_OUTPUT, SM_SLOT_COLOR, 0xF), dx_immediate(1, 1, 1, 1));
+    out->varying_mask |= 1u << SM_SLOT_COLOR;
+  }
 
   while (at < available) {
     const uint32_t t = tokens[at];
@@ -1037,9 +1050,14 @@ static int sm_translate(const uint32_t *tokens, size_t available, SmShader *out,
     if (c->failed) return SM_UNSUPPORTED;      /* (too long) */
   }
   if (!ended) return SM_INVALID;
-  if (!out->vertex) {      /* (a pixel shader's state registers come after its floats and bools, which are all known now) */
-    out->state_register = out->float_registers + (out->bools_used ? SM_BOOL_REGISTERS : 0u);
-    sm_pixel_end(c, out->state_register);
+  /* (the state registers come after the floats and bools, which are all known now - all 224 of a vertex shader that addresses them through a0) */
+  out->state_register = (out->vertex && out->relative ? SM_RELATIVE_REGISTERS : out->float_registers) + (out->bools_used ? SM_BOOL_REGISTERS : 0u);
+  if (!out->vertex) sm_pixel_end(c, out->state_register);
+  else if (out->varying_mask & 1u) {
+    /* the position out, moved by half a pixel: xy + (state.xy * w) */
+    sm_emit4(c, DXO_MAD, 0, dx_dst(DXT_OUTPUT, SM_SLOT_POSITION, 0x3), dx_temp(DX_TEMP_POSITION, SM_SWIZZLE_OF(3)), dx_constant(out->state_register, DX_SWIZZLE_XYZW, 0, 0, 0),
+             dx_temp(DX_TEMP_POSITION, DX_SWIZZLE_XYZW));
+    sm_emit2(c, DXO_MOV, 0, dx_dst(DXT_OUTPUT, SM_SLOT_POSITION, 0xC), dx_temp(DX_TEMP_POSITION, DX_SWIZZLE_XYZW));
   }
   sm_emit(c, DXO_RET, 0, NULL, 0);
   if (c->failed) return SM_UNSUPPORTED;
@@ -1050,7 +1068,7 @@ static int sm_translate(const uint32_t *tokens, size_t available, SmShader *out,
     if (out->float_registers > SM_RELATIVE_REGISTERS) return SM_UNSUPPORTED;
     out->float_registers = SM_RELATIVE_REGISTERS;
   }
-  out->constant_registers = out->float_registers + (out->bools_used ? SM_BOOL_REGISTERS : 0u) + (out->vertex ? 0u : SM_STATE_REGISTERS);
+  out->constant_registers = out->float_registers + (out->bools_used ? SM_BOOL_REGISTERS : 0u) + (out->vertex ? SM_VS_STATE_REGISTERS : SM_STATE_REGISTERS);
   if (out->constant_registers > 256) return SM_UNSUPPORTED;
   for (unsigned i = 0; i < c->bool_words; ++i) c->code[c->bool_word[i]] += out->float_registers;      /* (the bools' elements were written as their numbers) */
 

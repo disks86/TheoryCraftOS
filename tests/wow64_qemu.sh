@@ -54,7 +54,7 @@ for path in sorted(glob.glob("tests/data/dxbc/*.dxbc") + glob.glob("tests/data/d
 PY
 i686-w64-mingw32-gcc -O1 -I "$work" -o "$work/dx32.exe" tests/windows/dx32.c -ldxgi -ld3d12 -luuid -lgdi32
 i686-w64-mingw32-gcc -O1 -I "$work" -o "$work/d3d11test.exe" tests/windows/d3d11test.c -ld3d11 -ld3d12 -ldxgi -luuid -ldxguid -luser32
-i686-w64-mingw32-gcc -O1 -o "$work/d3d9test.exe" tests/windows/d3d9test.c -ld3d9 -luser32
+i686-w64-mingw32-gcc -O1 -o "$work/d3d9test.exe" tests/windows/d3d9test.c -ld3d9 -luser32 -lgdi32
 # (com32's interfaces: the type library is a resource of the program, the header and the identifiers are generated)
 widl -m32 -I /usr/include/wine/windows -t -T "$work/com32.tlb" -h -H "$work/com32_h.h" -u -U "$work/com32_i.c" tests/windows/com32.idl
 (cd "$work" && echo '1 TYPELIB "com32.tlb"' | i686-w64-mingw32-windres -o com32res.o)
