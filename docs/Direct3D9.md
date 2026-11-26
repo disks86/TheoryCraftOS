@@ -140,7 +140,7 @@ every kind of argument, eight stages, the temporary register, and 3000 set-ups p
 is off, no texture passes on, what is not read is not in the key); keys of any bytes, buffers that are too small, and shaders shortened
 or with a bit turned.
 
-`tests/windows/d3d9test.c` (157 checks): the Direct3D object and the adapter, a device on a window, clears, vertices that are pixels (to
+`tests/windows/d3d9test.c` (320 checks, with `d3d9test_api.inc`): the Direct3D object and the adapter, a device on a window, clears, vertices that are pixels (to
 the pixel) and vertices through the matrices, vertex and index buffers, culling, fans, textures of 32 and 16 bits, the stage operations,
 the alpha test, blending, depth, the scissor rectangle, state blocks, the program's shaders (a vertex shader with the fixed-function pixel
 stage, vertex and pixel shaders of 1.1, 2.0 and 3.0 from FVF vertices and from a vertex buffer through a declaration, constants of both
@@ -148,6 +148,16 @@ stages, a pixel shader that samples and discards, a pixel shader after the fixed
 with each kind of function and its fog by the pixel's depth (by z, and by w under a perspective projection) and by the vertex (also by the distance: range fog; and by what vertices that are pixels bring - their w, and the factor in the second colour's alpha), drawing into a texture and sampling it, `GetRenderTargetData`,
 `Present`, `Reset`, lighting (the lights kept and read back, ambient, a directional light by its angle, the colour sources, normals through the world matrix, a point light's distance and range, a spotlight's cone, the specular colour lit and unlit), texture coordinates (a texture matrix that moves and scales, projection, the set a stage reads, coordinates generated from the position), the texture stages (three and eight stages in a row, a stage with no texture and one switched off, every kind of argument, the operations that multiply, add, subtract, blend and take three arguments, the dot product, the temporary register, the alpha through the stages, the specular colour after them, and eighty set-ups one after the other - more than the device keeps shaders and pipelines for), and that everything is gone with its last reference. Also cube and volume textures (each face and slice
 sampled by a program's pixel shader, a face filled through its surface, a cube sampler with nothing set) and DXT1, DXT3 and DXT5 textures.
+`d3d9test_api.inc` adds the device's API beyond drawing, each part checking that the device's references are as they were after it: clears
+of rectangles, ColorFill, StretchRect and UpdateSurface of parts and between sizes, UpdateTexture, GetDC, additional swap chains and their
+buffers, the front buffer, gamma and the cursor, palettes, the levels of textures as objects, private data, the kinds of state blocks and
+recording, every kind of query, the device's other methods, vertex blending and tweening, the wide formats (a float target keeps 2.0; R32F,
+G16R16 and A2R10G10B10 sampled), levels and cube faces as targets, two targets at once with their own write masks, the write mask without
+blending, `ProcessVertices` (pixels, clipping, the clip status, lighting, `D3DPV_DONOTCOPYDATA`), indexed draws with no index buffer, what the
+UP draws leave of stream 0, a texture target smaller than the depth buffer, and 9Ex (devices, `ResetEx`, `PresentEx`, shared textures
+between two devices, the Ex methods).
+The fast loop is the host CPU emulator: `tests/emulated_dx.sh tests/windows/d3d9test.c` (the real kernel's Direct3D on its CPU renderer, in
+a host process); Wine's d3d9 tests run the same way (tests/windows/wine/README.md).
 Run in the real kernel on its CPU renderer: `tests/wow64_qemu.sh d3d9test` (32-bit) and `GPU=std tests/d3d12_qemu.sh d3d9test` (64-bit), and on
 the 3D hardware: `tests/d3d12_qemu.sh d3d9test`. All pass on the CPU renderer; on virgl all but one of the fog checks (vertices that are
 pixels with a 1 / w of 0, which should count as 1) - not looked into yet. `DxgkrnlTest` checks that the kernel compiles the

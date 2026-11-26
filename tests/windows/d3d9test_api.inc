@@ -318,6 +318,7 @@ static void test_front_buffer_gamma_cursor(void) {
         IDirect3DDevice9_GetFrontBufferData(g_device, 0, front) == D3D_OK, "GetFrontBufferData into a surface of the display's size");
   if (front) {
     const DWORD p = surface_pixel(front, corner.x + 8, corner.y + 8);
+    if ((p & 0xFFFFFF) != 0x4080C0 || (p >> 24) != 0xFF) printf("d3d9test: the front buffer at (%ld, %ld) of %ux%u: %08lx\n", corner.x + 8, corner.y + 8, mode.Width, mode.Height, p);
     check((p & 0xFFFFFF) == 0x4080C0 && (p >> 24) == 0xFF, "... the picture shown is where the window is");
     IDirect3DSurface9_Release(front);
   }
@@ -559,6 +560,7 @@ static void test_device_misc(void) {
   IDirect3DTexture9 *big = NULL;
   IDirect3DDevice9_CreateTexture(g_device, 1024, 1024, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &big, NULL);
   const UINT after = IDirect3DDevice9_GetAvailableTextureMem(g_device);
+  if (!(before > (64u << 20) && (before & 0xFFFFF) == 0 && after <= before - (4u << 20))) printf("d3d9test: GetAvailableTextureMem %u then %u\n", before, after);
   check(before > (64u << 20) && (before & 0xFFFFF) == 0 && after <= before - (4u << 20), "GetAvailableTextureMem: in megabytes, less by what a texture takes");
   if (big) IDirect3DTexture9_Release(big);
   check(IDirect3DDevice9_EvictManagedResources(g_device) == D3D_OK, "EvictManagedResources");

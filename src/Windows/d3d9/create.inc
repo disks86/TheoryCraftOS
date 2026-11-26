@@ -120,6 +120,7 @@ static HRESULT surface_create(Dev *d, UINT width, UINT height, DWORD usage, D3DF
   if (!out) return D3DERR_INVALIDCALL;
   *out = NULL;
   if (samples != D3DMULTISAMPLE_NONE) return D3DERR_INVALIDCALL;      /* (CheckDeviceMultiSampleType: no multisampling here, of any kind) */
+  if (dxt_block(format) && ((width & 3) || (height & 3))) return D3DERR_INVALIDCALL;      /* (a compressed surface of its own is whole blocks; a texture's levels need not be) */
   if (!shared) return surface_alone(d, width, height, usage, format, pool, flags, samples, quality, out);
   if (!d->ex) return D3DERR_INVALIDCALL;
   if (pool == D3DPOOL_SYSTEMMEM) {

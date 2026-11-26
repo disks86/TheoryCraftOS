@@ -170,7 +170,7 @@ static HRESULT present_parameters_check(Dev *d, const D3DPRESENT_PARAMETERS *pp,
   if (pp->BackBufferCount > (ex ? 30u : 3u)) return D3DERR_INVALIDCALL;
   if (pp->SwapEffect == D3DSWAPEFFECT_COPY && pp->BackBufferCount > 1) return D3DERR_INVALIDCALL;
   if (pp->SwapEffect == D3DSWAPEFFECT_FLIPEX && pp->BackBufferCount < 1) return D3DERR_INVALIDCALL;
-  if (!pp->hDeviceWindow && !focus) return D3DERR_INVALIDCALL;
+  if (!pp->hDeviceWindow && !focus && !(ex && pp->Windowed)) return D3DERR_INVALIDCALL;      /* (a windowed 9Ex device may have no window: PresentEx names one) */
   if (pp->MultiSampleType != D3DMULTISAMPLE_NONE) return D3DERR_INVALIDCALL;
   if (pp->Flags & ~(DWORD)(D3DPRESENTFLAG_LOCKABLE_BACKBUFFER | D3DPRESENTFLAG_DISCARD_DEPTHSTENCIL | D3DPRESENTFLAG_DEVICECLIP | D3DPRESENTFLAG_VIDEO |
                            D3DPRESENTFLAG_NOAUTOROTATE | D3DPRESENTFLAG_UNPRUNEDMODE | D3DPRESENTFLAG_OVERLAY_LIMITEDRGB | D3DPRESENTFLAG_OVERLAY_YCbCr_BT709 |
@@ -328,6 +328,13 @@ static HRESULT chain_present(SwapChain *c, const RECT *src, const RECT *dst, HWN
   (void)flags;
   if (!c->count) return D3DERR_INVALIDCALL;
   const HWND window = override ? override : c->window;
+  if (!window) {      /* (a 9Ex device with no window, presenting to none: the buffers go round, nothing is shown) */
+    EnterCriticalSection(&d->lock);
+    flush(d);
+    chain_flip(d, c);
+    LeaveCriticalSection(&d->lock);
+    return D3D_OK;
+  }
   const UINT w = c->pp.BackBufferWidth, h = c->pp.BackBufferHeight;
   if (!c->pixels || c->pixel_bytes < (SIZE_T)w * h * 4) {
     mem_free(c->pixels);

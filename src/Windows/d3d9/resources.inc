@@ -383,7 +383,8 @@ static HRESULT tex_make_kind(Dev *d, UINT kind, UINT width, UINT height, UINT sl
   *out = NULL;
   const BOOL depth = format_is_depth(format), memory_only = (flags & TEX_MEMORY) != 0;
   if (width == 0 || height == 0 || width > 4096 || height > 4096 || (!depth && !format_bytes(format) && !dxt_block(format))) return D3DERR_INVALIDCALL;
-  if (dxt_block(format) && (kind == 1 || (usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)) || existing)) return D3DERR_NOTAVAILABLE;      /* (compressed: sampled 2D textures and cubes) */
+  /* (compressed: sampled 2D textures and cubes, and volumes of the scratch pool, which the device never sees; Windows answers D3DERR_INVALIDCALL for the others) */
+  if (dxt_block(format) && ((kind == 1 && pool != D3DPOOL_SCRATCH) || (usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)) || existing)) return D3DERR_INVALIDCALL;
   if (kind == 1 && (slices == 0 || slices > 256)) return D3DERR_INVALIDCALL;
   if (kind == 3 && width != height) return D3DERR_INVALIDCALL;
   if (depth && (usage & D3DUSAGE_RENDERTARGET)) return D3DERR_INVALIDCALL;      /* (a depth format is no colour target: CreateRenderTarget(D3DFMT_D16) is refused) */
@@ -514,9 +515,14 @@ static HRESULT tex_lock(Tex *t, UINT sub, D3DLOCKED_RECT *out, const RECT *rect,
   if (t->depth && !format_depth_lockable(t->format)) return D3DERR_INVALIDCALL;
   if (!t->depth && !bytes && !block) return D3DERR_INVALIDCALL;
   const UINT w = sub_width(t, sub), h = sub_height(t, sub);
+  /* (Direct3D 9 checks the rectangle of a compressed level only in the default pool: in the others any rectangle locks - Wine's test_surface_blocks
+   * holds what Windows does -, and one that is not inside the level, or not on its blocks, hands out the level's first block) */
+  BOOL rect_inside = TRUE;
   if (rect) {
-    if (rect->left < 0 || rect->top < 0 || rect->right > (LONG)w || rect->bottom > (LONG)h || rect->left >= rect->right || rect->top >= rect->bottom) return D3DERR_INVALIDCALL;
-    if (block && ((rect->left & 3) || (rect->top & 3) || ((rect->right & 3) && rect->right != (LONG)w) || ((rect->bottom & 3) && rect->bottom != (LONG)h))) return D3DERR_INVALIDCALL;
+    rect_inside = rect->left >= 0 && rect->top >= 0 && rect->right <= (LONG)w && rect->bottom <= (LONG)h && rect->left < rect->right && rect->top < rect->bottom;
+    const BOOL on_blocks = !block || (!(rect->left & 3) && !(rect->top & 3) && (!(rect->right & 3) || rect->right == (LONG)w) && (!(rect->bottom & 3) || rect->bottom == (LONG)h));
+    if ((!rect_inside || !on_blocks) && (!block || t->pool == D3DPOOL_DEFAULT)) return D3DERR_INVALIDCALL;
+    if (!on_blocks) rect_inside = FALSE;
   }
   for (UINT i = 0; i < MAX_SUBS; ++i)
     if (t->surface[i] && t->surface[i]->dc && i == sub) return D3DERR_INVALIDCALL;      /* (a surface with its DC out) */
@@ -528,10 +534,11 @@ static HRESULT tex_lock(Tex *t, UINT sub, D3DLOCKED_RECT *out, const RECT *rect,
   LeaveCriticalSection(&d->lock);
   if (FAILED(hr)) return hr;
   t->locked[sub] = flags | 0x80000000u;
-  if (!(flags & (D3DLOCK_READONLY | D3DLOCK_NO_DIRTY_UPDATE)) && sub_level(t, sub) == 0) tex_add_dirty(t, t->kind == 3 ? sub_face(t, sub) : 0, 0, rect);
+  if (!(flags & (D3DLOCK_READONLY | D3DLOCK_NO_DIRTY_UPDATE)) && sub_level(t, sub) == 0) tex_add_dirty(t, t->kind == 3 ? sub_face(t, sub) : 0, 0, rect_inside ? rect : NULL);
   out->Pitch = (INT)format_pitch(t->format, w);
   /* (a rectangle of a compressed level starts at its block) */
-  const SIZE_T row = rect ? (SIZE_T)(block ? (UINT)rect->top / 4 : (UINT)rect->top) : 0, column = rect ? (block ? (SIZE_T)rect->left / 4 * block : (SIZE_T)rect->left * bytes) : 0;
+  const BOOL at_rect = rect && rect_inside;
+  const SIZE_T row = at_rect ? (SIZE_T)(block ? (UINT)rect->top / 4 : (UINT)rect->top) : 0, column = at_rect ? (block ? (SIZE_T)rect->left / 4 * block : (SIZE_T)rect->left * bytes) : 0;
   out->pBits = t->shadow[sub] + row * (SIZE_T)out->Pitch + column;
   return D3D_OK;
 }
