@@ -21,6 +21,34 @@
 
 /* ---- what the device can do -------------------------------------------------------------------------------------------------------------------------- */
 
+/* Whether the kernel keeps the levels of every image - of cubes and volumes too - on the adapter (graphics::kFeature2MipmappedLayers: the CPU renderer, virgl). */
+/* What the kernel's 3D device can do (its features words), asked once: bit 10 of features2 is mipmapped layers (the levels of cubes and volumes), bit 5 of
+ * features several render targets at once. */
+static volatile LONG g_adapter_known;      /* (0 not asked yet, 1 asked) */
+static UINT g_adapter_features, g_adapter_features2;
+static void adapter_features(void) {
+  if (g_adapter_known) return;
+  KmtAdapter adapters[1];
+  KmtCaps caps;
+  memset(&caps, 0, sizeof caps);
+  if (kmt_enum_adapters(adapters, 1, NULL) >= 1) {
+    if (KMT_OK(kmt_adapter_caps(adapters[0].handle, &caps))) {
+      g_adapter_features = caps.features;
+      g_adapter_features2 = caps.features2;
+    }
+    kmt_close_adapter(adapters[0].handle);
+  }
+  InterlockedExchange(&g_adapter_known, 1);
+}
+static int adapter_mipmapped_layers(void) {
+  adapter_features();
+  return (g_adapter_features2 & (1u << 10)) != 0;
+}
+/* The render targets a draw writes at once: 4 where the kernel draws into several (D3DCAPS9.NumSimultaneousRTs), else 1. */
+static UINT adapter_targets(void) {
+  adapter_features();
+  return (g_adapter_features & (1u << 5)) ? TARGETS : 1u;
+}
 static void caps_fill(D3DCAPS9 *caps) {
   memset(caps, 0, sizeof *caps);
   caps->DeviceType = D3DDEVTYPE_HAL;
@@ -50,6 +78,8 @@ static void caps_fill(D3DCAPS9 *caps) {
   caps->ShadeCaps = D3DPSHADECAPS_COLORGOURAUDRGB | D3DPSHADECAPS_ALPHAGOURAUDBLEND | D3DPSHADECAPS_SPECULARGOURAUDRGB | D3DPSHADECAPS_FOGGOURAUD;
   caps->TextureCaps = D3DPTEXTURECAPS_ALPHA | D3DPTEXTURECAPS_MIPMAP | D3DPTEXTURECAPS_PERSPECTIVE | D3DPTEXTURECAPS_PROJECTED | D3DPTEXTURECAPS_CUBEMAP | D3DPTEXTURECAPS_VOLUMEMAP |
                       D3DPTEXTURECAPS_ALPHAPALETTE | D3DPTEXTURECAPS_TEXREPEATNOTSCALEDBYSIZE;
+  /* (the levels of cubes and volumes: where the kernel keeps the levels of every image) */
+  if (adapter_mipmapped_layers()) caps->TextureCaps |= D3DPTEXTURECAPS_MIPCUBEMAP | D3DPTEXTURECAPS_MIPVOLUMEMAP;
   caps->TextureFilterCaps = caps->CubeTextureFilterCaps = caps->VolumeTextureFilterCaps =
       D3DPTFILTERCAPS_MINFPOINT | D3DPTFILTERCAPS_MINFLINEAR | D3DPTFILTERCAPS_MAGFPOINT | D3DPTFILTERCAPS_MAGFLINEAR | D3DPTFILTERCAPS_MIPFPOINT | D3DPTFILTERCAPS_MIPFLINEAR;
   caps->TextureFilterCaps |= D3DPTFILTERCAPS_MINFANISOTROPIC;
@@ -82,7 +112,9 @@ static void caps_fill(D3DCAPS9 *caps) {
   caps->MaxStreams = STREAMS;
   caps->MaxStreamStride = 508;
   caps->MaxPointSize = MAX_POINT_SIZE;
-  caps->NumSimultaneousRTs = 1;
+  caps->NumSimultaneousRTs = adapter_targets();
+  if (caps->NumSimultaneousRTs > 1)      /* (each target its own write mask and format; blending and the alpha test on all of them) */
+    caps->PrimitiveMiscCaps |= D3DPMISCCAPS_INDEPENDENTWRITEMASKS | D3DPMISCCAPS_MRTINDEPENDENTBITDEPTHS | D3DPMISCCAPS_MRTPOSTPIXELSHADERBLENDING;
   caps->MasterAdapterOrdinal = caps->AdapterOrdinal = 0;
   caps->NumberOfAdaptersInGroup = 1;
   caps->DeclTypes = D3DDTCAPS_UBYTE4 | D3DDTCAPS_UBYTE4N | D3DDTCAPS_SHORT2N | D3DDTCAPS_SHORT4N | D3DDTCAPS_USHORT2N | D3DDTCAPS_USHORT4N | D3DDTCAPS_FLOAT16_2 | D3DDTCAPS_FLOAT16_4 | D3DDTCAPS_UDEC3 | D3DDTCAPS_DEC3N;
@@ -184,10 +216,22 @@ static HRESULT STDMETHODCALLTYPE dev_ValidateDevice(Dev *d, DWORD *passes) {
 
 static HRESULT STDMETHODCALLTYPE dev_SetRenderTarget(Dev *d, DWORD index, IDirect3DSurface9 *surface) {
   Surface *s = surface_of(surface);
-  if (index >= TARGETS || index >= 1u) return index == 0 || surface ? D3DERR_INVALIDCALL : D3D_OK;      /* (one target at a time: D3DCAPS9.NumSimultaneousRTs) */
-  if (!s || s->c.dev != d || !s->tex->target) return D3DERR_INVALIDCALL;
+  if (index >= adapter_targets()) return D3DERR_INVALIDCALL;      /* (D3DCAPS9.NumSimultaneousRTs) */
+  if (index > 0 && !surface) {      /* (targets 1 .. 3 may be unset; 0 may not) */
+    EnterCriticalSection(&d->lock);
+    bind(&d->target[index], NULL);
+    d->targets_dirty = 1;
+    LeaveCriticalSection(&d->lock);
+    return D3D_OK;
+  }
+  if (!s || s->c.dev != d || !surface_drawable(s)) return D3DERR_INVALIDCALL;      /* (a level of a cube the kernel does not keep: see tex_make_kind) */
   EnterCriticalSection(&d->lock);
   bind(&d->target[index], s);
+  if (index > 0) {      /* (the viewport stays as it is for the others) */
+    d->targets_dirty = 1;
+    LeaveCriticalSection(&d->lock);
+    return D3D_OK;
+  }
   /* (as Direct3D 9 does: the viewport and the scissor rectangle become the whole of the new target) */
   const D3DVIEWPORT9 viewport = {0, 0, sub_width(s->tex, s->sub), sub_height(s->tex, s->sub), 0.0f, 1.0f};
   d->state.viewport = viewport;
@@ -199,7 +243,7 @@ static HRESULT STDMETHODCALLTYPE dev_SetRenderTarget(Dev *d, DWORD index, IDirec
 static HRESULT STDMETHODCALLTYPE dev_GetRenderTarget(Dev *d, DWORD index, IDirect3DSurface9 **out) {
   if (!out) return D3DERR_INVALIDCALL;
   *out = NULL;
-  if (index >= TARGETS) return D3DERR_INVALIDCALL;
+  if (index >= adapter_targets()) return D3DERR_INVALIDCALL;
   if (!d->target[index]) return D3DERR_NOTFOUND;
   child_AddRef(&d->target[index]->c);
   *out = (IDirect3DSurface9 *)d->target[index];
@@ -226,6 +270,14 @@ static HRESULT STDMETHODCALLTYPE dev_GetDepthStencilSurface(Dev *d, IDirect3DSur
 /* ---- the implicit swap chain, Reset ----------------------------------------------------------------------------------------------------------------- */
 
 /* The device's swap chain and depth buffer go (Reset, the device's end). */
+/* A swap chain's buffer or the device's depth buffer that a 9Ex reset leaves with the program: a surface of its own (it frees its texture with its last reference),
+ * counted as a resource of the default pool, its container the device. */
+static void surface_orphan(Dev *d, Surface *s) {
+  s->kind = SURFACE_ALONE;
+  s->container = NULL;
+  s->c.kept = 0;
+  default_resource_made(d, s->tex->pool);
+}
 static void targets_release(Dev *d) {
   for (UINT i = 0; i < TARGETS; ++i) bind(&d->target[i], NULL);
   bind(&d->depth, NULL);
@@ -259,16 +311,41 @@ static HRESULT device_reset(Dev *d, D3DPRESENT_PARAMETERS *parameters, const D3D
   HRESULT hr = present_parameters_check(d, parameters, d->creation.hFocusWindow);
   if (FAILED(hr)) { if (!d->ex) d->lost = d->not_reset = 1; return hr; }
   EnterCriticalSection(&d->lock);
-  /* (the program may hold no buffer of the swap chain, and - not 9Ex - no resource of the default pool) */
+  /* (what the device has set goes first - a texture or target the program let go of goes with it -; then the program may hold no buffer of the swap chain, and,
+   * not 9Ex, no resource of the default pool) */
+  if (!d->ex) {
+    flush(d);
+    state_release(&d->state);
+    for (UINT i = 1; i < TARGETS; ++i) bind(&d->target[i], NULL);
+    if (d->chain && d->chain->count) bind(&d->target[0], d->chain->surface[0]);
+    bind(&d->depth, d->auto_depth);
+  }
   BOOL held = d->auto_depth && d->auto_depth->c.o.ref > 0;
   for (UINT i = 0; d->chain && i < d->chain->count; ++i) held = held || d->chain->surface[i]->c.o.ref > 0;
+  if (d->ex && held) {
+    /* (9Ex resets with the buffers held: they stay the program's, surfaces of their own whose container is the device - the new swap chain has new ones) */
+    for (UINT i = 0; d->chain && i < d->chain->count; ++i) {
+      Surface *s = d->chain->surface[i];
+      if (!s || s->c.o.ref == 0) continue;
+      for (UINT j = 0; j <= MAX_BACK_BUFFERS; ++j)
+        if (d->chain->buffer[j] == s->tex) d->chain->buffer[j] = NULL;
+      d->chain->surface[i] = NULL;
+      surface_orphan(d, s);
+    }
+    if (d->auto_depth && d->auto_depth->c.o.ref > 0) {
+      bind(&d->depth, NULL);
+      surface_orphan(d, d->auto_depth);
+      d->auto_depth = NULL;
+    }
+    held = FALSE;
+  }
   if (held || (!d->ex && d->default_resources > 0)) {
     d->lost = d->not_reset = 1;
     LeaveCriticalSection(&d->lock);
     return D3DERR_INVALIDCALL;
   }
   flush(d);
-  if (d->recording) { obj_free(OBJ(d->recording)); dx_Release(OBJ(d)); d->recording = NULL; }
+  if (d->recording) { obj_free(OBJ(d->recording)); d->recording = NULL; }      /* (a block being recorded holds no reference of the device) */
   /* (a 9Ex device keeps its state through a reset, but for the viewport and the scissor rectangle, which become the new back buffer's) */
   if (!d->ex) state_release(&d->state);
   const BOOL was_fullscreen = d->chain && !d->chain->pp.Windowed;
@@ -505,8 +582,7 @@ static HRESULT STDMETHODCALLTYPE d3d_GetAdapterIdentifier(Direct3D *o, UINT adap
 static UINT STDMETHODCALLTYPE d3d_GetAdapterModeCount(Direct3D *o, UINT adapter, D3DFORMAT format) { (void)o; return adapter == 0 ? display_mode_count(format) : 0; }
 static HRESULT STDMETHODCALLTYPE d3d_EnumAdapterModes(Direct3D *o, UINT adapter, D3DFORMAT format, UINT index, D3DDISPLAYMODE *mode) {
   (void)o;
-  if (adapter != 0 || !mode) return D3DERR_INVALIDCALL;
-  if (!display_format(format)) return D3DERR_NOTAVAILABLE;
+  if (adapter != 0 || !mode || !display_format(format)) return D3DERR_INVALIDCALL;      /* (a format with no modes is not one of the display's) */
   D3DDISPLAYMODEEX m;
   if (!display_mode_at(format, index, &m)) return D3DERR_INVALIDCALL;
   display_mode_plain(&m, mode);
@@ -546,14 +622,15 @@ static HRESULT STDMETHODCALLTYPE d3d_CheckDeviceFormat(Direct3D *o, UINT adapter
   const BOOL depth = format_is_depth(format), plain = format_bytes(format) != 0, block = dxt_block(format) != 0;
   if (!depth && !plain && !block) return D3DERR_NOTAVAILABLE;
   if ((usage & D3DUSAGE_DEPTHSTENCIL) && (!depth || volume || cube)) return D3DERR_NOTAVAILABLE;
-  if ((usage & D3DUSAGE_RENDERTARGET) && (!format_is_target(format) || volume || cube)) return D3DERR_NOTAVAILABLE;
+  if ((usage & D3DUSAGE_RENDERTARGET) && (!format_is_target(format) || volume)) return D3DERR_NOTAVAILABLE;
   if (depth && !(usage & D3DUSAGE_DEPTHSTENCIL) && resource != D3DRTYPE_SURFACE) return D3DERR_NOTAVAILABLE;
   if (block && (volume || (usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)))) return D3DERR_NOTAVAILABLE;
   if (format_is_palette(format) && (usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL | D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING))) return D3DERR_NOTAVAILABLE;
   if (usage & (D3DUSAGE_DMAP | D3DUSAGE_QUERY_LEGACYBUMPMAP | D3DUSAGE_QUERY_SRGBREAD | D3DUSAGE_QUERY_SRGBWRITE | D3DUSAGE_QUERY_VERTEXTEXTURE)) return D3DERR_NOTAVAILABLE;
   if ((usage & D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING) && !format_is_target(format)) return D3DERR_NOTAVAILABLE;
-  /* (the levels of a 2D texture are made from its top level; a cube's and a volume's are not kept: the texture is there, the levels are not made) */
-  if ((usage & D3DUSAGE_AUTOGENMIPMAP) && (block || depth || cube || volume)) return D3DOK_NOAUTOGEN;
+  /* (the levels of a 2D texture of a format that can be drawn into are made from its top level, as Windows' drivers make them by drawing; of the others the texture
+   * is made, with no levels made) */
+  if ((usage & D3DUSAGE_AUTOGENMIPMAP) && (!format_is_target(format) || cube || volume)) return D3DOK_NOAUTOGEN;
   return D3D_OK;
 }
 static HRESULT STDMETHODCALLTYPE d3d_CheckDeviceMultiSampleType(Direct3D *o, UINT adapter, D3DDEVTYPE type, D3DFORMAT format, BOOL windowed, D3DMULTISAMPLE_TYPE samples,
@@ -647,8 +724,7 @@ static UINT STDMETHODCALLTYPE d3d_GetAdapterModeCountEx(Direct3D *o, UINT adapte
 }
 static HRESULT STDMETHODCALLTYPE d3d_EnumAdapterModesEx(Direct3D *o, UINT adapter, const D3DDISPLAYMODEFILTER *filter, UINT index, D3DDISPLAYMODEEX *mode) {
   (void)o;
-  if (adapter != 0 || !mode_filter_valid(filter) || !mode || mode->Size != sizeof *mode) return D3DERR_INVALIDCALL;
-  if (!display_format(filter->Format)) return D3DERR_NOTAVAILABLE;
+  if (adapter != 0 || !mode_filter_valid(filter) || !mode || mode->Size != sizeof *mode || !display_format(filter->Format)) return D3DERR_INVALIDCALL;
   if (filter->ScanLineOrdering == D3DSCANLINEORDERING_INTERLACED || !display_mode_at(filter->Format, index, mode)) return D3DERR_INVALIDCALL;
   return D3D_OK;
 }

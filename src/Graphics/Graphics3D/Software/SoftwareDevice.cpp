@@ -1253,6 +1253,7 @@ struct DrawState {
   uint32_t layer_count[kMaxColorTargets + 1] = {1, 1, 1, 1, 1, 1, 1, 1, 1};
   uint32_t level[kMaxColorTargets + 1] = {};   // (RenderPassBegin::level: the level of each target drawn into)
   Extent2D extent;                             // (the size of the pass: of those levels)
+  uint32_t depth_width = 0;                    // (the width of the depth target's level, which may be larger than the pass: its rows are this long)
   mutable uint32_t layer = 0;
   // (with view instancing the view's layer and viewport offsets are added, wrapping: set_view_instance)
   void select_layer(uint32_t l) const { layer = l + view_layer; }
@@ -1483,7 +1484,7 @@ void write_fragment(const DrawState& s, int32_t x, int32_t y, float z, bool dept
   const ArrayView<uint8_t> stencil = s.stencil_plane();
   const bool stencil_on = pd.stencil.enable && !stencil.empty();
   const uint32_t samples = s.sample_count;
-  const uint64_t index = (uint64_t{static_cast<uint32_t>(y)} * s.extent.width + static_cast<uint32_t>(x)) * samples + sample;   // (the sample's place in the depth and stencil planes)
+  const uint64_t index = (uint64_t{static_cast<uint32_t>(y)} * s.depth_width + static_cast<uint32_t>(x)) * samples + sample;   // (the sample's place in the depth and stencil planes)
   if (stencil_on) {
     // The stencil test comes first, then the depth test; each outcome has its own op (a fragment the shader discarded changed nothing).
     const StencilState& st = !front && pd.separate_back_stencil ? pd.back_stencil : pd.stencil;
@@ -1680,7 +1681,7 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
   const bool conservative = pd.conservative && !line;
   auto magnitude = [](float v) { return v < 0 ? -v : v; };
   const float reach0 = 0.5f * (magnitude(e0dx) + magnitude(e0dy)), reach1 = 0.5f * (magnitude(e1dx) + magnitude(e1dy)), reach2 = 0.5f * (magnitude(e2dx) + magnitude(e2dy));
-  const uint32_t target_width = s.extent.width;
+  const uint32_t target_width = s.depth_width;      // (the depth plane's rows)
   const uint32_t sample_count = s.sample_count;
   // (programmable sample positions on a single-sample pass: the one sample, wherever it is, decides the pixel)
   const bool custom_single = sample_count == 1 && s.custom_pixels != 0 && s.custom_samples == 1;
@@ -2107,7 +2108,7 @@ void fragment_at(const DrawState& s, int32_t x, int32_t y, float z, float inv_w,
   if (x < s.scissor.x || y < s.scissor.y || x >= static_cast<int64_t>(s.scissor.x) + s.scissor.width || y >= static_cast<int64_t>(s.scissor.y) + s.scissor.height) return;
   if (x < 0 || y < 0 || static_cast<uint32_t>(x) >= target.width || static_cast<uint32_t>(y) >= target.height) return;
   const ArrayView<float> depth = s.depth_plane();
-  const uint64_t index = uint64_t{static_cast<uint32_t>(y)} * s.extent.width + static_cast<uint32_t>(x);
+  const uint64_t index = uint64_t{static_cast<uint32_t>(y)} * s.depth_width + static_cast<uint32_t>(x);      // (in the depth plane)
   const uint32_t sample_count = s.sample_count;   // (a line or point covers every sample of its pixel)
   uint32_t covered = (1u << sample_count) - 1;
   if (s.depth_bounds && !depth.empty())   // (the depth bounds test: of what the depth buffer holds, before the depth test)
@@ -2879,7 +2880,9 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         if (s.level[0] >= s.color->mip_levels() || (s.depth && s.level[kMaxColorTargets] >= s.depth->mip_levels())) return false;
         const Extent2D e = s.color->level_extent(s.level[0]);
         s.extent = e;
-        if (s.depth && (s.depth->level_extent(s.level[kMaxColorTargets]).width != e.width || s.depth->level_extent(s.level[kMaxColorTargets]).height != e.height)) return false;
+        // (a depth target as large as the pass or larger, whose top left part the pass uses, as Direct3D 9 and OpenGL have it; not a smaller one)
+        if (s.depth && (s.depth->level_extent(s.level[kMaxColorTargets]).width < e.width || s.depth->level_extent(s.level[kMaxColorTargets]).height < e.height)) return false;
+        s.depth_width = s.depth ? s.depth->level_extent(s.level[kMaxColorTargets]).width : e.width;
         for (SoftwareImage*& extra : s.extra_colors) extra = nullptr;
         for (uint32_t n = 0; n + 1 < kMaxColorTargets && cmd.pass.extra_colors[n]; ++n) {
           SoftwareImage* image = static_cast<SoftwareImage*>(cmd.pass.extra_colors[n]);

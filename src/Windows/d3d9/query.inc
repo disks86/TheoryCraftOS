@@ -230,7 +230,10 @@ static HRESULT STDMETHODCALLTYPE query_GetData(Query *q, void *data, DWORD size,
   memset(&out, 0, sizeof out);
   HRESULT hr = S_OK;
   EnterCriticalSection(&d->lock);
-  switch (q->type) {
+  if (!q->ever_issued && q->type != D3DQUERYTYPE_VCACHE) {
+    memset(&out, 0xDD, sizeof out);      /* (as Windows' drivers fill a query that was never issued) */
+    if (q->type == D3DQUERYTYPE_EVENT) out.b = TRUE;
+  } else switch (q->type) {
     case D3DQUERYTYPE_VCACHE:
       out.vcache.Pattern = MAKEFOURCC('C', 'A', 'C', 'H');
       out.vcache.OptMethod = 0;      /* (strips: there is no vertex cache to fit meshes to) */
@@ -248,11 +251,6 @@ static HRESULT STDMETHODCALLTYPE query_GetData(Query *q, void *data, DWORD size,
       out.b = FALSE;
       break;
     default:
-      if (!q->ever_issued) {
-        memset(&out, 0xDD, sizeof out);      /* (as Windows' drivers fill a query that was never issued) */
-        if (q->type == D3DQUERYTYPE_EVENT) out.b = TRUE;
-        break;
-      }
       if (q->state == 1) {
         /* (begun, not ended: there is nothing to give until the end has run) */
         if ((flags & D3DGETDATA_FLUSH) && d->recorded) flush(d);

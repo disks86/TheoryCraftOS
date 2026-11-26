@@ -664,6 +664,7 @@ static HRESULT shader_make_ex(Dev *d, const DWORD *code, BOOL vertex, int implic
     hr = s ? D3D_OK : E_OUTOFMEMORY;
   }
   if (s) {
+    s->magic = SHADER_MAGIC;
     s->vertex = vertex;
     s->code_bytes = (UINT)translated->tokens * 4;
     s->dxbc_bytes = (UINT)translated->dxbc_size;
@@ -677,6 +678,7 @@ static HRESULT shader_make_ex(Dev *d, const DWORD *code, BOOL vertex, int implic
       s->registers = translated->constant_registers;
       s->major = translated->major;
       s->state = translated->state_register;
+      s->fill = translated->fill_register;
       for (UINT i = 0; i < 16; ++i) if (translated->sampler_mask >> i & 1) s->sampler_count = i + 1;
       memcpy(s->sampler_kind, translated->sampler_kind, sizeof s->sampler_kind);
       for (UINT i = 0; i < TEXTURE_SETS; ++i) if (translated->varying_mask >> (SM_SLOT_TEXCOORD + i) & 1) s->coordinates = i + 1;
@@ -696,8 +698,10 @@ static HRESULT shader_make_ex(Dev *d, const DWORD *code, BOOL vertex, int implic
 static HRESULT shader_make(Dev *d, const DWORD *code, BOOL vertex, Shader **out) { return shader_make_ex(d, code, vertex, 0, out); }
 static HRESULT STDMETHODCALLTYPE dev_CreateVertexShader(Dev *d, const DWORD *code, IDirect3DVertexShader9 **shader) { return shader_make(d, code, TRUE, (Shader **)shader); }
 static HRESULT STDMETHODCALLTYPE dev_CreatePixelShader(Dev *d, const DWORD *code, IDirect3DPixelShader9 **shader) { return shader_make(d, code, FALSE, (Shader **)shader); }
+/* (a shader is known by its own mark, not its vtable: Direct3D 9 takes one whose vtable a program changed) */
+static BOOL shader_is(const void *p, int vertex) { return p && ((const Shader *)p)->magic == SHADER_MAGIC && ((const Shader *)p)->vertex == vertex; }
 static HRESULT STDMETHODCALLTYPE dev_SetVertexShader(Dev *d, IDirect3DVertexShader9 *shader) {
-  if (shader && (((DxObj *)shader)->lpVtbl != (const void *)&vs_vtbl || ((Shader *)shader)->c.dev != d)) return D3DERR_INVALIDCALL;
+  if (shader && (!shader_is(shader, 1) || ((Shader *)shader)->c.dev != d)) return D3DERR_INVALIDCALL;
   StateMask *m;
   State *s = state_for_set(d, &m);
   bind(&s->vs, shader);
@@ -711,7 +715,7 @@ static HRESULT STDMETHODCALLTYPE dev_GetVertexShader(Dev *d, IDirect3DVertexShad
   return D3D_OK;
 }
 static HRESULT STDMETHODCALLTYPE dev_SetPixelShader(Dev *d, IDirect3DPixelShader9 *shader) {
-  if (shader && (((DxObj *)shader)->lpVtbl != (const void *)&ps_vtbl || ((Shader *)shader)->c.dev != d)) return D3DERR_INVALIDCALL;
+  if (shader && (!shader_is(shader, 0) || ((Shader *)shader)->c.dev != d)) return D3DERR_INVALIDCALL;
   StateMask *m;
   State *s = state_for_set(d, &m);
   bind(&s->ps, shader);
@@ -827,6 +831,10 @@ static HRESULT STDMETHODCALLTYPE dev_BeginStateBlock(Dev *d) {
   if (d->recording) return D3DERR_INVALIDCALL;
   StateBlock *b = sb_make(d);
   if (!b) return E_OUTOFMEMORY;
+  /* (the block being recorded holds no reference of the device yet, as in Direct3D 9: EndStateBlock gives it its first) */
+  dx_Release(OBJ(d));
+  b->c.o.ref = 0;
+  b->c.kept = 1;
   /* (the block starts as the device is, so that what is recorded on top - a part of the constants, the lights - has the rest of its part) */
   StateMask all;
   memset(&all, 0, sizeof all);
@@ -839,6 +847,8 @@ static HRESULT STDMETHODCALLTYPE dev_BeginStateBlock(Dev *d) {
 }
 static HRESULT STDMETHODCALLTYPE dev_EndStateBlock(Dev *d, IDirect3DStateBlock9 **out) {
   if (!out || !d->recording) return D3DERR_INVALIDCALL;
+  d->recording->c.kept = 0;
+  child_AddRef(&d->recording->c);
   *out = (IDirect3DStateBlock9 *)d->recording;
   d->recording = NULL;
   return D3D_OK;

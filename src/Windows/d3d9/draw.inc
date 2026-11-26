@@ -270,6 +270,18 @@ static ID3D12RootSignature *root_get(Dev *d, UINT slots) {
 
 /* The Direct3D 12 pipeline state of the shaders (no vertex shader: the fixed-function one) and the render states that are set; NULL when it
  * cannot be made. */
+/* The targets a draw writes: target 0, and those of 1 .. 3 that are set one after the other from it (Direct3D 12 here takes no gap) and are its size. */
+static UINT draw_targets(const Dev *d, Surface **out) {
+  out[0] = d->target[0];
+  UINT n = 1;
+  const UINT w = sub_width(d->target[0]->tex, d->target[0]->sub), h = sub_height(d->target[0]->tex, d->target[0]->sub);
+  for (; n < TARGETS && d->target[n]; ++n) {
+    const Surface *s = d->target[n];
+    if (sub_width(s->tex, s->sub) != w || sub_height(s->tex, s->sub) != h) break;
+    out[n] = d->target[n];
+  }
+  return n;
+}
 static ID3D12PipelineState *pipeline_get(Dev *d, const Shader *vs, const Shader *ps, D3DPRIMITIVETYPE type) {
   const DWORD *rs = d->state.rs;
   Pipeline key;
@@ -277,6 +289,16 @@ static ID3D12PipelineState *pipeline_get(Dev *d, const Shader *vs, const Shader 
   key.topology = type == D3DPT_POINTLIST ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT : type == D3DPT_LINELIST || type == D3DPT_LINESTRIP ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE
                                                                                                                                  : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
   key.depth_format = d->depth ? (DWORD)depth_dxgi(d->depth->tex->format) : 0;
+  key.target_format = (DWORD)gpu_dxgi(d->target[0]->tex->format);
+  {
+    Surface *targets[TARGETS];
+    key.targets = draw_targets(d, targets);
+    static const D3DRENDERSTATETYPE masks[3] = {D3DRS_COLORWRITEENABLE1, D3DRS_COLORWRITEENABLE2, D3DRS_COLORWRITEENABLE3};
+    for (UINT i = 1; i < key.targets; ++i) {
+      key.extra_format[i - 1] = (DWORD)gpu_dxgi(targets[i]->tex->format);
+      key.extra_write |= (rs[masks[i - 1]] & 0xFu) << (4 * (i - 1));
+    }
+  }
   key.vs = vs ? vs->c.id : 0;
   key.ps = ps->c.id;
   key.sets = vs ? 0 : coordinate_sets(ps);
@@ -371,6 +393,12 @@ static ID3D12PipelineState *pipeline_get(Dev *d, const Shader *vs, const Shader 
   blend->BlendOpAlpha = (D3D12_BLEND_OP)key.op_alpha;
   blend->LogicOp = D3D12_LOGIC_OP_NOOP;
   blend->RenderTargetWriteMask = (UINT8)key.write;
+  /* (the other targets: the same blending, each its own write mask) */
+  pd.BlendState.IndependentBlendEnable = key.targets > 1;
+  for (UINT i = 1; i < key.targets; ++i) {
+    pd.BlendState.RenderTarget[i] = *blend;
+    pd.BlendState.RenderTarget[i].RenderTargetWriteMask = (UINT8)((key.extra_write >> (4 * (i - 1))) & 0xF);
+  }
   pd.RasterizerState.FillMode = key.wireframe ? D3D12_FILL_MODE_WIREFRAME : D3D12_FILL_MODE_SOLID;
   pd.RasterizerState.DepthBias = (INT)key.bias;
   memcpy(&pd.RasterizerState.SlopeScaledDepthBias, &key.slope, 4);
@@ -393,8 +421,9 @@ static ID3D12PipelineState *pipeline_get(Dev *d, const Shader *vs, const Shader 
   pd.DepthStencilState.BackFace.StencilFunc = (D3D12_COMPARISON_FUNC)key.ccw_func;
   pd.InputLayout.pInputElementDescs = vs ? inputs : layout;
   pd.InputLayout.NumElements = vs ? vs->input_count : 3 + TEXTURE_SETS;
-  pd.NumRenderTargets = 1;
-  pd.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+  pd.NumRenderTargets = key.targets;
+  pd.RTVFormats[0] = (DXGI_FORMAT)key.target_format;
+  for (UINT i = 1; i < key.targets; ++i) pd.RTVFormats[i] = (DXGI_FORMAT)key.extra_format[i - 1];
   if (d->depth) pd.DSVFormat = (DXGI_FORMAT)key.depth_format;
   pd.PrimitiveTopologyType = (D3D12_PRIMITIVE_TOPOLOGY_TYPE)key.topology;
   pd.SampleDesc.Count = 1;
@@ -627,6 +656,7 @@ static void colour_of_state(DWORD colour, float out[4]) {
   out[2] = (colour & 255) / 255.0f;
   out[3] = (colour >> 24) / 255.0f;
 }
+static Tex *stage_texture(const Dev *d, const Shader *ps, UINT i);
 /* Writes the block of constants of the draw and gives its address. (The ring has room for a whole block: draw() saw to it.) `ps` is the
  * program's pixel shader, or - `fixed` - the one of the texture stages. */
 static UINT64 constants_of(Dev *d, const Layout *l, const Shader *vs, const Shader *ps, BOOL fixed) {
@@ -674,6 +704,8 @@ static UINT64 constants_of(Dev *d, const Layout *l, const Shader *vs, const Shad
     shader_constants(pixel, ps, stages, FFS_CONSTANTS, 0);
   } else shader_constants(pixel, ps, s->ps_float, PS_FLOATS, s->ps_bool);
   shader_state(pixel + ps->state * 4, s, ps->major < 3, TRUE, fog_by_w(s));
+  /* (what each sampler's texture has not of the channels Direct3D 9 reads as 1: sm_to_dxbc.h's fill registers) */
+  for (UINT i = 0; i < ps->sampler_count; ++i) format_fill(stage_texture(d, ps, i)->format, pixel + (ps->fill + i) * 4);
   if (!d->constant_valid || d->constant_last_bytes != bytes || memcmp(d->constant_data + d->constant_last, block, bytes) != 0) {
     d->constant_last = d->constant_used;
     d->constant_last_bytes = bytes;
@@ -816,17 +848,22 @@ static HRESULT draw(Dev *d, D3DPRIMITIVETYPE type, UINT primitives, const Source
   const UINT sets = coordinate_sets(ps);
   Attribute inputs[SHADER_INPUTS];
   if (!indices) vertices = elements;
+  /* (no declaration and no FVF code: Direct3D 9 refuses the draw. Vertices a stream does not have - no buffer set, or one too short - are not read: Direct3D 9's
+   * runtime takes the draw as it is, and here it draws nothing) */
+  if (!d->state.decl && !d->state.fvf) return D3DERR_INVALIDCALL;
   if (vs) {
     shader_attributes(vs, declared, inputs);
     for (UINT i = 0; i < vs->input_count; ++i)
-      if (!attribute_inside(&inputs[i], sources, first_vertex, vertices)) return D3DERR_INVALIDCALL;
+      if (!attribute_inside(&inputs[i], sources, first_vertex, vertices)) return D3D_OK;
   } else {
-    if (layout.position.type == 255) return D3DERR_INVALIDCALL;
+    if (layout.position.type == 255) return D3D_OK;
     if (!attribute_inside(&layout.position, sources, first_vertex, vertices) || !attribute_inside(&layout.colour, sources, first_vertex, vertices) ||
-        !attribute_inside(&layout.specular, sources, first_vertex, vertices) || !attribute_inside(&layout.normal, sources, first_vertex, vertices))
-      return D3DERR_INVALIDCALL;
+        !attribute_inside(&layout.specular, sources, first_vertex, vertices) || !attribute_inside(&layout.normal, sources, first_vertex, vertices) ||
+        !attribute_inside(&layout.weights, sources, first_vertex, vertices) || !attribute_inside(&layout.indices, sources, first_vertex, vertices) ||
+        !attribute_inside(&layout.position1, sources, first_vertex, vertices) || !attribute_inside(&layout.normal1, sources, first_vertex, vertices))
+      return D3D_OK;
     for (UINT t = 0; t < sets; ++t)
-      if (!attribute_inside(&layout.texture[d->state.stage[t][D3DTSS_TEXCOORDINDEX] & (TEXTURE_SETS - 1)], sources, first_vertex, vertices)) return D3DERR_INVALIDCALL;
+      if (!attribute_inside(&layout.texture[d->state.stage[t][D3DTSS_TEXCOORDINDEX] & (TEXTURE_SETS - 1)], sources, first_vertex, vertices)) return D3D_OK;
   }
   const UINT stride = vs ? 16 * (vs->input_count ? vs->input_count : 1) : VERTEX_BYTES(sets);
   const UINT slots = texture_slots(ps);
@@ -836,8 +873,9 @@ static HRESULT draw(Dev *d, D3DPRIMITIVETYPE type, UINT primitives, const Source
 
   /* what may have to send the list first */
   settle(d, d->target[0]->tex->sampled);      /* (a texture the list's draws sampled cannot become its target) */
+  for (UINT i = 1; i < TARGETS && d->target[i]; ++i) settle(d, d->target[i]->tex->sampled);
   textures_refresh(d, ps);
-  if (d->vertex_used + vertices * stride > VERTEX_RING || d->index_used + out_indices * 4 > INDEX_RING || d->constant_used + CONSTANT_REGISTERS * 16 > CONSTANT_RING ||
+  if (d->vertex_used + vertices * stride > VERTEX_RING || d->index_used + out_indices * 4 > INDEX_RING || d->constant_used + ((constant_registers(vs, ps) * 16 + 255) & ~255u) > CONSTANT_RING ||
       d->view_used + slots > VIEW_HEAP || d->sampler_used + slots > VIEW_HEAP || (d->open_queries && queries_need_slots(d)))
     flush(d);
   ID3D12PipelineState *pipeline = pipeline_get(d, vs, ps, type);
@@ -901,7 +939,14 @@ static HRESULT draw(Dev *d, D3DPRIMITIVETYPE type, UINT primitives, const Source
     const State *s = &d->state;
     ID3D12DescriptorHeap *heaps[2] = {d->view_heap, d->sampler_heap};
     ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 2, heaps);
-    ID3D12GraphicsCommandList_OMSetRenderTargets(list, 1, &target->view, FALSE, depth ? &d->depth->tex->view : NULL);
+    Surface *targets[TARGETS];
+    D3D12_CPU_DESCRIPTOR_HANDLE target_views[TARGETS];
+    const UINT target_count = draw_targets(d, targets);
+    for (UINT i = 0; i < target_count; ++i) {
+      target_views[i] = surface_target_view(d, targets[i]);
+      if (!target_views[i].ptr) return E_OUTOFMEMORY;
+    }
+    ID3D12GraphicsCommandList_OMSetRenderTargets(list, target_count, target_views, FALSE, depth ? &d->depth->tex->view : NULL);
     D3D12_VIEWPORT vp = {(FLOAT)s->viewport.X, (FLOAT)s->viewport.Y, (FLOAT)s->viewport.Width, (FLOAT)s->viewport.Height, s->viewport.MinZ, s->viewport.MaxZ};
     D3D12_RECT sc = {(LONG)s->viewport.X, (LONG)s->viewport.Y, (LONG)(s->viewport.X + s->viewport.Width), (LONG)(s->viewport.Y + s->viewport.Height)};
     if (s->rs[D3DRS_SCISSORTESTENABLE]) {      /* (the rectangle, inside the viewport) */
@@ -954,6 +999,7 @@ static HRESULT draw(Dev *d, D3DPRIMITIVETYPE type, UINT primitives, const Source
   for (UINT i = 0; i < slots; ++i)
     if (d->state.tex[i]) ((Tex *)d->state.tex[i])->used = ((Tex *)d->state.tex[i])->sampled = d->epoch;
   target->used = d->epoch;
+  for (UINT i = 1; i < TARGETS && d->target[i]; ++i) d->target[i]->tex->used = d->epoch;
   if (depth) {
     d->depth->tex->used = d->epoch;
     for (UINT i = 0; i < d->clear_count;) {      /* (its clear is done by the pass this draw begins) */
@@ -995,7 +1041,8 @@ static HRESULT STDMETHODCALLTYPE dev_DrawIndexedPrimitive(Dev *d, D3DPRIMITIVETY
   Source sources[STREAMS];
   const Buffer *ib = d->state.indices;
   const UINT elements = primitive_elements(type, primitives);
-  if (!ib || !elements || vertices == 0) return D3DERR_INVALIDCALL;
+  if (!elements || vertices == 0 || (!d->state.decl && !d->state.fvf)) return D3DERR_INVALIDCALL;
+  if (!ib) return D3D_OK;      /* (no index buffer, with a declaration: Windows draws nothing and succeeds) */
   const UINT index_bytes = ib->format == D3DFMT_INDEX32 ? 4 : 2;
   if (start > ib->length / index_bytes || elements > ib->length / index_bytes - start) return D3DERR_INVALIDCALL;
   if ((INT64)base + lowest < 0) return D3DERR_INVALIDCALL;
@@ -1024,6 +1071,7 @@ static HRESULT STDMETHODCALLTYPE dev_DrawPrimitiveUP(Dev *d, D3DPRIMITIVETYPE ty
   EnterCriticalSection(&d->lock);
   const HRESULT hr = draw(d, type, primitives, sources, 0, 0, NULL, 0, 0);
   bind(&d->state.stream[0].buffer, NULL);
+  if (SUCCEEDED(hr)) d->state.stream[0].offset = d->state.stream[0].stride = 0;      /* (GetStreamSource then gives NULL, 0, 0; a draw refused keeps them, as on Windows) */
   LeaveCriticalSection(&d->lock);
   return hr;
 }
@@ -1039,7 +1087,242 @@ static HRESULT STDMETHODCALLTYPE dev_DrawIndexedPrimitiveUP(Dev *d, D3DPRIMITIVE
   EnterCriticalSection(&d->lock);
   const HRESULT hr = draw(d, type, primitives, sources, lowest, vertices, indices, index_format == D3DFMT_INDEX32 ? 4 : 2, 0);
   bind(&d->state.stream[0].buffer, NULL);
+  if (SUCCEEDED(hr)) d->state.stream[0].offset = d->state.stream[0].stride = 0;
   bind(&d->state.indices, NULL);
+  LeaveCriticalSection(&d->lock);
+  return hr;
+}
+
+/* ProcessVertices: the fixed-function vertex stage on the CPU, its results written into a vertex buffer - what the draws would give the rasterizer: positions
+ * in pixels (x, y, z and 1 / w) out of the world, view and projection matrices and the viewport, the colours lit as the lights say (or the vertex's own), vertex
+ * blending and tweening, the vertex fog factor in the specular colour's alpha, the texture coordinates as the vertex has them, and the point size.
+ * The output is the declaration's (`declaration`) or else the destination buffer's FVF code; a part the input has not comes out as Direct3D 9 makes it (white,
+ * black specular, zero). With D3DRS_CLIPPING a vertex outside the clip volume is not made pixels, as Direct3D 9 (and wined3d) has it: its x and y are
+ * (x + w) / 2 and (y + w) / 2 of clip space and its z and w are kept; the clip status gets every vertex's clip codes. D3DPV_DONOTCOPYDATA: only the positions
+ * are written. A program's vertex shader is not run here: that needs a CPU interpreter of the shader models, which there is not (D3DERR_INVALIDCALL). */
+typedef struct PvOutput {
+  int position;                  /* the offset of each part, -1 where the output has none */
+  BOOL rhw;                      /* a position of four (x, y, z, 1 / w), else three */
+  int diffuse, specular, point_size, normal;
+  int texture[TEXTURE_SETS];
+  BYTE texture_type[TEXTURE_SETS];
+  BYTE colour_type[2];           /* D3DDECLTYPE_D3DCOLOR, or a float type of a declaration */
+  UINT stride;
+} PvOutput;
+/* What the output of ProcessVertices is, from the elements of stream 0 of a declaration (or of an FVF code); FALSE when it has no position. */
+static BOOL pv_output_of(const D3DVERTEXELEMENT9 *e, UINT count, PvOutput *o) {
+  memset(o, 0xFF, sizeof *o);
+  o->rhw = FALSE;
+  o->stride = 0;
+  for (UINT i = 0; i < count && e[i].Stream != 0xFF; ++i) {
+    if (e[i].Stream != 0 || e[i].Type > D3DDECLTYPE_FLOAT16_4) continue;
+    const UINT end = e[i].Offset + type_bytes(e[i].Type);
+    if (end > o->stride) o->stride = end;
+    const int at = e[i].Offset;
+    switch (e[i].Usage) {
+      case D3DDECLUSAGE_POSITIONT:
+      case D3DDECLUSAGE_POSITION:
+        if (e[i].UsageIndex != 0 || (e[i].Type != D3DDECLTYPE_FLOAT3 && e[i].Type != D3DDECLTYPE_FLOAT4)) break;
+        o->position = at;
+        o->rhw = e[i].Type == D3DDECLTYPE_FLOAT4;
+        break;
+      case D3DDECLUSAGE_COLOR:
+        if (e[i].UsageIndex > 1 || (e[i].Type != D3DDECLTYPE_D3DCOLOR && e[i].Type != D3DDECLTYPE_FLOAT4 && e[i].Type != D3DDECLTYPE_FLOAT3)) break;
+        if (e[i].UsageIndex == 0) o->diffuse = at; else o->specular = at;
+        o->colour_type[e[i].UsageIndex] = e[i].Type;
+        break;
+      case D3DDECLUSAGE_PSIZE:
+        if (e[i].Type == D3DDECLTYPE_FLOAT1) o->point_size = at;
+        break;
+      case D3DDECLUSAGE_NORMAL:
+        if (e[i].UsageIndex == 0 && e[i].Type == D3DDECLTYPE_FLOAT3) o->normal = at;
+        break;
+      case D3DDECLUSAGE_TEXCOORD:
+        if (e[i].UsageIndex < TEXTURE_SETS && e[i].Type <= D3DDECLTYPE_FLOAT4) {
+          o->texture[e[i].UsageIndex] = at;
+          o->texture_type[e[i].UsageIndex] = e[i].Type;
+        }
+        break;
+      default: break;
+    }
+  }
+  return o->position >= 0;
+}
+static void pv_put_floats(BYTE *at, const float *v, UINT n) { memcpy(at, v, n * sizeof(float)); }
+static void pv_put_colour(BYTE *at, BYTE type, const float c[4]) {
+  if (type != D3DDECLTYPE_D3DCOLOR) {
+    pv_put_floats(at, c, type == D3DDECLTYPE_FLOAT3 ? 3 : 4);
+    return;
+  }
+  DWORD v = 0;
+  const int order[4] = {2, 1, 0, 3};      /* (a D3DCOLOR: blue in the low byte, alpha in the top one) */
+  for (int k = 0; k < 4; ++k) {
+    const float x = ffl_clamp(c[order[k]]);
+    v |= (DWORD)(x * 255.0f + 0.5f) << (8 * k);
+  }
+  memcpy(at, &v, 4);
+}
+/* The clip codes of a position in clip space (D3DCS_*): the six planes of the volume, and the program's clip planes that are on. */
+static DWORD pv_clip_codes(const State *s, const float c[4], const float world[4]) {
+  DWORD codes = 0;
+  if (c[0] < -c[3]) codes |= D3DCS_LEFT;
+  if (c[0] > c[3]) codes |= D3DCS_RIGHT;
+  if (c[1] < -c[3]) codes |= D3DCS_BOTTOM;
+  if (c[1] > c[3]) codes |= D3DCS_TOP;
+  if (c[2] < 0.0f) codes |= D3DCS_FRONT;
+  if (c[2] > c[3]) codes |= D3DCS_BACK;
+  for (UINT i = 0; i < 6; ++i) {
+    if (!(s->rs[D3DRS_CLIPPLANEENABLE] >> i & 1)) continue;
+    const float *p = s->clip_plane[i];
+    /* (the planes are in world space for the fixed-function stage) */
+    if (p[0] * world[0] + p[1] * world[1] + p[2] * world[2] + p[3] * world[3] < 0.0f) codes |= D3DCS_PLANE0 << i;
+  }
+  return codes;
+}
+static HRESULT STDMETHODCALLTYPE dev_ProcessVertices(Dev *d, UINT src_start, UINT dst_index, UINT count, IDirect3DVertexBuffer9 *dst_buffer,
+                                                     IDirect3DVertexDeclaration9 *declaration, DWORD flags) {
+  Buffer *out = vb_of(dst_buffer);
+  Decl *out_decl = decl_of(declaration);
+  if (!out || (declaration && !out_decl) || (flags & ~(DWORD)D3DPV_DONOTCOPYDATA)) return D3DERR_INVALIDCALL;
+  D3DVERTEXELEMENT9 out_elements[MAX_ELEMENTS + 1];
+  PvOutput o;
+  const BOOL have = out_decl ? pv_output_of(out_decl->elements, out_decl->count, &o) : pv_output_of(out_elements, fvf_elements(out->fvf, out_elements), &o);
+  if (!have || o.stride == 0) return D3DERR_INVALIDCALL;
+  if (count == 0) return D3D_OK;
+  if (dst_index > out->length / o.stride || count > out->length / o.stride - dst_index) return D3DERR_INVALIDCALL;
+  EnterCriticalSection(&d->lock);
+  State *s = &d->state;
+  HRESULT hr = D3D_OK;
+  Layout layout;
+  D3DVERTEXELEMENT9 fvf[16];
+  if (s->decl) layout = s->decl->layout;
+  else layout_of_elements(fvf, fvf_elements(s->fvf, fvf), &layout);
+  Source sources[STREAMS];
+  stream_sources(d, sources);
+  /* (what the vertices have not - no declaration, no position, a stream too short - is refused, as is a program's vertex shader: see above) */
+  BOOL inside = (s->decl || s->fvf) && !s->vs && layout.position.type != 255;
+  const Attribute *parts[] = {&layout.position, &layout.colour, &layout.specular, &layout.normal, &layout.weights, &layout.indices, &layout.position1, &layout.normal1,
+                              &layout.point_size};
+  for (UINT i = 0; inside && i < sizeof parts / sizeof parts[0]; ++i) inside = attribute_inside(parts[i], sources, src_start, count);
+  for (UINT t = 0; inside && t < TEXTURE_SETS; ++t) inside = o.texture[t] < 0 || attribute_inside(&layout.texture[t], sources, src_start, count);
+  BYTE *decoded = inside ? mem_alloc((SIZE_T)count * VERTEX_BYTES(0)) : NULL;
+  Blend *blend = NULL;
+  const D3DMATRIX world = s->world[0];
+  if (!inside) hr = D3DERR_INVALIDCALL;
+  else if (!decoded) hr = E_OUTOFMEMORY;
+  else if (!layout.transformed) {
+    const DWORD mode = s->rs[D3DRS_VERTEXBLEND];
+    const UINT matrices = mode == D3DVBF_0WEIGHTS ? 1u : mode >= D3DVBF_1WEIGHTS && mode <= D3DVBF_3WEIGHTS ? (UINT)mode + 1u : 0u;
+    if (matrices || mode == D3DVBF_TWEENING) {
+      blend = mem_alloc(sizeof *blend);
+      if (!blend) hr = E_OUTOFMEMORY;
+      else {
+        blend->matrices = mode == D3DVBF_TWEENING ? 0 : matrices;
+        blend->indexed = s->rs[D3DRS_INDEXEDVERTEXBLENDENABLE] != 0;
+        blend->tween = mode == D3DVBF_TWEENING;
+        memcpy(&blend->tween_factor, &s->rs[D3DRS_TWEENFACTOR], 4);
+        memcpy(blend->copy, s->world, sizeof blend->copy);
+        blend->world = blend->copy;
+        if (!blend->tween) s->world[0] = g_identity;      /* (blended into world space: the world matrix is the identity for what follows) */
+      }
+    }
+  }
+  if (SUCCEEDED(hr)) {
+    FflSetup lighting;
+    const BOOL lit = s->rs[D3DRS_LIGHTING] && !layout.transformed;
+    if (lit) lighting_of(s, &lighting);
+    Coordinates coordinates;
+    coordinates_of(s, &layout, FALSE, 0, &coordinates);
+    decode_vertices(&layout, sources, src_start, count, decoded, lit ? &lighting : NULL, &coordinates, blend);
+    const D3DMATRIX world_view = matrix_multiply(&s->world[0], &s->view), all = matrix_multiply(&world_view, &s->projection);
+    const D3DVIEWPORT9 *vp = &s->viewport;
+    const BOOL clipping = s->rs[D3DRS_CLIPPING] != 0, fog = vertex_fog(s, &layout);
+    float start, end, density, point_size;
+    memcpy(&start, &s->rs[D3DRS_FOGSTART], 4);
+    memcpy(&end, &s->rs[D3DRS_FOGEND], 4);
+    memcpy(&density, &s->rs[D3DRS_FOGDENSITY], 4);
+    memcpy(&point_size, &s->rs[D3DRS_POINTSIZE], 4);
+    DWORD clip_union = 0, clip_intersection = 0xFFFFFFFFu;
+    BYTE *to = out->data + (SIZE_T)dst_index * o.stride;
+    for (UINT v = 0; v < count; ++v, to += o.stride) {
+      const float *f = (const float *)(decoded + (SIZE_T)v * VERTEX_BYTES(0));
+      float position[4] = {f[0], f[1], f[2], f[3]};
+      if (!layout.transformed) {
+        const float p[4] = {f[0], f[1], f[2], 1.0f};
+        float c[4];
+        blend_point(&all, p, c);
+        if (clipping) {
+          const DWORD codes = pv_clip_codes(s, c, p);
+          clip_union |= codes;
+          clip_intersection &= codes;
+        }
+        const float eps = 1e-8f;
+        if (!clipping || (-c[3] - eps < c[0] && -c[3] - eps < c[1] && c[0] - eps < c[3] && c[1] - eps < c[3] && c[2] < c[3] + eps && c[2] > -eps && c[3] > eps)) {
+          const float inverse = c[3] != 0.0f ? 1.0f / c[3] : 1.0f;
+          position[0] = c[0] * inverse * (vp->Width / 2.0f) + vp->Width / 2.0f + vp->X;
+          position[1] = -c[1] * inverse * (vp->Height / 2.0f) + vp->Height / 2.0f + vp->Y;
+          position[2] = c[2] * inverse * (vp->MaxZ - vp->MinZ) + vp->MinZ;
+          position[3] = inverse;
+        } else {
+          position[0] = (c[0] + c[3]) / 2.0f;
+          position[1] = (c[1] + c[3]) / 2.0f;
+          position[2] = c[2];
+          position[3] = c[3];
+        }
+      }
+      pv_put_floats(to + o.position, position, o.rhw ? 4 : 3);
+      if (flags & D3DPV_DONOTCOPYDATA) continue;
+      if (o.diffuse >= 0) pv_put_colour(to + o.diffuse, o.colour_type[0], f + 4);
+      if (o.specular >= 0) {
+        float specular[4] = {f[9], f[10], f[11], f[8]};
+        if (fog) {      /* (the vertex fog factor, by the depth in view space, in its alpha) */
+          const float p[4] = {f[0], f[1], f[2], 1.0f};
+          float view[4];
+          blend_point(&world_view, p, view);
+          float depth = view[2] < 0.0f ? -view[2] : view[2];
+          if (s->rs[D3DRS_RANGEFOGENABLE]) depth = ffl_sqrt(view[0] * view[0] + view[1] * view[1] + view[2] * view[2]);
+          const DWORD mode = s->rs[D3DRS_FOGVERTEXMODE];
+          const float log2_e = 1.44269504f;
+          float factor = 1.0f;
+          if (mode == D3DFOG_LINEAR) factor = end != start ? (end - depth) / (end - start) : 1.0f;
+          else if (mode == D3DFOG_EXP) factor = ffl_pow(2.0f, -density * depth * log2_e);
+          else if (mode == D3DFOG_EXP2) factor = ffl_pow(2.0f, -density * density * depth * depth * log2_e);
+          specular[3] = ffl_clamp(factor);
+        }
+        pv_put_colour(to + o.specular, o.colour_type[1], specular);
+      }
+      if (o.point_size >= 0) {
+        float size = point_size;
+        if (layout.point_size.type != 255) {
+          float value[4] = {0, 0, 0, 1};
+          decode_element(layout.point_size.type, source_at(&sources[layout.point_size.stream], src_start + v, layout.point_size.offset), value);
+          size = value[0];
+        }
+        pv_put_floats(to + o.point_size, &size, 1);
+      }
+      if (o.normal >= 0) {
+        float normal[4] = {0, 0, 0, 0};
+        if (layout.normal.type != 255) decode_element(layout.normal.type, source_at(&sources[layout.normal.stream], src_start + v, layout.normal.offset), normal);
+        pv_put_floats(to + o.normal, normal, 3);
+      }
+      for (UINT t = 0; t < TEXTURE_SETS; ++t) {
+        if (o.texture[t] < 0) continue;
+        float value[4] = {0, 0, 0, 1};
+        const Attribute *a = &layout.texture[t];
+        if (a->type != 255) decode_element(a->type, source_at(&sources[a->stream], src_start + v, a->offset), value);
+        pv_put_floats(to + o.texture[t], value, (UINT)o.texture_type[t] + 1u);      /* (FLOAT1 .. FLOAT4 are 0 .. 3) */
+      }
+    }
+    if (clipping) {
+      d->clip_status.ClipUnion = clip_union;
+      d->clip_status.ClipIntersection = clip_intersection;
+    }
+  }
+  if (blend) {
+    s->world[0] = world;
+    mem_free(blend);
+  }
+  if (decoded) mem_free(decoded);
   LeaveCriticalSection(&d->lock);
   return hr;
 }

@@ -88,10 +88,10 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 #define TEXTURE_SETS 8u                /* the sets of texture coordinates a vertex can have */
 #define VERTEX_RING (1u << 20)       /* (21845 vertices a draw at most. The rings are kept small: each is there three times - here, in the kernel, on the device) */
 #define INDEX_RING (256u << 10)
-#define CONSTANT_RING (256u << 10)
+#define CONSTANT_RING (1024u << 10)
 #define VERTEX_REGISTERS 11u           /* the constants of the fixed-function vertex shader, in registers of four floats */
 #define FIXED_SHADERS 48u              /* the pixel shaders of texture stage set-ups that are kept */
-#define CONSTANT_REGISTERS 256u        /* the block of a draw, at most */
+#define CONSTANT_REGISTERS 1024u       /* the block of a draw, at most (a vertex shader 3.0 has 256 floats, 16 bools and its state; a pixel shader 3.0 224, 16, 5 and 16 fills) */
 #define VS_FLOATS 256u                 /* the float constants a program sets for its vertex shaders, */
 #define PS_FLOATS 224u                 /* ... and for its pixel shaders */
 #define SHADER_INPUTS 16u
@@ -207,6 +207,9 @@ struct Surface {
                                     or the device's depth buffer (it begins at no reference, keeps the device while it has one, and goes with what made it) */
   DxObj *container;              /* GetContainer: the texture, the swap chain, or (NULL) the device */
   HDC dc;                        /* GetDC .. ReleaseDC */
+  D3D12_CPU_DESCRIPTOR_HANDLE view;      /* a target that is not level 0 of a 2D texture (another level, a face of a cube): its own render target view */
+  UINT view_slot;
+  BOOL has_view;
   HBITMAP bitmap;
   HGDIOBJ old_bitmap;
   BYTE *dib;
@@ -234,8 +237,10 @@ typedef struct Decl {
 typedef struct Stream { Buffer *buffer; UINT offset, stride, freq; } Stream;      /* (freq: SetStreamSourceFreq's value) */
 
 /* A vertex or pixel shader of the program's: its tokens (GetFunction gives them back) and what the translator made of them. */
+#define SHADER_MAGIC 0x39534854u      /* "THS9": Shader.magic */
 typedef struct Shader {
   Child c;
+  UINT magic;
   int vertex;
   DWORD *code;
   UINT code_bytes;
@@ -245,7 +250,8 @@ typedef struct Shader {
   int bools;                     /* it reads bool constants: 16 registers after the floats */
   UINT registers;                /* all it takes of a draw's block */
   UINT major;                    /* its shader model */
-  UINT state;                    /* a pixel shader: the first of its state registers (the alpha test and fog: sm_to_dxbc.h) */
+  UINT state;                    /* the first of its state registers (a pixel shader's alpha test and fog, a vertex shader's half pixel: sm_to_dxbc.h) */
+  UINT fill;                     /* a pixel shader: the first of its fill registers, one a sampler up to sampler_count (what a texture's format has not reads 1) */
   UINT sampler_count;            /* a pixel shader: the highest sampler it reads, and one */
   BYTE sampler_kind[16];         /* ... and what each is declared as (SM_SAMPLER_*: Tex.kind) */
   UINT coordinates;              /* ... and the highest set of texture coordinates */
@@ -305,6 +311,10 @@ typedef struct Pipeline {
   DWORD twosided, ccw_fail, ccw_zfail, ccw_pass, ccw_func;   /* D3DRS_TWOSIDEDSTENCILMODE and the counter-clockwise faces' operations */
   DWORD topology;                /* D3D12_PRIMITIVE_TOPOLOGY_TYPE */
   DWORD depth_format;            /* the DXGI format of the depth buffer, 0 for none */
+  DWORD target_format;           /* ... and of the render target */
+  DWORD targets;                 /* the render targets drawn into (1 .. 4) */
+  DWORD extra_format[3];         /* the formats of targets 1 .. 3 */
+  DWORD extra_write;             /* their D3DRS_COLORWRITEENABLE1 .. 3, four bits each */
   ID3D12PipelineState *state;
   UINT last_used;
 } Pipeline;
@@ -542,6 +552,7 @@ static const GUID *const g_query_iids[] = {&IID_IDirect3DQuery9, NULL};
 /* ---- the command list ------------------------------------------------------------------------------------------------------------------------------- */
 
 static void record_pending_clears(Dev *d);
+static int adapter_mipmapped_layers(void);
 static void queries_before_submit(Dev *d);
 static void queries_after_submit(Dev *d);
 static void queries_before_draw(Dev *d);

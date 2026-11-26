@@ -218,8 +218,8 @@ static BYTE *tex_shadow(Tex *t, UINT sub) {
 /* The Direct3D 12 subresource of a subresource (the kernel keeps all levels of a 2D texture, one of a cube's or a volume's). */
 static UINT tex_d12_sub(const Tex *t, UINT sub) { return sub_level(t, sub) + sub_face(t, sub) * t->kmips; }
 
-/* Sends rows of B8G8R8A8 pixels (or a compressed format's blocks) into a part of a subresource: `rect` of it (NULL: the whole), from `pixels` with rows `pitch`
- * bytes apart, slices `slice_pitch` apart for a volume. The list is sent with it. */
+/* Sends rows of pixels as the Direct3D 12 texture has them (B8G8R8A8, a wide format's own, or a compressed format's blocks) into a part of a subresource: `rect`
+ * of it (NULL: the whole), from `pixels` with rows `pitch` bytes apart, slices `slice_pitch` apart for a volume. The list is sent with it. */
 static HRESULT tex_upload_rows(Dev *d, Tex *t, UINT sub, const RECT *rect, const BYTE *pixels, UINT pitch, UINT slice_pitch) {
   if (!t->res || t->depth || sub_level(t, sub) >= t->kmips) return D3D_OK;      /* (a level the kernel does not keep) */
   const UINT w = sub_width(t, sub), h = sub_height(t, sub), slices = tex_slices(t, sub), block = dxt_block(t->format);
@@ -227,7 +227,7 @@ static HRESULT tex_upload_rows(Dev *d, Tex *t, UINT sub, const RECT *rect, const
   if (rect) r = *rect;
   if (r.left < 0 || r.top < 0 || r.right > (LONG)w || r.bottom > (LONG)h || r.left >= r.right || r.top >= r.bottom) return D3DERR_INVALIDCALL;
   const UINT rw = (UINT)(r.right - r.left), rh = (UINT)(r.bottom - r.top);
-  const UINT row_bytes = block ? (rw + 3) / 4 * block : rw * 4, rows = block ? (rh + 3) / 4 : rh;
+  const UINT row_bytes = block ? (rw + 3) / 4 * block : rw * gpu_bytes(t->format), rows = block ? (rh + 3) / 4 : rh;
   const UINT row_pitch = (row_bytes + 255u) & ~255u;
   settle(d, t->used);
   ID3D12Resource *upload = make_buffer(d, D3D12_HEAP_TYPE_UPLOAD, (UINT64)row_pitch * rows * slices);
@@ -244,7 +244,7 @@ static HRESULT tex_upload_rows(Dev *d, Tex *t, UINT sub, const RECT *rect, const
   to.SubresourceIndex = tex_d12_sub(t, sub);
   from.pResource = upload;
   from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-  from.PlacedFootprint.Footprint.Format = block ? dxt_dxgi(t->format) : DXGI_FORMAT_B8G8R8A8_UNORM;
+  from.PlacedFootprint.Footprint.Format = gpu_dxgi(t->format);
   from.PlacedFootprint.Footprint.Width = block ? (rw + 3) & ~3u : rw;
   from.PlacedFootprint.Footprint.Height = block ? (rh + 3) & ~3u : rh;
   from.PlacedFootprint.Footprint.Depth = slices;
@@ -260,6 +260,14 @@ static HRESULT tex_upload(Dev *d, Tex *t, UINT sub) {
   if (!t->res || t->depth || !t->shadow[sub] || sub_level(t, sub) >= t->kmips) return D3D_OK;
   const UINT w = sub_width(t, sub), h = sub_height(t, sub), slices = tex_slices(t, sub), bytes = format_bytes(t->format);
   if (dxt_block(t->format)) return tex_upload_rows(d, t, sub, NULL, t->shadow[sub], format_pitch(t->format, w), format_pitch(t->format, w) * format_rows(t->format, h));
+  if (format_is_wide(t->format)) {      /* (its own pixels: as they are, but for A2R10G10B10's red and blue) */
+    BYTE *rows = mem_alloc((SIZE_T)w * bytes * h * slices);
+    if (!rows) return E_OUTOFMEMORY;
+    for (UINT row = 0; row < h * slices; ++row) row_to_gpu(t->format, t->shadow[sub] + (SIZE_T)row * w * bytes, w, rows + (SIZE_T)row * w * bytes);
+    const HRESULT hr = tex_upload_rows(d, t, sub, NULL, rows, w * bytes, w * bytes * h);
+    mem_free(rows);
+    return hr;
+  }
   BYTE *bgra = mem_alloc((SIZE_T)w * 4 * h * slices);
   if (!bgra) return E_OUTOFMEMORY;
   const PALETTEENTRY *palette = format_is_palette(t->format) ? current_palette(d) : NULL;
@@ -269,11 +277,11 @@ static HRESULT tex_upload(Dev *d, Tex *t, UINT sub) {
   mem_free(bgra);
   return hr;
 }
-/* Fetches a subresource of a Direct3D 12 texture (a 2D level or a cube's face) as rows of B8G8R8A8, `pitch` bytes apart. */
+/* Fetches a subresource of a Direct3D 12 texture (a 2D level or a cube's face) as the texture has its rows (B8G8R8A8, or a wide format's own), `pitch` bytes apart. */
 static HRESULT tex_download(Dev *d, Tex *t, UINT sub, BYTE *rows, UINT pitch) {
   if (!t->res || t->depth || dxt_block(t->format) || t->kind == 1) return D3DERR_INVALIDCALL;
-  const UINT w = sub_width(t, sub), h = sub_height(t, sub);
-  const UINT row_pitch = (w * 4 + 255u) & ~255u;
+  const UINT w = sub_width(t, sub), h = sub_height(t, sub), bytes = gpu_bytes(t->format);
+  const UINT row_pitch = (w * bytes + 255u) & ~255u;
   ID3D12Resource *readback = make_buffer(d, D3D12_HEAP_TYPE_READBACK, (UINT64)row_pitch * h);
   if (!readback) return E_OUTOFMEMORY;
   D3D12_TEXTURE_COPY_LOCATION to, from;
@@ -281,7 +289,7 @@ static HRESULT tex_download(Dev *d, Tex *t, UINT sub, BYTE *rows, UINT pitch) {
   memset(&from, 0, sizeof from);
   to.pResource = readback;
   to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-  to.PlacedFootprint.Footprint.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+  to.PlacedFootprint.Footprint.Format = gpu_dxgi(t->format);
   to.PlacedFootprint.Footprint.Width = w;
   to.PlacedFootprint.Footprint.Height = h;
   to.PlacedFootprint.Footprint.Depth = 1;
@@ -295,7 +303,7 @@ static HRESULT tex_download(Dev *d, Tex *t, UINT sub, BYTE *rows, UINT pitch) {
   const BYTE *memory = NULL;
   HRESULT hr = ID3D12Resource_Map(readback, 0, NULL, (void **)&memory);
   if (SUCCEEDED(hr) && memory) {
-    for (UINT row = 0; row < h; ++row) memcpy(rows + (SIZE_T)row * pitch, memory + (SIZE_T)row * row_pitch, (SIZE_T)w * 4);
+    for (UINT row = 0; row < h; ++row) memcpy(rows + (SIZE_T)row * pitch, memory + (SIZE_T)row * row_pitch, (SIZE_T)w * bytes);
     ID3D12Resource_Unmap(readback, 0, NULL);
   } else if (SUCCEEDED(hr)) hr = E_FAIL;
   ID3D12Resource_Release(readback);
@@ -307,7 +315,12 @@ static HRESULT tex_fetch(Dev *d, Tex *t, UINT sub) {
   if (!shadow) return E_OUTOFMEMORY;
   if (!tex_device_owned(t) || t->depth) return D3D_OK;
   const UINT w = sub_width(t, sub), h = sub_height(t, sub);
-  if (format_bytes(t->format) == 4 && (t->format == D3DFMT_A8R8G8B8 || t->format == D3DFMT_X8R8G8B8)) {
+  if (format_is_wide(t->format)) {
+    const HRESULT hr = tex_download(d, t, sub, shadow, w * format_bytes(t->format));
+    if (SUCCEEDED(hr)) for (UINT row = 0; row < h; ++row) row_from_gpu(t->format, shadow + (SIZE_T)row * w * format_bytes(t->format), w, shadow + (SIZE_T)row * w * format_bytes(t->format));
+    return hr;
+  }
+  if (t->format == D3DFMT_A8R8G8B8 || t->format == D3DFMT_X8R8G8B8) {
     const HRESULT hr = tex_download(d, t, sub, shadow, w * 4);
     if (SUCCEEDED(hr) && t->format == D3DFMT_X8R8G8B8) for (SIZE_T i = 3; i < (SIZE_T)w * h * 4; i += 4) shadow[i] = 0xFF;      /* (X8: the top byte reads as 0xFF) */
     return hr;
@@ -373,12 +386,13 @@ static HRESULT tex_make_kind(Dev *d, UINT kind, UINT width, UINT height, UINT sl
   if (dxt_block(format) && (kind == 1 || (usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)) || existing)) return D3DERR_NOTAVAILABLE;      /* (compressed: sampled 2D textures and cubes) */
   if (kind == 1 && (slices == 0 || slices > 256)) return D3DERR_INVALIDCALL;
   if (kind == 3 && width != height) return D3DERR_INVALIDCALL;
+  if (depth && (usage & D3DUSAGE_RENDERTARGET)) return D3DERR_INVALIDCALL;      /* (a depth format is no colour target: CreateRenderTarget(D3DFMT_D16) is refused) */
   const BOOL target = !depth && (usage & D3DUSAGE_RENDERTARGET) != 0;
   if (target && !format_is_target(format)) return D3DERR_NOTAVAILABLE;
   if ((target || depth) && memory_only) return D3DERR_INVALIDCALL;
   if (format_is_palette(format) && (target || depth)) return D3DERR_NOTAVAILABLE;
-  /* (the kernel samples volumes and cubes; it does not draw into them) */
-  if (kind && (depth || target || existing)) return D3DERR_NOTAVAILABLE;
+  /* (the kernel samples volumes and cubes, and draws into the faces of a cube; not into a volume, nor a cube of depth) */
+  if (kind && (depth || existing || (target && kind == 1))) return D3DERR_NOTAVAILABLE;
   if (depth && !memory_only && d->dsv_free_count == 0) return E_OUTOFMEMORY;
   if (target && d->rtv_free_count == 0) return E_OUTOFMEMORY;
   UINT full = 1;
@@ -386,7 +400,9 @@ static HRESULT tex_make_kind(Dev *d, UINT kind, UINT width, UINT height, UINT sl
   if (kind == 1 && slices > largest) largest = slices;
   for (UINT size = largest; size > 1; size >>= 1) ++full;
   if (levels == 0 || levels > full) levels = full;
-  if ((usage & D3DUSAGE_AUTOGENMIPMAP) && pool != D3DPOOL_SYSTEMMEM && pool != D3DPOOL_SCRATCH) levels = full;      /* (the program sees one; the others are made from it) */
+  /* (the program sees one level of D3DUSAGE_AUTOGENMIPMAP; the others are made from it where the format can be drawn into - D3DOK_NOAUTOGEN else) */
+  if (usage & D3DUSAGE_AUTOGENMIPMAP) levels = kind == 0 && format_is_target(format) && pool != D3DPOOL_SYSTEMMEM && pool != D3DPOOL_SCRATCH ? full : 1;
+  if (kind && !adapter_mipmapped_layers()) levels = 1;      /* (cubes and volumes of one level where the kernel keeps one: the caps have no MIPCUBEMAP) */
   if (target || depth) levels = kind == 0 && target && !(flags & (TEX_ALONE | TEX_IMPLICIT)) ? levels : 1;
   if (levels > MAX_LEVELS) levels = MAX_LEVELS;
   const BOOL implicit = (flags & (TEX_IMPLICIT | TEX_INTERNAL)) != 0;
@@ -398,7 +414,7 @@ static HRESULT tex_make_kind(Dev *d, UINT kind, UINT width, UINT height, UINT sl
   t->levels = levels;
   t->kind = kind;
   t->slices = kind == 1 ? slices : 1;
-  t->kmips = kind ? 1 : levels;      /* (the kernel's volumes and cubes have one level: the program's others are dropped) */
+  t->kmips = levels;
   t->format = format;
   t->usage = usage;
   t->pool = pool;
@@ -418,7 +434,7 @@ static HRESULT tex_make_kind(Dev *d, UINT kind, UINT width, UINT height, UINT sl
     D3D12_HEAP_PROPERTIES props = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
     D3D12_RESOURCE_DESC rd = {kind == 1 ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height,
                               (UINT16)(kind == 1 ? slices : kind == 3 ? 6 : 1), (UINT16)t->kmips,
-                              depth ? depth_dxgi(format) : dxt_block(format) ? dxt_dxgi(format) : DXGI_FORMAT_B8G8R8A8_UNORM,
+                              depth ? depth_dxgi(format) : gpu_dxgi(format),
                               {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, depth ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL : target ? D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET : D3D12_RESOURCE_FLAG_NONE};
     /* (Direct3D 12 knows a cube only by its views; the kernel has to know it now. A shared one gets a global share handle, the legacy kind Direct3D 9 hands out,
      * and carries its description for the device that opens it) */
@@ -545,8 +561,10 @@ static void tex_describe(const Tex *t, UINT sub, D3DSURFACE_DESC *desc) {
 
 /* Makes the levels of a D3DUSAGE_AUTOGENMIPMAP texture from its top level (each from the one above, two by two pixels into one, as the filter type asks:
  * a box for D3DTEXF_LINEAR and the others, the top left one for D3DTEXF_POINT). */
+static void tex_generate_wide_levels(Dev *d, Tex *t);
 static void tex_generate_levels(Dev *d, Tex *t) {
   if (!t->res || t->levels < 2 || t->kind != 0) { t->autogen_dirty = 0; return; }
+  if (format_is_wide(t->format)) { tex_generate_wide_levels(d, t); return; }
   const UINT w = t->width, h = t->height;
   BYTE *level = mem_alloc((SIZE_T)w * h * 4), *next = mem_alloc((SIZE_T)w * h * 4);
   if (!level || !next) { mem_free(level); mem_free(next); return; }
@@ -570,6 +588,41 @@ static void tex_generate_levels(Dev *d, Tex *t) {
   }
   mem_free(level);
   mem_free(next);
+  t->autogen_dirty = 0;
+}
+
+/* The same for a wide format: each level a box (or the top left one) of the one above, as four floats a pixel, sent as the format's pixels. */
+static void tex_generate_wide_levels(Dev *d, Tex *t) {
+  const UINT w = t->width, h = t->height, bytes = format_bytes(t->format);
+  float *level = mem_alloc((SIZE_T)w * h * 16), *next = mem_alloc((SIZE_T)w * h * 16);
+  BYTE *raw = mem_alloc((SIZE_T)w * h * bytes);
+  HRESULT hr = level && next && raw ? D3D_OK : E_OUTOFMEMORY;
+  if (SUCCEEDED(hr)) {
+    if (tex_device_owned(t)) {
+      hr = tex_download(d, t, 0, raw, w * bytes);
+      if (SUCCEEDED(hr)) for (UINT row = 0; row < h; ++row) row_from_gpu(t->format, raw + (SIZE_T)row * w * bytes, w, raw + (SIZE_T)row * w * bytes);
+    } else if (t->shadow[0]) memcpy(raw, t->shadow[0], (SIZE_T)w * h * bytes);
+    else memset(raw, 0, (SIZE_T)w * h * bytes);
+  }
+  if (SUCCEEDED(hr)) for (SIZE_T i = 0; i < (SIZE_T)w * h; ++i) wide_to_float(t->format, raw + i * bytes, level + i * 4);
+  for (UINT l = 1; SUCCEEDED(hr) && l < t->levels; ++l) {
+    const UINT pw = level_size(w, l - 1), ph = level_size(h, l - 1), lw = level_size(w, l), lh = level_size(h, l);
+    for (UINT y = 0; y < lh; ++y)
+      for (UINT x = 0; x < lw; ++x)
+        for (UINT c = 0; c < 4; ++c) {
+          const UINT x0 = x * 2 < pw ? x * 2 : pw - 1, y0 = y * 2 < ph ? y * 2 : ph - 1, x1 = x0 + 1 < pw ? x0 + 1 : x0, y1 = y0 + 1 < ph ? y0 + 1 : y0;
+          next[((SIZE_T)y * lw + x) * 4 + c] = t->autogen_filter == D3DTEXF_POINT ? level[((SIZE_T)y0 * pw + x0) * 4 + c]
+                                               : (level[((SIZE_T)y0 * pw + x0) * 4 + c] + level[((SIZE_T)y0 * pw + x1) * 4 + c] + level[((SIZE_T)y1 * pw + x0) * 4 + c] +
+                                                  level[((SIZE_T)y1 * pw + x1) * 4 + c]) * 0.25f;
+        }
+    for (SIZE_T i = 0; i < (SIZE_T)lw * lh; ++i) float_to_wide(t->format, next + i * 4, raw + i * bytes);
+    for (UINT row = 0; row < lh; ++row) row_to_gpu(t->format, raw + (SIZE_T)row * lw * bytes, lw, raw + (SIZE_T)row * lw * bytes);
+    hr = tex_upload_rows(d, t, l, NULL, raw, lw * bytes, lw * bytes * lh);
+    float *swap = level; level = next; next = swap;
+  }
+  mem_free(level);
+  mem_free(next);
+  mem_free(raw);
   t->autogen_dirty = 0;
 }
 
@@ -765,10 +818,45 @@ static void surface_release_dc(Surface *s);
 static void surface_destroy(DxObj *o) {
   Surface *s = (Surface *)o;
   if (s->dc) surface_release_dc(s);
+  if (s->has_view) {
+    Dev *d = s->c.dev;
+    if (d->rtv_free_count < RTV_SLOTS) d->rtv_free[d->rtv_free_count++] = s->view_slot;
+    s->has_view = FALSE;
+  }
   if (s->kind == SURFACE_ALONE && s->tex) {
     default_resource_gone(s->c.dev, s->tex->pool);
     obj_free(OBJ(s->tex));
   }
+}
+/* Whether a surface can be drawn into: a target's level the kernel keeps (of a cube: of each face). */
+static BOOL surface_drawable(const Surface *s) { return s->tex->target && s->tex->res && sub_level(s->tex, s->sub) < s->tex->kmips; }
+/* The render target view of a surface: the texture's own for level 0 of a 2D one (a swap chain's buffers change resource behind it: tex_make_view), else one of
+ * the surface's, of its level and face, made on the first draw into it. A zero handle when there are no slots left. */
+static D3D12_CPU_DESCRIPTOR_HANDLE surface_target_view(Dev *d, Surface *s) {
+  Tex *t = s->tex;
+  if (s->sub == 0 && t->kind == 0) return t->view;
+  if (!s->has_view) {
+    D3D12_CPU_DESCRIPTOR_HANDLE none = {0};
+    if (d->rtv_free_count == 0) return none;
+    s->view_slot = d->rtv_free[--d->rtv_free_count];
+    s->view = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(d->rtv_heap);
+    s->view.ptr += (SIZE_T)s->view_slot * ID3D12Device_GetDescriptorHandleIncrementSize(d->d12, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    D3D12_RENDER_TARGET_VIEW_DESC desc;
+    memset(&desc, 0, sizeof desc);
+    desc.Format = gpu_dxgi(t->format);
+    if (t->kind == 3) {
+      desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+      desc.Texture2DArray.MipSlice = sub_level(t, s->sub);
+      desc.Texture2DArray.FirstArraySlice = sub_face(t, s->sub);
+      desc.Texture2DArray.ArraySize = 1;
+    } else {
+      desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+      desc.Texture2D.MipSlice = sub_level(t, s->sub);
+    }
+    ID3D12Device_CreateRenderTargetView(d->d12, t->res, &desc, s->view);
+    s->has_view = TRUE;
+  }
+  return s->view;
 }
 /* A surface of a level of a texture: made on the first ask, it counts with the texture (and is freed with it). */
 static Surface *surface_of_level(Tex *t, UINT sub) {

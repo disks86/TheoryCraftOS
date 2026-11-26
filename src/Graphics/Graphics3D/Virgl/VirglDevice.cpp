@@ -2448,7 +2448,9 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         if (cmd.pass.level[0] >= color->mip_levels() || (depth && cmd.pass.level[kMaxColorTargets] >= depth->mip_levels())) return false;
         const Extent2D e = {mip_extent(color->extent().width, cmd.pass.level[0]), mip_extent(color->extent().height, cmd.pass.level[0])};
         auto sized = [&](const VirglImage* image, uint32_t level) { return level < image->mip_levels() && mip_extent(image->extent().width, level) == e.width && mip_extent(image->extent().height, level) == e.height; };
-        if (depth && !sized(depth, cmd.pass.level[kMaxColorTargets])) return false;
+        // (a depth target as large as the pass or larger - the framebuffer is the part all have, as OpenGL and Direct3D 9 have it - not a smaller one)
+        auto covers = [&](const VirglImage* image, uint32_t level) { return level < image->mip_levels() && mip_extent(image->extent().width, level) >= e.width && mip_extent(image->extent().height, level) >= e.height; };
+        if (depth && !covers(depth, cmd.pass.level[kMaxColorTargets])) return false;
         target_count = 1;
         for (uint32_t n = 0; n + 1 < kMaxColorTargets; ++n) {
           extra_colors[n] = static_cast<VirglImage*>(cmd.pass.extra_colors[n]);

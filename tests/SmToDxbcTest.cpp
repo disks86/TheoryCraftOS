@@ -521,7 +521,7 @@ void test_pixel_state(HostAllocator& allocator) {
   sm_state_none(g_state);
   // the state registers follow the floats and the bools
   {
-    Asm a(false, 2, 0);
+    Asm a(false, 2, 1);      // (ps_2_x: ps_2_0 has no bools)
     a.ins(40, {src(kConstBool, 2)}).ins(1, {dst(kColorOut, 0), src(kConst, 6)}).ins(42, {}).ins(1, {dst(kColorOut, 0), src(kInput, 0)}).ins(43, {});
     const Tokens tokens = a.end();
     CHECK(sm_translate(tokens.data(), tokens.size(), &g_shader, &g_context) == SM_OK && g_shader.float_registers == 7 && g_shader.state_register == 7 + SM_BOOL_REGISTERS &&
@@ -567,10 +567,39 @@ void test_refusals() {
     CHECK(status_of(a.end()) == SM_OK);
     CHECK(g_shader.sampler_kind[0] == (type == 3 ? SM_SAMPLER_CUBE : type == 4 ? SM_SAMPLER_VOLUME : SM_SAMPLER_2D));
   }
+  // the fill registers: one for each sampler up to the highest read, after the state registers
   {
     Asm a(false, 2, 0);
-    a.ins(1, {dst(kColorOut, 1), src(kInput, 0)});      // a second render target
-    CHECK(status_of(a.end()) == SM_UNSUPPORTED);
+    a.dcl(2u << 27, 0, reg(kSampler, 2));
+    a.ins(66, {dst(kTemp, 0), src(kAddr, 0), src(kSampler, 2)}).ins(1, {dst(kColorOut, 0), src(kTemp, 0)});
+    CHECK(status_of(a.end()) == SM_OK && g_shader.fill_register == g_shader.state_register + SM_STATE_REGISTERS &&
+          g_shader.constant_registers == g_shader.fill_register + 3);
+  }
+  // the constants each version has: c8 is past a pixel shader 1.x's, c32 past 2.0's, c224 past 3.0's; vertex shaders have 256
+  {
+    struct Limit { bool vertex; uint32_t major, minor, number; int status; };
+    const Limit limits[] = {{false, 1, 4, 7, SM_OK}, {false, 1, 4, 8, SM_INVALID}, {false, 2, 0, 31, SM_OK}, {false, 2, 0, 32, SM_INVALID},
+                            {false, 3, 0, 223, SM_OK}, {false, 3, 0, 224, SM_INVALID}, {true, 2, 0, 255, SM_OK}, {true, 2, 0, 256, SM_INVALID}};
+    for (const Limit& l : limits) {
+      Asm a(l.vertex, l.major, l.minor);
+      if (l.vertex) a.ins(1, {dst(kRastOut, 0), src(kConst, l.number)});
+      else a.ins(1, {dst(l.major == 1 ? kTemp : kColorOut, 0), src(kConst, l.number)});
+      { const int got = status_of(a.end()); if (got != l.status) printf("  limit %u.%u c%u: %d\n", l.major, l.minor, l.number, got); CHECK(got == l.status); }
+    }
+    Asm a(false, 2, 0);
+    a.ins(40, {src(kConstBool, 0)}).ins(1, {dst(kColorOut, 0), src(kInput, 0)}).ins(43, {});      // if b0 in a pixel shader 2.0: it has no bools
+    CHECK(status_of(a.end()) == SM_INVALID);
+  }
+  {
+    Asm a(false, 2, 0);
+    a.ins(1, {dst(kColorOut, 0), src(kInput, 0)}).ins(1, {dst(kColorOut, 1), src(kInput, 0)}).ins(1, {dst(kColorOut, 3), src(kInput, 0)});      // more render targets
+    CHECK(status_of(a.end()) == SM_OK && g_shader.target_mask == ((1u << 1) | (1u << 3)));
+    Asm b(false, 2, 0);
+    b.ins(1, {dst(kColorOut, 4), src(kInput, 0)});      // there is no oC4
+    CHECK(status_of(b.end()) == SM_INVALID);
+    Asm one(false, 1, 4);
+    one.ins(1, {dst(kColorOut, 1), src(kInput, 0)});      // nor an oC1 below 2.0
+    CHECK(status_of(one.end()) == SM_INVALID);
   }
   {
     Asm a(true, 2, 0);
@@ -673,7 +702,7 @@ void test_damage(HostAllocator& allocator, const std::vector<Tokens>& shaders) {
       damaged[at] ^= bit;
       const int status = sm_translate(damaged.data(), damaged.size(), &g_shader, &g_context);
       if (status == SM_OK) {
-        CHECK(g_shader.dxbc_size >= 32 && g_shader.dxbc_size <= SM_DXBC_BYTES && g_shader.constant_registers <= 256);
+        CHECK(g_shader.dxbc_size >= 32 && g_shader.dxbc_size <= SM_DXBC_BYTES && g_shader.constant_registers <= 512);
         UniquePointer<D3d9Program> program = compile_translated(allocator, g_shader);
         ++taken;
       }

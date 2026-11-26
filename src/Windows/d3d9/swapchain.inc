@@ -169,7 +169,7 @@ static HRESULT present_parameters_check(Dev *d, const D3DPRESENT_PARAMETERS *pp,
   if (pp->SwapEffect < D3DSWAPEFFECT_DISCARD || pp->SwapEffect > (ex ? D3DSWAPEFFECT_FLIPEX : D3DSWAPEFFECT_COPY) || pp->SwapEffect == D3DSWAPEFFECT_OVERLAY) return D3DERR_INVALIDCALL;
   if (pp->BackBufferCount > (ex ? 30u : 3u)) return D3DERR_INVALIDCALL;
   if (pp->SwapEffect == D3DSWAPEFFECT_COPY && pp->BackBufferCount > 1) return D3DERR_INVALIDCALL;
-  if (pp->SwapEffect == D3DSWAPEFFECT_FLIPEX && (!pp->Windowed || pp->BackBufferCount < 1)) return D3DERR_INVALIDCALL;
+  if (pp->SwapEffect == D3DSWAPEFFECT_FLIPEX && pp->BackBufferCount < 1) return D3DERR_INVALIDCALL;
   if (!pp->hDeviceWindow && !focus) return D3DERR_INVALIDCALL;
   if (pp->MultiSampleType != D3DMULTISAMPLE_NONE) return D3DERR_INVALIDCALL;
   if (pp->Flags & ~(DWORD)(D3DPRESENTFLAG_LOCKABLE_BACKBUFFER | D3DPRESENTFLAG_DISCARD_DEPTHSTENCIL | D3DPRESENTFLAG_DEVICECLIP | D3DPRESENTFLAG_VIDEO |
@@ -192,7 +192,9 @@ static HRESULT present_parameters_check(Dev *d, const D3DPRESENT_PARAMETERS *pp,
   return D3D_OK;
 }
 
-/* Full screen: the window is made a popup over the whole display (unless D3DCREATE_NOWINDOWCHANGES), in the display mode of the back buffers. */
+/* Full screen: the window covers the whole display, in the display mode of the back buffers, made visible and topmost with its own style kept, as Windows does
+ * it (Wine's test_window_style holds what Windows does); D3DCREATE_NOWINDOWCHANGES leaves the window alone. Back to a window: the style stays (visible), the
+ * topmost extended style goes again if the window was visible when it went full screen (and stays if it was not, as on Windows). */
 static LONG g_saved_style, g_saved_exstyle;
 static RECT g_saved_rect;
 static HWND g_fullscreen_window;
@@ -204,18 +206,18 @@ static HRESULT chain_enter_fullscreen(SwapChain *c) {
     g_saved_exstyle = GetWindowLongW(c->window, GWL_EXSTYLE);
     GetWindowRect(c->window, &g_saved_rect);
     g_fullscreen_window = c->window;
-    SetWindowLongW(c->window, GWL_STYLE, (g_saved_style | WS_POPUP | WS_SYSMENU) & ~(LONG)(WS_CAPTION | WS_THICKFRAME));
-    SetWindowLongW(c->window, GWL_EXSTYLE, (g_saved_exstyle | WS_EX_TOPMOST) & ~(LONG)(WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE));
-    SetWindowPos(c->window, HWND_TOPMOST, 0, 0, (int)c->mode.Width, (int)c->mode.Height, SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOACTIVATE);
+    SetWindowPos(c->window, HWND_TOPMOST, 0, 0, (int)c->mode.Width, (int)c->mode.Height, SWP_SHOWWINDOW | SWP_NOACTIVATE);
   }
+  /* (a full-screen device's window is in front: it is not lost, nor occluded, when it is made) */
+  HWND focus = d->creation.hFocusWindow ? d->creation.hFocusWindow : c->window;
+  if (focus && GetForegroundWindow() != focus) SetForegroundWindow(focus);
   return D3D_OK;
 }
 static void chain_leave_fullscreen(SwapChain *c) {
   if (g_fullscreen_window && g_fullscreen_window == c->window) {
-    SetWindowLongW(c->window, GWL_STYLE, g_saved_style);
-    SetWindowLongW(c->window, GWL_EXSTYLE, g_saved_exstyle);
-    SetWindowPos(c->window, HWND_NOTOPMOST, g_saved_rect.left, g_saved_rect.top, g_saved_rect.right - g_saved_rect.left, g_saved_rect.bottom - g_saved_rect.top,
-                 SWP_FRAMECHANGED | SWP_NOACTIVATE);
+    const BOOL was_visible = (g_saved_style & WS_VISIBLE) != 0;
+    SetWindowPos(c->window, was_visible ? HWND_NOTOPMOST : NULL, g_saved_rect.left, g_saved_rect.top, g_saved_rect.right - g_saved_rect.left,
+                 g_saved_rect.bottom - g_saved_rect.top, SWP_NOACTIVATE | (was_visible ? 0u : (UINT)SWP_NOZORDER));
     g_fullscreen_window = NULL;
   }
   display_set(NULL);
@@ -663,9 +665,10 @@ static void STDMETHODCALLTYPE dev_SetCursorPosition(Dev *d, int x, int y, DWORD 
   d->cursor_position.y = y;
   if (d->cursor_shown) SetCursorPos(x, y);
 }
-/* Shows or hides the device's cursor; it answers whether it was shown. */
+/* Shows or hides the device's cursor; it answers whether it was shown (which it is only once a cursor was set). */
 static BOOL STDMETHODCALLTYPE dev_ShowCursor(Dev *d, BOOL show) {
   const BOOL was = d->cursor_shown;
+  if (show && !d->cursor) return was;      /* (no cursor yet: it stays hidden, as Windows has it - the next ShowCursor after SetCursorProperties still answers FALSE) */
   d->cursor_shown = show ? TRUE : FALSE;
   if (d->cursor_shown && d->cursor) SetCursor(d->cursor);
   return was;

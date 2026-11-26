@@ -32,7 +32,7 @@ static Surface *surface_of(IDirect3DSurface9 *surface) {
 
 typedef struct OwnDraw {
   State *saved;
-  Surface *target, *depth;
+  Surface *target, *depth, *extra[TARGETS - 1];
 } OwnDraw;
 /* Puts the device's state aside (it is restored as it was: nothing the program set changes) and draws into `target` (and `depth`) from now on, in the
  * viewport `viewport` with the scissor rectangle `scissor` (NULL: none), with the fixed-function stages and none of the program's shaders. */
@@ -44,9 +44,14 @@ static HRESULT own_draw_begin(Dev *d, OwnDraw *o, Surface *target, Surface *dept
   o->target = d->target[0];
   o->depth = d->depth;
   State *s = &d->state;
-  /* (raw pointers: they are put back before anyone sees them, so the counts of what is set do not change) */
+  /* (raw pointers: they are put back before anyone sees them, so the counts of what is set do not change; the device's own draws write one target) */
   d->target[0] = target;
   d->depth = depth;
+  for (UINT i = 1; i < TARGETS; ++i) {
+    o->extra[i - 1] = d->target[i];
+    d->target[i] = NULL;
+  }
+  d->targets_dirty = 1;
   s->vs = s->ps = NULL;
   s->decl = decl;
   s->fvf = D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1;
@@ -81,6 +86,7 @@ static void own_draw_end(Dev *d, OwnDraw *o) {
   memcpy(&d->state, o->saved, sizeof(State));
   d->target[0] = o->target;
   d->depth = o->depth;
+  for (UINT i = 1; i < TARGETS; ++i) d->target[i] = o->extra[i - 1];
   d->targets_dirty = 1;
   mem_free(o->saved);
 }
@@ -116,12 +122,16 @@ static D3DCOLOR colour_float(const float c[4]) {
   return (D3DCOLOR)b[3] << 24 | (D3DCOLOR)b[0] << 16 | (D3DCOLOR)b[1] << 8 | b[2];
 }
 /* The whole target in one colour, and the depth buffer (all of it) in one depth and stencil: Direct3D 12's clears. */
-static void clear_whole(Dev *d, Tex *target, Tex *depth, DWORD flags, D3DCOLOR colour, float z, DWORD stencil) {
-  if ((flags & D3DCLEAR_TARGET) && target) {
+static void clear_whole(Dev *d, Surface *target_surface, Tex *depth, DWORD flags, D3DCOLOR colour, float z, DWORD stencil) {
+  if ((flags & D3DCLEAR_TARGET) && target_surface) {
+    Tex *target = target_surface->tex;
     const float c[4] = {((colour >> 16) & 255) / 255.0f, ((colour >> 8) & 255) / 255.0f, (colour & 255) / 255.0f, (colour >> 24) / 255.0f};
-    ID3D12GraphicsCommandList_ClearRenderTargetView(d->list, target->view, c, 0, NULL);
-    target->used = d->epoch;
-    d->recorded = 1;
+    const D3D12_CPU_DESCRIPTOR_HANDLE view = surface_target_view(d, target_surface);
+    if (view.ptr) {
+      ID3D12GraphicsCommandList_ClearRenderTargetView(d->list, view, c, 0, NULL);
+      target->used = d->epoch;
+      d->recorded = 1;
+    }
   }
   if ((flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL)) && depth) {
     /* Direct3D 12 here clears a depth buffer when the next pass with it begins, and forgets the clear with the list: it is kept until a draw has followed it,
@@ -183,7 +193,7 @@ static HRESULT STDMETHODCALLTYPE dev_Clear(Dev *d, DWORD rect_count, const D3DRE
   /* What is cleared: the viewport (in the target), and of that the rectangles and the scissor rectangle. Rectangles that are upside down are dropped. */
   const D3DVIEWPORT9 *vp = &d->state.viewport;
   RECT area = {(LONG)vp->X, (LONG)vp->Y, (LONG)(vp->X + vp->Width), (LONG)(vp->Y + vp->Height)};
-  const RECT whole = {0, 0, (LONG)target->width, (LONG)target->height};
+  const RECT whole = {0, 0, (LONG)sub_width(target, d->target[0]->sub), (LONG)sub_height(target, d->target[0]->sub)};
   area = rect_meet(area, &whole);
   if (d->state.rs[D3DRS_SCISSORTESTENABLE]) area = rect_meet(area, &d->state.scissor);
   RECT *list = NULL;
@@ -205,11 +215,28 @@ static HRESULT STDMETHODCALLTYPE dev_Clear(Dev *d, DWORD rect_count, const D3DRE
     count = 1;
   }
   /* (one rectangle that is all of the target, and a depth buffer of the target's size: Direct3D 12's clears) */
-  const BOOL depth_whole = !(flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL)) || (depth->tex->width == target->width && depth->tex->height == target->height);
-  if (count == 1 && EqualRect(&list[0], &whole) && depth_whole) clear_whole(d, target, depth ? depth->tex : NULL, flags, colour, z, stencil);
+  const BOOL depth_whole = !(flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL)) || (depth->tex->width == (UINT)whole.right && depth->tex->height == (UINT)whole.bottom);
+  if (count == 1 && EqualRect(&list[0], &whole) && depth_whole) clear_whole(d, d->target[0], depth ? depth->tex : NULL, flags, colour, z, stencil);
   else if (count) {
-    const D3DVIEWPORT9 full = {0, 0, target->width, target->height, 0.0f, 1.0f};
+    const D3DVIEWPORT9 full = {0, 0, (DWORD)whole.right, (DWORD)whole.bottom, 0.0f, 1.0f};
     hr = clear_rects(d, d->target[0], (flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL)) ? depth : NULL, list, count, flags, colour, z, stencil, &full);
+  }
+  /* (the other render targets that are set get the colour too, in the same rectangles of theirs) */
+  for (UINT i = 1; i < TARGETS && SUCCEEDED(hr) && (flags & D3DCLEAR_TARGET) && count; ++i) {
+    Surface *other = d->target[i];
+    if (!other) continue;
+    const RECT all = {0, 0, (LONG)sub_width(other->tex, other->sub), (LONG)sub_height(other->tex, other->sub)};
+    if (count == 1 && EqualRect(&list[0], &all)) clear_whole(d, other, NULL, D3DCLEAR_TARGET, colour, 0, 0);
+    else {
+      UINT kept = 0;
+      for (UINT k = 0; k < count; ++k) {
+        list[kept] = rect_meet(list[k], &all);
+        if (!rect_empty(&list[kept])) ++kept;
+      }
+      count = kept;
+      const D3DVIEWPORT9 full = {0, 0, (DWORD)all.right, (DWORD)all.bottom, 0.0f, 1.0f};
+      if (count) hr = clear_rects(d, other, NULL, list, count, D3DCLEAR_TARGET, colour, 0, 0, &full);
+    }
   }
   mem_free(list);
   LeaveCriticalSection(&d->lock);
@@ -223,11 +250,18 @@ static HRESULT surface_read(Dev *d, Surface *s, const RECT *r, BYTE *out, UINT p
   Tex *t = s->tex;
   const UINT w = sub_width(t, s->sub), h = sub_height(t, s->sub), rw = (UINT)(r->right - r->left);
   if (tex_device_owned(t)) {
-    BYTE *all = mem_alloc((SIZE_T)w * h * 4);
+    const UINT gb = gpu_bytes(t->format);
+    BYTE *all = mem_alloc((SIZE_T)w * h * gb);
     if (!all) return E_OUTOFMEMORY;
-    const HRESULT hr = tex_download(d, t, s->sub, all, w * 4);
+    const HRESULT hr = tex_download(d, t, s->sub, all, w * gb);
     if (SUCCEEDED(hr))
-      for (LONG y = r->top; y < r->bottom; ++y) memcpy(out + (SIZE_T)(y - r->top) * pitch, all + ((SIZE_T)y * w + (SIZE_T)r->left) * 4, (SIZE_T)rw * 4);
+      for (LONG y = r->top; y < r->bottom; ++y) {
+        BYTE *row = all + ((SIZE_T)y * w + (SIZE_T)r->left) * gb;
+        if (format_is_wide(t->format)) {
+          row_from_gpu(t->format, row, rw, row);
+          row_to_bgra(t->format, row, rw, out + (SIZE_T)(y - r->top) * pitch, NULL);
+        } else memcpy(out + (SIZE_T)(y - r->top) * pitch, row, (SIZE_T)rw * 4);
+      }
     mem_free(all);
     return hr;
   }
@@ -242,7 +276,19 @@ static HRESULT surface_read(Dev *d, Surface *s, const RECT *r, BYTE *out, UINT p
 static HRESULT surface_write(Dev *d, Surface *s, const RECT *r, const BYTE *in, UINT pitch) {
   Tex *t = s->tex;
   const UINT w = sub_width(t, s->sub), rw = (UINT)(r->right - r->left);
-  if (tex_device_owned(t)) return tex_upload_rows(d, t, s->sub, r, in, pitch, 0);
+  if (tex_device_owned(t)) {
+    if (!format_is_wide(t->format)) return tex_upload_rows(d, t, s->sub, r, in, pitch, 0);
+    const UINT gb = gpu_bytes(t->format), rh = (UINT)(r->bottom - r->top);
+    BYTE *rows = mem_alloc((SIZE_T)rw * rh * gb);
+    if (!rows) return E_OUTOFMEMORY;
+    for (UINT y = 0; y < rh; ++y) {
+      row_from_bgra(t->format, in + (SIZE_T)y * pitch, rw, rows + (SIZE_T)y * rw * gb);
+      row_to_gpu(t->format, rows + (SIZE_T)y * rw * gb, rw, rows + (SIZE_T)y * rw * gb);
+    }
+    const HRESULT hr = tex_upload_rows(d, t, s->sub, r, rows, rw * gb, 0);
+    mem_free(rows);
+    return hr;
+  }
   BYTE *shadow = tex_shadow(t, s->sub);
   if (!shadow) return E_OUTOFMEMORY;
   const UINT bytes = format_bytes(t->format), row_bytes = format_pitch(t->format, w);
@@ -286,7 +332,7 @@ static HRESULT STDMETHODCALLTYPE dev_ColorFill(Dev *d, IDirect3DSurface9 *surfac
   HRESULT hr = D3D_OK;
   EnterCriticalSection(&d->lock);
   if (t->target && t->res) {
-    if (r.left == 0 && r.top == 0 && r.right == (LONG)w && r.bottom == (LONG)h && s->sub == 0) clear_whole(d, t, NULL, D3DCLEAR_TARGET, colour, 0, 0);
+    if (r.left == 0 && r.top == 0 && r.right == (LONG)w && r.bottom == (LONG)h && surface_drawable(s)) clear_whole(d, s, NULL, D3DCLEAR_TARGET, colour, 0, 0);
     else {
       const D3DVIEWPORT9 full = {0, 0, w, h, 0.0f, 1.0f};
       hr = clear_rects(d, s, NULL, &r, 1, D3DCLEAR_TARGET, colour, 0, 0, &full);
@@ -389,8 +435,8 @@ static HRESULT STDMETHODCALLTYPE dev_StretchRect(Dev *d, IDirect3DSurface9 *from
   if (format_is_palette(dt->format) || dxt_block(dt->format)) return D3DERR_INVALIDCALL;
   HRESULT hr = D3D_OK;
   EnterCriticalSection(&d->lock);
-  if (st->res && dt->res && sw == dw && sh == dh && st->kind == 0 && dt->kind == 0 && !dxt_block(st->format)) {
-    /* (one size: Direct3D 12's copy; the textures are all of B8G8R8A8 there) */
+  if (st->res && dt->res && sw == dw && sh == dh && st->kind == 0 && dt->kind == 0 && !dxt_block(st->format) && gpu_dxgi(st->format) == gpu_dxgi(dt->format)) {
+    /* (one size and the same Direct3D 12 format: Direct3D 12's copy) */
     settle(d, dt->sampled);
     D3D12_TEXTURE_COPY_LOCATION a, b;
     memset(&a, 0, sizeof a);

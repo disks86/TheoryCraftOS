@@ -81,7 +81,7 @@ static HRESULT texture_create(Dev *d, UINT kind, UINT width, UINT height, UINT s
   if (!pool_valid(d, pool) || (usage & ~(DWORD)TEXTURE_USAGES)) return D3DERR_INVALIDCALL;
   if ((usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)) && pool != D3DPOOL_DEFAULT) return D3DERR_INVALIDCALL;
   if ((usage & D3DUSAGE_DYNAMIC) && (pool == D3DPOOL_MANAGED || (usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)))) return D3DERR_INVALIDCALL;
-  if ((usage & D3DUSAGE_AUTOGENMIPMAP) && (pool == D3DPOOL_SYSTEMMEM || kind == 1 || levels > 1 || dxt_block(format))) return D3DERR_INVALIDCALL;
+  if ((usage & D3DUSAGE_AUTOGENMIPMAP) && (pool == D3DPOOL_SYSTEMMEM || kind == 1 || levels > 1)) return D3DERR_INVALIDCALL;
   if ((usage & D3DUSAGE_DEPTHSTENCIL) && kind == 1) return D3DERR_INVALIDCALL;
   if (kind == 1 && format_is_depth(format)) return D3DERR_INVALIDCALL;
   UINT flags = 0;
@@ -119,8 +119,7 @@ static HRESULT surface_create(Dev *d, UINT width, UINT height, DWORD usage, D3DF
                               IDirect3DSurface9 **out) {
   if (!out) return D3DERR_INVALIDCALL;
   *out = NULL;
-  if (samples != D3DMULTISAMPLE_NONE && samples != D3DMULTISAMPLE_NONMASKABLE) return D3DERR_NOTAVAILABLE;      /* (CheckDeviceMultiSampleType: no multisampling here) */
-  if (samples == D3DMULTISAMPLE_NONMASKABLE && quality) return D3DERR_INVALIDCALL;
+  if (samples != D3DMULTISAMPLE_NONE) return D3DERR_INVALIDCALL;      /* (CheckDeviceMultiSampleType: no multisampling here, of any kind) */
   if (!shared) return surface_alone(d, width, height, usage, format, pool, flags, samples, quality, out);
   if (!d->ex) return D3DERR_INVALIDCALL;
   if (pool == D3DPOOL_SYSTEMMEM) {

@@ -814,6 +814,290 @@ static void test_vertex_processing(void) {
   }
 }
 
+/* The wide formats: a float target that keeps what is above 1, read back by GetRenderTargetData and sampled; textures of R32F, G16R16 (the channels they have
+ * not read 1, as Direct3D 9 has them) and A2R10G10B10. */
+static void test_wide_formats(void) {
+  static const DWORD ps_two[] = {0xFFFF0200, 0x05000051, 0xA00F0000, 0x40000000, 0x40000000, 0x40000000, 0x40000000, 0x02000001, 0x800F0800, 0xA0E40000, 0x0000FFFF};
+  static const DWORD ps_quarter[] = {0xFFFF0200, 0x05000051, 0xA00F0001, 0x3E800000, 0x3E800000, 0x3E800000, 0x3E800000, 0x0200001F, 0x80000000, 0xB00F0000,
+                                     0x0200001F, 0x90000000, 0xA00F0800, 0x03000042, 0x800F0000, 0xB0E40000, 0xA0E40800, 0x03000005, 0x800F0000, 0x80E40000,
+                                     0xA0E40001, 0x02000001, 0x800F0800, 0x80E40000, 0x0000FFFF};
+  IDirect3DTexture9 *target = NULL, *r32 = NULL, *g16 = NULL, *a2 = NULL;
+  IDirect3DSurface9 *level = NULL, *memory = NULL, *back = NULL;
+  IDirect3DPixelShader9 *two = NULL, *quarter = NULL;
+  HRESULT hr = IDirect3D9_CheckDeviceFormat(g_d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, D3DUSAGE_RENDERTARGET, D3DRTYPE_TEXTURE, D3DFMT_A16B16G16R16F);
+  check(hr == D3D_OK && IDirect3D9_CheckDeviceFormat(g_d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, 0, D3DRTYPE_TEXTURE, D3DFMT_R32F) == D3D_OK, "float formats: textures and targets");
+  hr = IDirect3DDevice9_CreateTexture(g_device, 16, 16, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &target, NULL);
+  if (SUCCEEDED(hr)) hr = IDirect3DTexture9_GetSurfaceLevel(target, 0, &level);
+  if (SUCCEEDED(hr)) hr = IDirect3DDevice9_CreateOffscreenPlainSurface(g_device, 16, 16, D3DFMT_A16B16G16R16F, D3DPOOL_SYSTEMMEM, &memory, NULL);
+  if (SUCCEEDED(hr)) hr = IDirect3DDevice9_CreatePixelShader(g_device, ps_two, &two);
+  if (SUCCEEDED(hr)) hr = IDirect3DDevice9_CreatePixelShader(g_device, ps_quarter, &quarter);
+  IDirect3DDevice9_GetRenderTarget(g_device, 0, &back);
+  check(SUCCEEDED(hr) && target && level && memory && two && quarter && back, "an A16B16G16R16F target, a surface of it in memory, and two pixel shaders");
+  if (FAILED(hr) || !back) goto done;
+  /* 2.0 into the float target, kept as it is */
+  IDirect3DDevice9_SetRenderTarget(g_device, 0, level);
+  IDirect3DDevice9_SetPixelShader(g_device, two);
+  screen_quad(0, 0, 16, 16, 0.5f, 0xFFFFFFFF);
+  IDirect3DDevice9_SetPixelShader(g_device, NULL);
+  IDirect3DDevice9_SetRenderTarget(g_device, 0, back);
+  D3DLOCKED_RECT locked;
+  WORD half[4] = {0, 0, 0, 0};
+  if (SUCCEEDED(IDirect3DDevice9_GetRenderTargetData(g_device, level, memory)) && SUCCEEDED(IDirect3DSurface9_LockRect(memory, &locked, NULL, D3DLOCK_READONLY))) {
+    memcpy(half, (const BYTE *)locked.pBits + 5 * locked.Pitch + 5 * 8, 8);
+    IDirect3DSurface9_UnlockRect(memory);
+  }
+  check(half[0] == 0x4000 && half[3] == 0x4000, "a pixel shader's 2.0 is kept in a float target (GetRenderTargetData)");
+  /* ... and sampled as 2.0: a quarter of it is half the light */
+  IDirect3DDevice9_SetTexture(g_device, 0, (IDirect3DBaseTexture9 *)target);
+  IDirect3DDevice9_SetPixelShader(g_device, quarter);
+  clear(0xFF000000);
+  textured_quad(0, 0, 64, 64, 0xFFFFFFFF);
+  IDirect3DDevice9_SetPixelShader(g_device, NULL);
+  read_back();
+  check(near_colour(pixel(32, 32), 128, 128, 128), "... and sampled as 2.0");
+  /* an R32F texture through the stages: (r, 1, 1, 1) */
+  hr = IDirect3DDevice9_CreateTexture(g_device, 2, 2, 1, 0, D3DFMT_R32F, D3DPOOL_MANAGED, &r32, NULL);
+  if (SUCCEEDED(hr) && SUCCEEDED(IDirect3DTexture9_LockRect(r32, 0, &locked, NULL, 0))) {
+    for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x) ((float *)((BYTE *)locked.pBits + y * locked.Pitch))[x] = 0.25f;
+    IDirect3DTexture9_UnlockRect(r32, 0);
+  }
+  IDirect3DDevice9_SetTexture(g_device, 0, (IDirect3DBaseTexture9 *)r32);
+  clear(0xFF000000);
+  textured_quad(0, 0, 64, 64, 0xFFFFFFFF);
+  read_back();
+  check(r32 && near_colour(pixel(32, 32), 64, 255, 255), "an R32F texture samples as (r, 1, 1, 1), as Direct3D 9 has it");
+  /* a G16R16 texture: (r, g, 1, 1) */
+  hr = IDirect3DDevice9_CreateTexture(g_device, 2, 2, 1, 0, D3DFMT_G16R16, D3DPOOL_MANAGED, &g16, NULL);
+  if (SUCCEEDED(hr) && SUCCEEDED(IDirect3DTexture9_LockRect(g16, 0, &locked, NULL, 0))) {
+    for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x) ((DWORD *)((BYTE *)locked.pBits + y * locked.Pitch))[x] = 0x0000FFFFu;      /* (red 1, green 0) */
+    IDirect3DTexture9_UnlockRect(g16, 0);
+  }
+  IDirect3DDevice9_SetTexture(g_device, 0, (IDirect3DBaseTexture9 *)g16);
+  clear(0xFF000000);
+  textured_quad(0, 0, 64, 64, 0xFFFFFFFF);
+  read_back();
+  check(g16 && pixel(32, 32) == 0xFF00FF, "a G16R16 texture samples as (r, g, 1, 1)");
+  /* A2R10G10B10: red in the top bits */
+  hr = IDirect3DDevice9_CreateTexture(g_device, 2, 2, 1, 0, D3DFMT_A2R10G10B10, D3DPOOL_MANAGED, &a2, NULL);
+  if (SUCCEEDED(hr) && SUCCEEDED(IDirect3DTexture9_LockRect(a2, 0, &locked, NULL, 0))) {
+    for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x) ((DWORD *)((BYTE *)locked.pBits + y * locked.Pitch))[x] = 0xC0000000u | (1023u << 20);
+    IDirect3DTexture9_UnlockRect(a2, 0);
+  }
+  IDirect3DDevice9_SetTexture(g_device, 0, (IDirect3DBaseTexture9 *)a2);
+  clear(0xFF000000);
+  textured_quad(0, 0, 64, 64, 0xFFFFFFFF);
+  read_back();
+  check(a2 && pixel(32, 32) == 0xFF0000, "an A2R10G10B10 texture: red in its top bits");
+  IDirect3DDevice9_SetTexture(g_device, 0, NULL);
+done:
+  if (back) IDirect3DSurface9_Release(back);
+  if (level) IDirect3DSurface9_Release(level);
+  if (memory) IDirect3DSurface9_Release(memory);
+  if (target) IDirect3DTexture9_Release(target);
+  if (r32) IDirect3DTexture9_Release(r32);
+  if (g16) IDirect3DTexture9_Release(g16);
+  if (a2) IDirect3DTexture9_Release(a2);
+  if (two) IDirect3DPixelShader9_Release(two);
+  if (quarter) IDirect3DPixelShader9_Release(quarter);
+}
+
+/* ProcessVertices: the vertices made pixels, lit, and clipped as Direct3D 9 does it; what the draws leave of stream 0 and an indexed draw with no indices; a small
+ * texture target drawn into with the device's larger depth buffer. */
+static void test_process_vertices(void) {
+  typedef struct { float x, y, z; DWORD colour; } In;
+  typedef struct { float x, y, z, rhw; DWORD colour; } Out;
+  static const In in[4] = {{-0.5f, -0.5f, 0.0f, 0xFFFF0000}, {-0.5f, 0.5f, 0.5f, 0xFF00FF00}, {0.5f, -0.5f, 0.75f, 0xFF0000FF}, {2.0f, 0.0f, 0.0f, 0xFFFFFFFF}};
+  IDirect3DVertexBuffer9 *source = NULL, *dest = NULL, *got = NULL;
+  void *p = NULL;
+  HRESULT hr = IDirect3DDevice9_CreateVertexBuffer(g_device, sizeof in, 0, D3DFVF_XYZ | D3DFVF_DIFFUSE, D3DPOOL_SYSTEMMEM, &source, NULL);
+  if (SUCCEEDED(hr)) hr = IDirect3DDevice9_CreateVertexBuffer(g_device, 4 * sizeof(Out), 0, D3DFVF_XYZRHW | D3DFVF_DIFFUSE, D3DPOOL_SYSTEMMEM, &dest, NULL);
+  if (SUCCEEDED(hr) && SUCCEEDED(IDirect3DVertexBuffer9_Lock(source, 0, 0, &p, 0))) {
+    memcpy(p, in, sizeof in);
+    IDirect3DVertexBuffer9_Unlock(source);
+  }
+  check(SUCCEEDED(hr), "a source and a destination vertex buffer");
+  if (FAILED(hr)) goto done;
+  D3DMATRIX identity;
+  memset(&identity, 0, sizeof identity);
+  identity._11 = identity._22 = identity._33 = identity._44 = 1.0f;
+  IDirect3DDevice9_SetTransform(g_device, D3DTS_WORLD, &identity);
+  IDirect3DDevice9_SetTransform(g_device, D3DTS_VIEW, &identity);
+  IDirect3DDevice9_SetTransform(g_device, D3DTS_PROJECTION, &identity);
+  IDirect3DDevice9_SetFVF(g_device, D3DFVF_XYZ | D3DFVF_DIFFUSE);
+  IDirect3DDevice9_SetStreamSource(g_device, 0, source, 0, sizeof(In));
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_LIGHTING, FALSE);
+  D3DCLIPSTATUS9 status = {0, 0};
+  IDirect3DDevice9_SetClipStatus(g_device, &status);
+  hr = IDirect3DDevice9_ProcessVertices(g_device, 0, 0, 4, dest, NULL, 0);
+  Out out[4];
+  memset(out, 0, sizeof out);
+  if (SUCCEEDED(IDirect3DVertexBuffer9_Lock(dest, 0, 0, &p, D3DLOCK_READONLY))) {
+    memcpy(out, p, sizeof out);
+    IDirect3DVertexBuffer9_Unlock(dest);
+  }
+  check(hr == D3D_OK && out[0].x == 16.0f && out[0].y == 48.0f && out[0].z == 0.0f && out[0].rhw == 1.0f && out[0].colour == 0xFFFF0000 &&
+        out[1].x == 16.0f && out[1].y == 16.0f && out[1].z == 0.5f && out[2].x == 48.0f && out[2].z == 0.75f && out[2].colour == 0xFF0000FF,
+        "ProcessVertices: positions in pixels by the matrices and the viewport, the colours copied");
+  check(out[3].x == 1.5f && out[3].y == 0.5f && out[3].z == 0.0f && out[3].rhw == 1.0f, "... a vertex outside the clip volume is (x + w) / 2, (y + w) / 2, z, w");
+  IDirect3DDevice9_GetClipStatus(g_device, &status);
+  check(status.ClipUnion == D3DCS_RIGHT && status.ClipIntersection == 0, "... and the clip status has its clip codes");
+  /* lit: the global ambient light on the material's ambient colour, the vertex's alpha */
+  D3DMATERIAL9 material;
+  memset(&material, 0, sizeof material);
+  material.Ambient.r = material.Ambient.g = material.Ambient.b = material.Ambient.a = 1.0f;
+  IDirect3DDevice9_SetMaterial(g_device, &material);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_LIGHTING, TRUE);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_AMBIENT, 0xFF404040);
+  hr = IDirect3DDevice9_ProcessVertices(g_device, 1, 2, 1, dest, NULL, D3DPV_DONOTCOPYDATA);
+  DWORD kept = 0;
+  hr = SUCCEEDED(hr) ? IDirect3DDevice9_ProcessVertices(g_device, 1, 1, 1, dest, NULL, 0) : hr;
+  if (SUCCEEDED(IDirect3DVertexBuffer9_Lock(dest, 0, 0, &p, D3DLOCK_READONLY))) {
+    memcpy(out, p, sizeof out);
+    IDirect3DVertexBuffer9_Unlock(dest);
+    kept = out[2].colour;
+  }
+  check(hr == D3D_OK && out[1].colour == 0xFF404040 && out[2].x == 16.0f && out[2].y == 16.0f && kept == 0xFF0000FF,
+        "... lit by the ambient light; D3DPV_DONOTCOPYDATA writes the position alone");
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_LIGHTING, FALSE);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_AMBIENT, 0);
+  check(IDirect3DDevice9_ProcessVertices(g_device, 0, 3, 2, dest, NULL, 0) == D3DERR_INVALIDCALL && IDirect3DDevice9_ProcessVertices(g_device, 3, 0, 2, dest, NULL, 0) == D3DERR_INVALIDCALL &&
+        IDirect3DDevice9_ProcessVertices(g_device, 0, 0, 1, NULL, NULL, 0) == D3DERR_INVALIDCALL,
+        "... not past the end of the destination nor of the source, not into no buffer");
+  /* an indexed draw with no indices draws nothing and succeeds; the UP draws leave stream 0 unset with no offset and no stride */
+  IDirect3DDevice9_SetIndices(g_device, NULL);
+  check(IDirect3DDevice9_DrawIndexedPrimitive(g_device, D3DPT_TRIANGLELIST, 0, 0, 3, 0, 1) == D3D_OK, "DrawIndexedPrimitive with no index buffer: D3D_OK");
+  IDirect3DDevice9_SetStreamSource(g_device, 0, NULL, 0, 0);
+  UINT offset = 7, stride = 7;
+  IDirect3DDevice9_DrawPrimitiveUP(g_device, D3DPT_TRIANGLELIST, 1, in, sizeof(In));
+  IDirect3DDevice9_GetStreamSource(g_device, 0, &got, &offset, &stride);
+  check(got == NULL && offset == 0 && stride == 0, "after DrawPrimitiveUP stream 0 is NULL, 0, 0");
+  if (got) IDirect3DVertexBuffer9_Release(got);
+  /* a 32 x 32 texture target with the 64 x 64 depth buffer: its top left part */
+  IDirect3DTexture9 *small = NULL;
+  IDirect3DSurface9 *level = NULL, *back = NULL, *memory = NULL;
+  hr = IDirect3DDevice9_CreateTexture(g_device, 32, 32, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &small, NULL);
+  if (SUCCEEDED(hr)) hr = IDirect3DTexture9_GetSurfaceLevel(small, 0, &level);
+  if (SUCCEEDED(hr)) hr = IDirect3DDevice9_CreateOffscreenPlainSurface(g_device, 32, 32, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &memory, NULL);
+  IDirect3DDevice9_GetRenderTarget(g_device, 0, &back);
+  DWORD front = 0, behind = 0;
+  if (SUCCEEDED(hr) && back) {
+    IDirect3DDevice9_SetRenderTarget(g_device, 0, level);
+    IDirect3DDevice9_Clear(g_device, 0, NULL, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xFF000000, 1.0f, 0);
+    screen_quad(0, 0, 32, 32, 0.25f, 0xFFFFFF00);
+    screen_quad(0, 0, 16, 32, 0.75f, 0xFF0000FF);      /* (behind: not drawn) */
+    IDirect3DDevice9_SetRenderTarget(g_device, 0, back);
+    D3DLOCKED_RECT locked;
+    if (SUCCEEDED(IDirect3DDevice9_GetRenderTargetData(g_device, level, memory)) && SUCCEEDED(IDirect3DSurface9_LockRect(memory, &locked, NULL, D3DLOCK_READONLY))) {
+      behind = ((const DWORD *)((const BYTE *)locked.pBits + 8 * locked.Pitch))[8] & 0xFFFFFF;
+      front = ((const DWORD *)((const BYTE *)locked.pBits + 8 * locked.Pitch))[24] & 0xFFFFFF;
+      IDirect3DSurface9_UnlockRect(memory);
+    }
+  }
+  check(front == 0xFFFF00 && behind == 0xFFFF00, "a texture target smaller than the depth buffer is drawn into, with the depth test");
+  if (back) IDirect3DSurface9_Release(back);
+  if (memory) IDirect3DSurface9_Release(memory);
+  if (level) IDirect3DSurface9_Release(level);
+  if (small) IDirect3DTexture9_Release(small);
+done:
+  IDirect3DDevice9_SetStreamSource(g_device, 0, NULL, 0, 0);
+  if (source) IDirect3DVertexBuffer9_Release(source);
+  if (dest) IDirect3DVertexBuffer9_Release(dest);
+}
+
+/* The levels of a target texture and the faces of a cube target are targets of their own: drawn into, cleared and read back, the others untouched. */
+static void test_level_targets(void) {
+  IDirect3DTexture9 *texture = NULL;
+  IDirect3DCubeTexture9 *cube = NULL;
+  IDirect3DSurface9 *level0 = NULL, *level1 = NULL, *face2 = NULL, *face3 = NULL, *back = NULL;
+  HRESULT hr = IDirect3DDevice9_CreateTexture(g_device, 32, 32, 2, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &texture, NULL);
+  if (SUCCEEDED(hr)) hr = IDirect3DTexture9_GetSurfaceLevel(texture, 0, &level0);
+  if (SUCCEEDED(hr)) hr = IDirect3DTexture9_GetSurfaceLevel(texture, 1, &level1);
+  check(SUCCEEDED(hr) && IDirect3D9_CheckDeviceFormat(g_d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, D3DUSAGE_RENDERTARGET, D3DRTYPE_CUBETEXTURE, D3DFMT_A8R8G8B8) == D3D_OK,
+        "a target texture of two levels; cube targets are there");
+  IDirect3DDevice9_GetRenderTarget(g_device, 0, &back);
+  if (FAILED(hr) || !back) goto done;
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_ZENABLE, D3DZB_FALSE);
+  IDirect3DDevice9_SetRenderTarget(g_device, 0, level0);
+  IDirect3DDevice9_Clear(g_device, 0, NULL, D3DCLEAR_TARGET, 0xFF0000FF, 1.0f, 0);
+  IDirect3DDevice9_SetRenderTarget(g_device, 0, level1);
+  D3DVIEWPORT9 viewport;
+  IDirect3DDevice9_GetViewport(g_device, &viewport);
+  IDirect3DDevice9_Clear(g_device, 0, NULL, D3DCLEAR_TARGET, 0xFF000000, 1.0f, 0);
+  screen_quad(0, 0, 8, 16, 0.5f, 0xFF00FF00);
+  IDirect3DDevice9_SetRenderTarget(g_device, 0, back);
+  check(viewport.Width == 16 && viewport.Height == 16 && target_pixel(level1, 4, 4) == 0xFF00FF00 && target_pixel(level1, 12, 4) == 0xFF000000 && target_pixel(level0, 20, 20) == 0xFF0000FF,
+        "level 1 of a target texture is drawn into and cleared as a target of its own (its size; level 0 keeps its blue)");
+  /* a cube's faces */
+  hr = IDirect3DDevice9_CreateCubeTexture(g_device, 16, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &cube, NULL);
+  if (SUCCEEDED(hr)) hr = IDirect3DCubeTexture9_GetCubeMapSurface(cube, D3DCUBEMAP_FACE_POSITIVE_Y, 0, &face2);
+  if (SUCCEEDED(hr)) hr = IDirect3DCubeTexture9_GetCubeMapSurface(cube, D3DCUBEMAP_FACE_NEGATIVE_Y, 0, &face3);
+  if (SUCCEEDED(hr)) {
+    IDirect3DDevice9_SetRenderTarget(g_device, 0, face3);
+    IDirect3DDevice9_Clear(g_device, 0, NULL, D3DCLEAR_TARGET, 0xFFFFFF00, 1.0f, 0);
+    hr = IDirect3DDevice9_SetRenderTarget(g_device, 0, face2);
+    IDirect3DDevice9_Clear(g_device, 0, NULL, D3DCLEAR_TARGET, 0xFF000000, 1.0f, 0);
+    screen_quad(0, 0, 16, 8, 0.5f, 0xFFFF0000);
+    IDirect3DDevice9_SetRenderTarget(g_device, 0, back);
+  }
+  check(SUCCEEDED(hr) && target_pixel(face2, 4, 4) == 0xFFFF0000 && target_pixel(face2, 4, 12) == 0xFF000000 && target_pixel(face3, 8, 8) == 0xFFFFFF00,
+        "the faces of a cube target are targets of their own");
+  /* the write mask with no blending: white over the blue of level 0 through D3DRS_COLORWRITEENABLE of red alone */
+  IDirect3DDevice9_SetRenderTarget(g_device, 0, level0);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_COLORWRITEENABLE, D3DCOLORWRITEENABLE_RED);
+  screen_quad(0, 0, 4, 4, 0.5f, 0xFFFFFFFF);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_COLORWRITEENABLE, 0xF);
+  IDirect3DDevice9_SetRenderTarget(g_device, 0, back);
+  check(target_pixel(level0, 1, 1) == 0xFFFF00FF && target_pixel(level0, 6, 6) == 0xFF0000FF, "D3DRS_COLORWRITEENABLE with no blending writes its channels alone");
+  /* two targets at once: a pixel shader's oC0 and oC1, both cleared by Clear; COLORWRITEENABLE1 masks the second */
+  D3DCAPS9 caps;
+  IDirect3DDevice9_GetDeviceCaps(g_device, &caps);
+  if (caps.NumSimultaneousRTs >= 2) {
+    static const DWORD ps_two_targets[] = {0xFFFF0200, 0x05000051, 0xA00F0000, 0x3F800000, 0, 0, 0x3F800000, 0x05000051, 0xA00F0001, 0, 0x3F800000, 0, 0x3F800000,
+                                           0x02000001, 0x800F0800, 0xA0E40000, 0x02000001, 0x800F0801, 0xA0E40001, 0x0000FFFF};
+    IDirect3DTexture9 *second = NULL;
+    IDirect3DSurface9 *second0 = NULL;
+    IDirect3DPixelShader9 *shader = NULL;
+    hr = IDirect3DDevice9_CreateTexture(g_device, 32, 32, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &second, NULL);
+    if (SUCCEEDED(hr)) hr = IDirect3DTexture9_GetSurfaceLevel(second, 0, &second0);
+    if (SUCCEEDED(hr)) hr = IDirect3DDevice9_CreatePixelShader(g_device, ps_two_targets, &shader);
+    DWORD cleared0 = 0, cleared1 = 0;
+    if (SUCCEEDED(hr)) {
+      IDirect3DDevice9_SetRenderTarget(g_device, 0, level0);
+      hr = IDirect3DDevice9_SetRenderTarget(g_device, 1, second0);
+      IDirect3DDevice9_Clear(g_device, 0, NULL, D3DCLEAR_TARGET, 0xFF102030, 1.0f, 0);
+      IDirect3DDevice9_SetRenderTarget(g_device, 0, back);
+      cleared0 = target_pixel(level0, 3, 3);
+      cleared1 = target_pixel(second0, 3, 3);
+      IDirect3DDevice9_SetRenderTarget(g_device, 0, level0);
+      IDirect3DDevice9_SetPixelShader(g_device, shader);
+      screen_quad(0, 0, 16, 32, 0.5f, 0xFFFFFFFF);
+      IDirect3DDevice9_SetRenderState(g_device, D3DRS_COLORWRITEENABLE1, D3DCOLORWRITEENABLE_ALPHA);
+      screen_quad(16, 0, 32, 32, 0.5f, 0xFFFFFFFF);
+      IDirect3DDevice9_SetRenderState(g_device, D3DRS_COLORWRITEENABLE1, 0xF);
+      IDirect3DDevice9_SetPixelShader(g_device, NULL);
+      IDirect3DDevice9_SetRenderTarget(g_device, 1, NULL);
+      IDirect3DDevice9_SetRenderTarget(g_device, 0, back);
+    }
+    IDirect3DSurface9 *none = (IDirect3DSurface9 *)0x1;
+    const HRESULT unset = IDirect3DDevice9_GetRenderTarget(g_device, 1, &none);
+    check(SUCCEEDED(hr) && cleared0 == 0xFF102030 && cleared1 == 0xFF102030 && target_pixel(level0, 8, 8) == 0xFFFF0000 && target_pixel(second0, 8, 8) == 0xFF00FF00 &&
+          target_pixel(level0, 24, 8) == 0xFFFF0000 && target_pixel(second0, 24, 8) == 0xFF102030 && unset == D3DERR_NOTFOUND && none == NULL,
+          "two render targets: Clear fills both, oC0 and oC1 each its own, COLORWRITEENABLE1 masks the second; target 1 unset again");
+    if (shader) IDirect3DPixelShader9_Release(shader);
+    if (second0) IDirect3DSurface9_Release(second0);
+    if (second) IDirect3DTexture9_Release(second);
+  }
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_ZENABLE, D3DZB_TRUE);
+done:
+  if (back) IDirect3DSurface9_Release(back);
+  if (level0) IDirect3DSurface9_Release(level0);
+  if (level1) IDirect3DSurface9_Release(level1);
+  if (face2) IDirect3DSurface9_Release(face2);
+  if (face3) IDirect3DSurface9_Release(face3);
+  if (texture) IDirect3DTexture9_Release(texture);
+  if (cube) IDirect3DCubeTexture9_Release(cube);
+}
+
 /* Each part leaves the device's references as they were: what it made is gone with its last reference. */
 static void api_part(void (*part)(void), const char *name) {
   const ULONG before = refs(g_device);
@@ -835,5 +1119,8 @@ static void test_api(void) {
   api_part(test_queries, "queries");
   api_part(test_device_misc, "the device's other methods");
   api_part(test_vertex_processing, "vertex processing");
+  api_part(test_wide_formats, "wide formats");
+  api_part(test_level_targets, "levels and cube faces as targets");
+  api_part(test_process_vertices, "ProcessVertices, draws with what is not set, a smaller target than the depth buffer");
   api_part(test_ex, "Direct3D 9Ex");
 }
