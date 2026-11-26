@@ -1442,6 +1442,26 @@ bool Compiler::alu(const Instruction& ins) {
       write(ins, extract(vt, pair, 1), t);
       return ok_;
     }
+    // (bits: TGSI's as GLSL 4's - the offset and count of UBFE / IBFE / BFI are SPIR-V scalars, so those go a component at a time)
+    case Op::Popc: write(ins, emit(OpBitCount, u4_, {src(ins, 0, Ty::U)}), Ty::U); return ok_;
+    case Op::Brev: write(ins, emit(OpBitReverse, u4_, {src(ins, 0, Ty::U)}), Ty::U); return ok_;
+    case Op::Lsb: glsl1(GlslFindILsb, Ty::U); return ok_;
+    case Op::Imsb: glsl1(GlslFindSMsb, Ty::I); return ok_;
+    case Op::Umsb: glsl1(GlslFindUMsb, Ty::U); return ok_;
+    case Op::Ubfe:
+    case Op::Ibfe:
+    case Op::Bfi: {
+      const bool insert = op == Op::Bfi, sign = op == Op::Ibfe;
+      const Ty t = sign ? Ty::I : Ty::U;
+      const uint32_t value = src(ins, 0, t), second = src(ins, 1, t), offsets = src(ins, insert ? 2 : 1, Ty::U), counts = src(ins, insert ? 3 : 2, Ty::U);
+      uint32_t parts[4];
+      for (uint32_t c = 0; c < 4; ++c) {
+        const uint32_t v = extract(scalar_of(t), value, c), o = extract(u_, offsets, c), n = extract(u_, counts, c);
+        parts[c] = insert ? emit(OpBitFieldInsert, u_, {v, extract(u_, second, c), o, n}) : emit(sign ? OpBitFieldSExtract : OpBitFieldUExtract, scalar_of(t), {v, o, n});
+      }
+      write(ins, emit(OpCompositeConstruct, vec_of(t), {parts[0], parts[1], parts[2], parts[3]}), t);
+      return ok_;
+    }
     case Op::Umad: {
       const uint32_t a = src(ins, 0, Ty::U), c = src(ins, 1, Ty::U), e = src(ins, 2, Ty::U);
       write(ins, emit(OpIAdd, u4_, {emit(OpIMul, u4_, {a, c}), e}), Ty::U);

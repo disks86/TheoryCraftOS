@@ -667,6 +667,59 @@ void test_stream_fuzz() {
   }
 }
 
+// Vertex buffer slots with no buffer (kFeature3NullVertexBuffers) and of stride 0 (kFeature3ZeroStride) on the CPU renderer: the colour of slot 1 unbound reads (0, 0, 0, 0) - black
+// over the red clear, a Float4 colour's alpha 0 too -, also after BindVertexBuffer of kNoVertexBuffer took a buffer away; a stride of 0 gives every vertex the first colour.
+void test_unbound_vertex_buffers() {
+  Env e;
+  Handle vs = 0, fs = 0, two_slots = 0, zero_stride = 0;
+  CHECK(e.kernel.create_shader(kPid, e.dev, {ShaderKind::ColoredVertex, graphics::ShaderStage::Vertex, {}}, &vs) == status::kSuccess);
+  CHECK(e.kernel.create_shader(kPid, e.dev, {ShaderKind::ColoredFragment, graphics::ShaderStage::Fragment, {}}, &fs) == status::kSuccess);
+  graphics::GraphicsPipelineDesc d;
+  graphics::describe_colored_pipeline(&d);
+  PipelineDesc pd;
+  pd.vertex_shader = vs, pd.fragment_shader = fs;
+  pd.vertex_stride = 12, pd.attribute_count = d.attribute_count, pd.varying_count = d.varying_count;
+  for (uint32_t i = 0; i < d.attribute_count; ++i) pd.attributes[i] = d.attributes[i];
+  pd.attributes[1].slot = 1, pd.attributes[1].offset = 0;   // (the colour from a buffer of its own)
+  pd.cull_mode = graphics::CullMode::None;
+  pd.slot_strides[1] = 16;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &two_slots) == status::kSuccess);
+  pd.slot_strides[1] = 0;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &zero_stride) == status::kSuccess);
+  pd.attributes[1].offset = 2048;   // (at stride 0 an attribute lies within the first 2048 bytes)
+  Handle refused = 0;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &refused) == status::kInvalidParameter);
+  Handle rt = e.alloc(kTarget, Format::A8R8G8B8, 8, 8), positions = e.buffer(kAllocVertexBuffer, 36), colours = e.buffer(kAllocVertexBuffer, 48);
+  const float p[9] = {-1, -1, 0.5f, 3, -1, 0.5f, -1, 3, 0.5f};
+  const float c[12] = {0, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 1};   // (green, then blue twice)
+  CHECK(e.write(positions, floats(p, 9)) && e.write(colours, floats(c, 12)));
+  const uint32_t black = 0x00000000u, green = 0xFF00FF00u;   // (the colour (0, 0, 0, 0): a Float4 attribute has its w)
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  for (int k = 0; k < 3; ++k) {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {1, 0, 0, 1}, 1, 0);
+    w.bind_pipeline(k == 2 ? zero_stride : two_slots);
+    w.push_constants(floats(identity, 16));
+    w.set_viewport({0, 0, 8, 8, 0, 1});
+    w.set_scissor({0, 0, 8, 8});
+    w.bind_vertex_buffer(1);
+    if (k != 0) w.bind_vertex_buffer_slot(1, 2);
+    if (k == 1) w.unbind_vertex_buffer_slot(1);   // (bound, then taken away)
+    w.draw(3);
+    w.end_pass();
+    CHECK(e.render(w, {rt, positions, colours}) == status::kSuccess);
+    const uint32_t got = e.pixel(rt, 2, 2);
+    if (got != (k == 2 ? green : black)) printf("  unbound vertex buffers %d: %08x\n", k, got);
+    CHECK(got == (k == 2 ? green : black));
+  }
+  // (an allocation index of kNoVertexBuffer takes an offset of 0 only)
+  CommandWriter bad(e.allocator);
+  bad.begin_pass(0, kNoAllocation, 0, {}, 1, 0);
+  bad.bind_vertex_buffer_slot(1, kNoVertexBuffer, 4);
+  bad.end_pass();
+  CHECK(e.render(bad, {rt}) == status::kInvalidParameter);
+}
+
 void test_stream_errors() {
   Env e;
   Handle rt = e.alloc(kTarget, Format::A8R8G8B8, 8, 8), vb = e.buffer(kAllocVertexBuffer, 3 * 28), ib = e.buffer(kAllocIndexBuffer, 12), tex = e.alloc(kTexture, Format::A8R8G8B8, 4, 4);
@@ -686,7 +739,7 @@ void test_stream_errors() {
   { CommandWriter w(e.allocator); w.begin_pass(0, kNoAllocation, kPassClearDepth, {}, 2.0f, 0); w.end_pass(); expect("clear depth out of range", w, {rt}, status::kInvalidParameter); }
   { CommandWriter w(e.allocator); w.begin_pass(0, kNoAllocation, 0, {NAN, 0, 0, 0}, 1, 0); w.end_pass(); expect("NaN clear colour", w, {rt}, status::kInvalidParameter); }
   { CommandWriter w(e.allocator); w.begin_pass(0, kNoAllocation, 0, {}, 1, 0); w.draw(3); w.end_pass(); expect("draw without a pipeline", w, {rt}, status::kInvalidParameter); }
-  { CommandWriter w(e.allocator); w.begin_pass(0, kNoAllocation, 0, {}, 1, 0); w.bind_pipeline(pipe); w.draw(3); w.end_pass(); expect("draw without vertices", w, {rt}, status::kInvalidParameter); }
+  { CommandWriter w(e.allocator); w.begin_pass(0, kNoAllocation, 0, {}, 1, 0); w.bind_pipeline(pipe); w.draw(3); w.end_pass(); expect("draw without vertices", w, {rt}, status::kSuccess); }   // (kFeature3NullVertexBuffers: the slot reads zeros)
   { CommandWriter w(e.allocator); w.begin_pass(0, kNoAllocation, 0, {}, 1, 0); w.bind_pipeline(0x12345); w.end_pass(); expect("no such pipeline", w, {rt}, status::kInvalidHandle); }
   { CommandWriter w(e.allocator); w.begin_pass(0, kNoAllocation, 0, {}, 1, 0); w.bind_pipeline(pipe); w.bind_vertex_buffer(1); w.draw(4); w.end_pass(); expect("draw past the vertex buffer", w, {rt, vb}, status::kInvalidParameter); }
   { CommandWriter w(e.allocator); w.begin_pass(0, kNoAllocation, 0, {}, 1, 0); w.bind_pipeline(pipe); w.bind_vertex_buffer(1, 28); w.draw(3); w.end_pass(); expect("draw past it from an offset", w, {rt, vb}, status::kInvalidParameter); }
@@ -6133,6 +6186,32 @@ void test_d3d12_reserved_texture() {
 
 // Reserved textures beyond tier 1 (VidMm ReservedLayout): the tile numbering of arrays, volumes and block-compressed formats; render targets whose unmapped tiles drop what is drawn;
 // CopyTiles; residency feedback (sample_cl_s, ld_s, gather4_s and check_access_fully_mapped: ps_tiled) and a lookup's own clamp (ps_tiled_clamp) on the CPU renderer.
+// Shader Model 5's bit operations (cs_bits: countbits, firstbit_hi / _lo / _shi, ubfe, ibfe, bfi, bfrev) become TGSI's POPC, LSB, UBFE, IBFE, BFI, BREV (d3d12test
+// checks what they compute against the HLSL on every device); a geometry shader whose inputs a register indexes (gs_loop: v[r0.x][register]) compiles, its inputs gathered by movc.
+void test_bits_and_indexed_inputs() {
+  HostAllocator allocator;
+  NtStatus st = 0;
+  const std::vector<uint8_t> bits_blob = read_blob("cs_bits.dxbc"), loop_blob = read_blob("gs_loop.dxbc");
+  CHECK(!bits_blob.empty() && !loop_blob.empty());
+  UniquePointer<D3d9Program> bits = compile_dxbc(allocator, bits_blob, &st);
+  CHECK(bits && st == status::kSuccess);
+  if (bits) {
+    String text(allocator);
+    CHECK(bits->emit_tgsi(&text) == status::kSuccess);
+    for (const char* op : {"POPC", "LSB", "UBFE", "IBFE", "BFI", "BREV"})
+      if (text.view().find(op) == StringView::npos) {
+        printf("  bit operations: no %s in the TGSI\n", op);
+        CHECK(false);
+      }
+  }
+  UniquePointer<D3d9Program> loop = compile_dxbc(allocator, loop_blob, &st);
+  CHECK(loop && st == status::kSuccess);
+  if (loop) {
+    String text(allocator);
+    CHECK(loop->emit_tgsi(&text) == status::kSuccess);
+  }
+}
+
 void test_reserved_tiers() {
   // --- the numbering
   {
@@ -6307,6 +6386,13 @@ void test_reserved_tiers() {
     CHECK(program && st == status::kSuccess && program->uses_feedback() && (program->required_features2() & graphics::kFeature2TileResidency));
     String text(allocator);
     CHECK(program && program->emit_tgsi(&text) == status::kNotSupported);
+    // (the loads of buffers and storage images with a status - ld_raw_s, ld_structured_s, ld_uav_typed_s of a typed buffer and of a texture: cs_tiled_loads - are taken too, and
+    // need the same feature; d3d12test runs it on reserved resources)
+    const std::vector<uint8_t> loads_blob = read_blob("cs_tiled_loads.dxbc");
+    UniquePointer<D3d9Program> loads = compile_dxbc(allocator, loads_blob, &st);
+    CHECK(loads && st == status::kSuccess && loads->uses_feedback() && (loads->required_features2() & graphics::kFeature2TileResidency));
+    String loads_text(allocator);
+    CHECK(loads && loads->emit_tgsi(&loads_text) == status::kNotSupported);
   }
 }
 
@@ -8223,7 +8309,12 @@ void test_d3d12_reserved() {
   CHECK(e.kernel.create_allocation(kPid, e.dev, image, &none) == status::kInvalidParameter);      // (a narrow layout of an image that is not A8B8G8R8)
   image.tile_narrow = 0;
   image.flags = kAllocDepthStencil | kAllocTexture | kAllocReserved, image.format = Format::D32Float;
-  CHECK(e.kernel.create_allocation(kPid, e.dev, image, &none) == status::kInvalidParameter);      // (no reserved depth buffer: its contents are the device's alone)
+  CHECK(e.kernel.create_allocation(kPid, e.dev, image, &none) == status::kSuccess);      // (a reserved depth buffer: floats in its backing, kFeature2DepthCopies)
+  image.format = Format::D24S8;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, image, &none) == status::kInvalidParameter);      // (... not one with a stencil plane)
+  image.format = Format::D32Float, image.tile_narrow = static_cast<uint32_t>(NarrowLayout::R8);
+  CHECK(e.kernel.create_allocation(kPid, e.dev, image, &none) == status::kInvalidParameter);      // (its heaps' texels are floats or 16-bit codes)
+  image.tile_narrow = 0;
   image.format = Format::A8R8G8B8;
   AllocationDesc narrow_buffer;
   narrow_buffer.flags = kAllocVertexBuffer, narrow_buffer.size = kTileBytes, narrow_buffer.tile_narrow = 1;
@@ -12001,6 +12092,7 @@ int main() {
   test_triangle();
   test_texture_copy_mips();
   test_stream_errors();
+  test_unbound_vertex_buffers();
   test_stream_fuzz();
   test_fault();
   test_fences_and_scheduler();
@@ -12054,6 +12146,7 @@ int main() {
   test_d3d12_reserved();
   test_d3d12_reserved_texture();
   test_reserved_tiers();
+  test_bits_and_indexed_inputs();
   test_dxil();
   test_compute_shared();
   test_geometry_extras();

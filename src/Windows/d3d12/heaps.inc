@@ -354,7 +354,7 @@ static void STDMETHODCALLTYPE dev_CreateShaderResourceView(Dev *This, ID3D12Reso
       if (format_packed_yuv(r->desc.Format) && (!desc || !packed_yuv_view_ok(r->desc.Format, desc->Format, 0))) d.kind = 0;
       if (!r->planes && !srv_view(r, desc, &d)) d.kind = 0;      /* (the levels and layers it shows) */
       /* (a typeless narrow texture the kernel keeps natively, seen as another kind of its family: through a mirror of the view's levels and layers in the view's format, which the
-       * kernel brings up to date when the view is used; the view is then all of the mirror. Not of a volume: a mirror is 2D or an array) */
+       * kernel brings up to date when the view is used; the view is then all of the mirror - of a volume, a volume of the view's levels, every slice of each) */
       UINT kf = 0;
       const int typed = d.kind && desc ? typed_view_kind(This, r, desc->Format, 0, &kf) : 0;
       if (typed < 0) d.kind = 0;
@@ -363,7 +363,7 @@ static void STDMETHODCALLTYPE dev_CreateShaderResourceView(Dev *This, ID3D12Reso
         const UINT levels = d.stride ? d.stride : r->mips - d.mip, count = d.pad ? d.pad : layers - d.slice;
         const int array = desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY || desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE1DARRAY ||
                           desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBE || desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
-        d.alloc = r->kind == 1 ? 0 : typed_mirror(r, kf, d.mip, levels, d.slice, count, array, 0, 0);
+        d.alloc = r->kind == 1 ? typed_mirror(r, kf, d.mip, levels, 0, mip_extent(r->layers, d.mip), 0, 0, 0) : typed_mirror(r, kf, d.mip, levels, d.slice, count, array, 0, 0);
         d.mip = d.stride = d.slice = d.pad = 0;
         d.offset = SRV_MIRRORS;
         if (!d.alloc) d.kind = 0;
@@ -573,7 +573,7 @@ static void STDMETHODCALLTYPE dev_CreateRenderTargetView(Dev *This, ID3D12Resour
       if (typed < 0) d.kind = 0;
       if (typed > 0) {
         const int array = desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY || desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE1DARRAY;
-        d.alloc = (r->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) && r->kind != 1 ? typed_mirror(r, kf, d.mip, 1, d.slice, d.stride, array, MIRROR_WRITE_BACK, narrow_family_mask(desc->Format)) : 0;
+        d.alloc = (r->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ? typed_mirror(r, kf, d.mip, 1, d.slice, d.stride, array, MIRROR_WRITE_BACK, narrow_family_mask(desc->Format)) : 0;
         d.mip = 0, d.slice = 0;
         if (!d.alloc) d.kind = 0;
       }

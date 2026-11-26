@@ -822,6 +822,7 @@ static void STDMETHODCALLTYPE list_CopyTiles(CmdList *l, ID3D12Resource *resourc
   UINT *tiles = mem_alloc((SIZE_T)count * sizeof(UINT));
   if (!tiles) return;
   const UINT n = region_tiles(&layout, *start, *size, tiles, 0, (UINT)count);
+  if (l->pending_clear) flush_pending_clear(l);      /* (a depth clear recorded before - of a reserved depth buffer - comes first) */
   end_pass(l);
   /* (runs of tiles that follow each other in the numbering become one copy each) */
   for (UINT k = 0; k < n;) {

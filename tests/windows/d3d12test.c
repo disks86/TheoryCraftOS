@@ -1371,6 +1371,67 @@ static void test_bundle(Scene *c) {
   ID3D12CommandAllocator_Release(balloc);
 }
 
+/* Root arguments and bundles (Direct3D 12 "Bundle Semantics"): a bundle inherits the caller's root arguments; setting the caller's root signature again inside it keeps them
+ * (as setting the same one again on a list does); what the bundle sets is the caller's afterwards. The matrix of the root constants puts the triangle in one half. */
+static void test_bundle_root_arguments(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  ID3D12CommandAllocator *balloc = NULL;
+  ID3D12GraphicsCommandList *same = NULL, *sets = NULL, *list = NULL;
+  CHECK_HR(ID3D12Device_CreateCommandAllocator(dev, D3D12_COMMAND_LIST_TYPE_BUNDLE, &IID_ID3D12CommandAllocator, (void **)&balloc));
+  if (!balloc) return;
+  CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_BUNDLE, balloc, NULL, &IID_ID3D12GraphicsCommandList, (void **)&same));
+  CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_BUNDLE, balloc, NULL, &IID_ID3D12GraphicsCommandList, (void **)&sets));
+  CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  if (same && sets && list) {
+    float left[16], right[16];
+    memcpy(left, kIdentity, sizeof left);
+    left[0] = left[5] = 0.5f;
+    memcpy(right, left, sizeof right);
+    left[3] = -0.5f;
+    right[3] = 0.5f;
+    D3D12_VERTEX_BUFFER_VIEW vbv = {ID3D12Resource_GetGPUVirtualAddress(c->vb), 256, 28};
+    /* (the caller's root signature again, the pipeline, the buffers and a draw: no root constants of its own) */
+    ID3D12GraphicsCommandList_SetGraphicsRootSignature(same, c->rs);
+    ID3D12GraphicsCommandList_SetPipelineState(same, c->pso);
+    ID3D12GraphicsCommandList_IASetPrimitiveTopology(same, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D12GraphicsCommandList_IASetVertexBuffers(same, 0, 1, &vbv);
+    ID3D12GraphicsCommandList_DrawInstanced(same, 3, 1, 0, 0);
+    CHECK_HR(ID3D12GraphicsCommandList_Close(same));
+    /* (one that sets the caller's signature and new constants, and draws nothing) */
+    ID3D12GraphicsCommandList_SetGraphicsRootSignature(sets, c->rs);
+    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(sets, 0, 16, left, 0);
+    CHECK_HR(ID3D12GraphicsCommandList_Close(sets));
+    for (int k = 0; k < 3; ++k) {
+      if (k) CHECK_HR(ID3D12GraphicsCommandList_Reset(list, c->allocator, NULL));      /* (made open) */
+      scene_begin(c, list, 1);
+      ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, c->rs);
+      ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(list, 0, 16, right, 0);
+      if (k == 0) {
+        ID3D12GraphicsCommandList_ExecuteBundle(list, same);      /* (inherits the right half) */
+      } else {
+        if (k == 1) ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, c->rs);      /* (the same signature again on the list: the constants stay) */
+        else ID3D12GraphicsCommandList_ExecuteBundle(list, sets);                          /* (the bundle's constants are the caller's after it: the left half) */
+        ID3D12GraphicsCommandList_SetPipelineState(list, c->pso);
+        ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ID3D12GraphicsCommandList_IASetVertexBuffers(list, 0, 1, &vbv);
+        ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+      }
+      scene_read_target(c, list);
+      scene_run(c, list);
+      const int l_n = scene_coloured(c, 0, 0, 32, 64), r_n = scene_coloured(c, 32, 0, 64, 64);
+      printf("bundle root arguments %d: %d pixels left, %d right\n", k, l_n, r_n);
+      if (k == 2) CHECK(l_n > 150 && r_n == 0);
+      else CHECK(r_n > 150 && l_n == 0);
+    }
+  } else {
+    CHECK(0);
+  }
+  if (list) ID3D12GraphicsCommandList_Release(list);
+  if (same) ID3D12GraphicsCommandList_Release(same);
+  if (sets) ID3D12GraphicsCommandList_Release(sets);
+  ID3D12CommandAllocator_Release(balloc);
+}
+
 static void test_tiled(Scene *c) {
   ID3D12Device *dev = c->dev;
   D3D12_FEATURE_DATA_D3D12_OPTIONS opts;
@@ -2206,6 +2267,89 @@ static void test_all_vertex_formats(Scene *c) {
   }
   ID3D12Resource_Release(positions);
   ID3D12Resource_Release(offsets);
+  ID3D12Resource_Release(colours);
+}
+
+/* Vertex buffer slots with no buffer and of stride 0 (Direct3D 12: a null vertex buffer view reads 0 - the components the format lacks 0, 0, 0, 1 -; a stride of 0 gives every vertex
+ * the first element). vs_fmt shows COLOR * 0.5 + 0.5 (vs_fmt_uint: xyz / 1023 and w / 3). A list that draws with the colours bound and then without them sees zeros the second
+ * time, not the buffer bound before. */
+static void test_unbound_vertex_buffers(Scene *c) {
+  const float big[9] = {-1, -1, 0.5f, -1, 3, 0.5f, 3, -1, 0.5f};
+  const float tints[12] = {-1, 1, -1, 1, 1, -1, -1, 1, 1, -1, -1, 1};      /* (green, then red: one element at stride 0 is green everywhere) */
+  ID3D12Resource *positions = upload_floats(c->dev, big, 9), *colours = upload_floats(c->dev, tints, 12);
+  if (!positions || !colours) { CHECK(0); return; }
+  D3D12_VERTEX_BUFFER_VIEW views[8];
+  memset(views, 0, sizeof views);
+  views[0].BufferLocation = ID3D12Resource_GetGPUVirtualAddress(positions), views[0].SizeInBytes = 36, views[0].StrideInBytes = 12;
+  struct { DXGI_FORMAT format; int shader; int rgba[4]; } cases[] = {
+    {DXGI_FORMAT_R32G32B32A32_FLOAT, 0, {128, 128, 128, 128}},      /* (0, 0, 0, 0) */
+    {DXGI_FORMAT_R32G32_FLOAT, 0, {128, 128, 128, 255}},            /* (0, 0, 0, 1) */
+    {DXGI_FORMAT_R8G8B8A8_UNORM, 0, {128, 128, 128, 128}},
+    {DXGI_FORMAT_R16_SNORM, 0, {128, 128, 128, 255}},
+    {DXGI_FORMAT_R32G32_UINT, 1, {0, 0, 0, 85}},                    /* (0, 0, 0, 1 as an integer: w / 3) */
+  };
+  int ok_all = 1;
+  for (UINT k = 0; k < sizeof cases / sizeof cases[0]; ++k) {
+    /* (COLOR from slot 4 and OFFSET per instance from slot 7, neither bound) */
+    const D3D12_INPUT_ELEMENT_DESC e[3] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                           {"COLOR", 0, cases[k].format, 4, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                           {"OFFSET", 0, DXGI_FORMAT_R32G32_FLOAT, 7, 0, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1}};
+    ID3D12PipelineState *pso = fmt_pipeline(c, e, 3, cases[k].shader, NULL);
+    UINT32 shown[5] = {0};
+    const int ok = pso && fmt_draw(c, pso, views, 2, 0, shown) && colour_is(shown[4], cases[k].rgba) && colour_is(shown[0], cases[k].rgba);
+    printf("unbound vertex buffers: format %u: %08x\n", (unsigned)cases[k].format, (unsigned)shown[4]);
+    ok_all = ok_all && ok;
+    if (pso) ID3D12PipelineState_Release(pso);
+  }
+  CHECK(ok_all);
+  /* Stride 0: every vertex reads the first colour (green); and the position slot unbound: every vertex at 0, 0 - nothing drawn. */
+  const D3D12_INPUT_ELEMENT_DESC e[3] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                         {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 4, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                         {"OFFSET", 0, DXGI_FORMAT_R32G32_FLOAT, 7, 0, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1}};
+  ID3D12PipelineState *pso = fmt_pipeline(c, e, 3, 0, NULL);
+  if (!pso) { CHECK(0); return; }
+  UINT32 shown[5] = {0};
+  views[4].BufferLocation = ID3D12Resource_GetGPUVirtualAddress(colours), views[4].SizeInBytes = 48, views[4].StrideInBytes = 0;
+  const int green[4] = {0, 255, 0, 255}, black[4] = {0, 0, 0, 255}, grey[4] = {128, 128, 128, 128};
+  CHECK(fmt_draw(c, pso, views, 1, 0, shown) && colour_is(shown[4], green) && colour_is(shown[0], green) && colour_is(shown[3], green));
+  printf("unbound vertex buffers: stride 0: %08x %08x\n", (unsigned)shown[0], (unsigned)shown[4]);
+  D3D12_VERTEX_BUFFER_VIEW no_position[8];
+  memcpy(no_position, views, sizeof no_position);
+  memset(&no_position[0], 0, sizeof no_position[0]);
+  CHECK(fmt_draw(c, pso, no_position, 1, 0, shown) && colour_is(shown[4], black));
+  /* In one list: the colours bound (at stride 16: the vertices' own), then unbound (IASetVertexBuffers with no views) and drawn again over the right half. */
+  {
+    ID3D12GraphicsCommandList *list = NULL;
+    CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+    CHECK_HR(ID3D12Device_CreateCommandList(c->dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, pso, &IID_ID3D12GraphicsCommandList, (void **)&list));
+    if (list) {
+      views[4].StrideInBytes = 16;
+      scene_begin(c, list, 1);
+      ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, c->rs);
+      ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(list, 0, 16, kIdentity, 0);
+      ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      ID3D12GraphicsCommandList_IASetVertexBuffers(list, 0, 8, views);
+      ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+      const D3D12_RECT right = {32, 0, 64, 64};
+      ID3D12GraphicsCommandList_RSSetScissorRects(list, 1, &right);
+      ID3D12GraphicsCommandList_IASetVertexBuffers(list, 4, 1, NULL);
+      ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+      scene_read_target(c, list);
+      scene_run(c, list);
+      ID3D12GraphicsCommandList_Release(list);
+      const UINT32 *pixels = NULL;
+      if (SUCCEEDED(ID3D12Resource_Map(c->readback, 0, NULL, (void **)&pixels)) && pixels) {
+        const UINT32 left = pixels[4 * 64 + 4], right_px = pixels[4 * 64 + 60];
+        printf("unbound vertex buffers: in one list %08x then %08x\n", (unsigned)left, (unsigned)right_px);
+        CHECK(!colour_is(left, grey) && colour_is(right_px, grey));
+        ID3D12Resource_Unmap(c->readback, 0, NULL);
+      } else {
+        CHECK(0);
+      }
+    }
+  }
+  ID3D12PipelineState_Release(pso);
+  ID3D12Resource_Release(positions);
   ID3D12Resource_Release(colours);
 }
 
@@ -3091,16 +3235,16 @@ static void test_tiled_formats(Scene *c) {
     else CHECK(packed.NumPackedMips == 1 && packed.NumStandardMips == 0 && total == packed.NumTilesForPackedMips && total >= 1);
     ID3D12Resource_Release(r);
   }
-  /* not tiled: the video formats (DXGI's tables) and depth formats (block-compressed ones are: test_tiled_tiers) */
+  /* not tiled: the video formats (DXGI's tables) and the depth formats with stencil (block-compressed ones are, and D32_FLOAT / D16_UNORM: test_tiled_tiers) */
   static const DXGI_FORMAT untiled[] = {DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_FORMAT_P016, DXGI_FORMAT_AYUV, DXGI_FORMAT_Y410, DXGI_FORMAT_Y416, DXGI_FORMAT_YUY2,
-                                        DXGI_FORMAT_Y210, DXGI_FORMAT_Y216, DXGI_FORMAT_D32_FLOAT};
+                                        DXGI_FORMAT_Y210, DXGI_FORMAT_Y216, DXGI_FORMAT_D24_UNORM_S8_UINT};
   for (UINT i = 0; i < sizeof untiled / sizeof untiled[0]; ++i) {
     CHECK(!(format_support2(dev, untiled[i]) & D3D12_FORMAT_SUPPORT2_TILED));
     D3D12_RESOURCE_DESC td = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 256, 256, 1, 1, untiled[i], {1, 0}, D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
-                              untiled[i] == DXGI_FORMAT_D32_FLOAT ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL : D3D12_RESOURCE_FLAG_NONE};
+                              untiled[i] == DXGI_FORMAT_D24_UNORM_S8_UINT ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL : D3D12_RESOURCE_FLAG_NONE};
     ID3D12Resource *r = NULL;
     const HRESULT hr = ID3D12Device_CreateReservedResource(dev, &td, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&r);
-    if (untiled[i] != DXGI_FORMAT_D32_FLOAT) CHECK(hr == E_INVALIDARG && !r);
+    if (untiled[i] != DXGI_FORMAT_D24_UNORM_S8_UINT) CHECK(hr == E_INVALIDARG && !r);
     else CHECK(FAILED(hr) && !r);
     if (r) ID3D12Resource_Release(r);
   }
@@ -3800,6 +3944,79 @@ static void test_texture_uavs(Scene *c) {
 /* Unordered access views of narrow volumes (formats the device keeps widened, written through a mirror of the view's slices): an R8_UNORM volume of 4 x 4 x 4 written whole, slice 1 of
  * level 1 of an R16G16_UNORM volume of 8 x 8 x 4 (4 x 4 x 2 there) written by cs_uav_volume, and slice 0 of that level cleared through a view of it alone; the rest keeps what it had. */
 static UINT16 unorm16(float v) { return (UINT16)(v <= 0 ? 0 : v >= 1 ? 65535 : (UINT)(v * 65535.0f + 0.5f)); }
+/* Typed views of a typeless narrow volume (an R16_TYPELESS volume of 4 x 4 x 4 and two levels the kernel keeps natively, seen through R16_UINT shader resource views: mirrors that
+ * are volumes - of both levels, and of level 1 alone), read by cs_vol_typed: every texel of each level as it was written. A device without the kernel's narrow images reads the
+ * widened texture as it is (no mirror): the same values. */
+static ID3D12RootSignature *ranges_signature(ID3D12Device *dev, UINT count, const D3D12_DESCRIPTOR_RANGE_TYPE *types, const UINT *regs, const UINT *sizes, int graphics);
+static void buffer_uav(ID3D12Device *dev, ID3D12DescriptorHeap *heap, ID3D12DescriptorHeap *cpu, UINT i, ID3D12Resource *r, ID3D12Resource *counter, UINT64 counter_offset, DXGI_FORMAT format,
+                       UINT first, UINT count, UINT stride, UINT flags);
+static int buffer_download(Scene *c, ID3D12Resource *from, UINT64 offset, void *out, UINT bytes);
+static void test_typeless_volume_views(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  D3D12_HEAP_PROPERTIES defaults = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+  const D3D12_RESOURCE_DESC vd = {D3D12_RESOURCE_DIMENSION_TEXTURE3D, 0, 4, 4, 4, 2, DXGI_FORMAT_R16_TYPELESS, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+  ID3D12Resource *vol = NULL;
+  CHECK_HR(ID3D12Device_CreateCommittedResource(dev, &defaults, D3D12_HEAP_FLAG_NONE, &vd, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&vol));
+  const D3D12_DESCRIPTOR_RANGE_TYPE types[2] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_DESCRIPTOR_RANGE_TYPE_UAV};
+  const UINT regs[2] = {0, 0};
+  ID3D12RootSignature *rs = ranges_signature(dev, 2, types, regs, NULL, 0);
+  ID3D12PipelineState *pso = rs ? compute_pso(dev, rs, dx_cs_vol_typed_dxbc, sizeof dx_cs_vol_typed_dxbc) : NULL;
+  ID3D12Resource *out = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 512, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+  ID3D12DescriptorHeap *heap = view_heap(dev, 4, 1);
+  if (!vol || !rs || !pso || !out || !heap) {
+    CHECK(0);
+  } else {
+    UINT16 level0[64], level1[8];
+    for (UINT i = 0; i < 64; ++i) level0[i] = (UINT16)(1000 + i * 7);
+    for (UINT i = 0; i < 8; ++i) level1[i] = (UINT16)(50000 + i * 3);
+    texture_write(c, vol, 0, level0, 2);
+    texture_write(c, vol, 1, level1, 2);
+    for (int view = 0; view < 2; ++view) {
+      /* (view 0: both levels; view 1: from level 1, one level) */
+      D3D12_SHADER_RESOURCE_VIEW_DESC s;
+      memset(&s, 0, sizeof s);
+      s.Format = DXGI_FORMAT_R16_UINT;
+      s.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+      s.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+      s.Texture3D.MostDetailedMip = view ? 1 : 0;
+      s.Texture3D.MipLevels = view ? 1 : 2;
+      ID3D12Device_CreateShaderResourceView(dev, vol, &s, heap_cpu(dev, heap, 0));
+      buffer_uav(dev, heap, NULL, 1, out, NULL, 0, DXGI_FORMAT_R32_TYPELESS, 0, 128, 0, D3D12_BUFFER_UAV_FLAG_RAW);
+      ID3D12GraphicsCommandList *list = NULL;
+      CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+      CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, pso, &IID_ID3D12GraphicsCommandList, (void **)&list));
+      if (!list) continue;
+      ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 1, &heap);
+      ID3D12GraphicsCommandList_SetComputeRootSignature(list, rs);
+      ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(list, 0, 16, kIdentity, 0);
+      ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 1, heap_gpu(dev, heap, 0));
+      ID3D12GraphicsCommandList_Dispatch(list, 1, 1, 1);
+      scene_run(c, list);
+      ID3D12GraphicsCommandList_Release(list);
+      UINT got[72];
+      memset(got, 0xEE, sizeof got);
+      CHECK(buffer_download(c, out, 0, got, sizeof got));
+      int wrong = 0;
+      for (UINT i = 0; i < 64; ++i) {
+        /* (view 1's level 0 is level 1: its 2 x 2 x 2 only - a load outside is out of bounds, which a GPU may not answer with 0) */
+        const UINT x = i % 4, y = i / 4 % 4, z = i / 16;
+        if (view && (x >= 2 || y >= 2 || z >= 2)) continue;
+        const UINT want = !view ? level0[i] : level1[x + 2 * y + 4 * z];
+        if (got[i] != want && wrong++ < 4) printf("  typeless volume view %d: texel %u of level 0 %u, not %u\n", view, i, got[i], want);
+      }
+      for (UINT i = 0; i < 8 && !view; ++i)
+        if (got[64 + i] != level1[i] && wrong++ < 8) printf("  typeless volume view %d: texel %u of level 1 %u, not %u\n", view, i, got[64 + i], level1[i]);
+      printf("typeless volume view %d: %d texels wrong\n", view, wrong);
+      CHECK(wrong == 0);
+    }
+  }
+  if (heap) ID3D12DescriptorHeap_Release(heap);
+  if (out) ID3D12Resource_Release(out);
+  if (pso) ID3D12PipelineState_Release(pso);
+  if (rs) ID3D12RootSignature_Release(rs);
+  if (vol) ID3D12Resource_Release(vol);
+}
+
 static void test_narrow_volume_uavs(Scene *c) {
   ID3D12Device *dev = c->dev;
   const D3D12_RESOURCE_FLAGS uav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
@@ -4137,6 +4354,88 @@ static void test_typed_buffers(Scene *c) {
   ID3D12Resource_Release(colours);
 }
 
+/* Shader Model 5's bit operations in a compute shader (cs_bits: countbits, firstbit_hi / _lo / _shi, bfrev, ubfe, ibfe, bfi, as Microsoft's compiler makes them of HLSL's
+ * countbits, firstbithigh, firstbitlow, reversebits and shifts and masks), against the same HLSL worked out here, for 16 pairs of words with the edge cases (no bits, all bits, the
+ * sign bit, widths of 0 and 31, fields that end past bit 31). */
+static UINT bits_reverse(UINT v) {
+  UINT r = 0;
+  for (int i = 0; i < 32; ++i) r |= ((v >> i) & 1u) << (31 - i);
+  return r;
+}
+static UINT bits_high(UINT v) {      /* (firstbithigh of a uint: the place from the bottom, -1 for none) */
+  for (int i = 31; i >= 0; --i) if (v >> i & 1u) return (UINT)i;
+  return 0xFFFFFFFFu;
+}
+static void bits_reference(UINT a, UINT b, UINT out[12]) {
+  const UINT width = b & 31, offset = (b >> 8) & 31;
+  UINT count = 0;
+  for (int i = 0; i < 32; ++i) count += a >> i & 1u;
+  out[0] = count;
+  out[1] = bits_high(a);
+  UINT low = 0xFFFFFFFFu;
+  for (int i = 31; i >= 0; --i) if (a >> i & 1u) low = (UINT)i;
+  out[2] = low;
+  out[3] = bits_high((INT)a < 0 ? ~a : a);      /* (firstbithigh of an int: the first bit other than the sign) */
+  out[4] = bits_reverse(a);
+  out[5] = (a >> 4) & 0x3F;
+  out[6] = (a >> offset) & ((1u << width) - 1u);
+  out[7] = (UINT)(((INT)(a << 8)) >> 20);
+  out[8] = (a & ~0x0000FF00u) | ((b << 8) & 0x0000FF00u);
+  const UINT mask = ((1u << width) - 1u) << offset;
+  out[9] = ((b << offset) & mask) | (a & ~mask);
+  out[10] = (a >> 28) & 0xFF;
+  out[11] = (UINT)(((INT)a) >> 31);
+}
+static void test_bit_operations(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  const UINT pairs[16][2] = {{0, 0},           {0xFFFFFFFFu, 31},          {0x80000000u, 0x1F01},     {1, 0x0001},         {0x12345678u, 0x0C08},     {0xDEADBEEFu, 0x1810},
+                             {0x7FFFFFFFu, 0x1F1F},  {0x00F000F0u, 0x041C}, {0xFFFF0000u, 0x101F},     {0x0000FFFFu, 0x0010}, {0xA5A5A5A5u, 0x0303}, {0x5A5A5A5Au, 0x1D05},
+                             {0xC0000000u, 0x1E02},  {0x00000100u, 0x0800}, {0x80000001u, 0x001F},     {0x13579BDFu, 0x170B}};
+  const D3D12_DESCRIPTOR_RANGE_TYPE types[2] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_DESCRIPTOR_RANGE_TYPE_UAV};
+  const UINT regs[2] = {0, 0};
+  ID3D12RootSignature *rs = ranges_signature(dev, 2, types, regs, NULL, 0);
+  ID3D12PipelineState *pso = rs ? compute_pso(dev, rs, dx_cs_bits_dxbc, sizeof dx_cs_bits_dxbc) : NULL;
+  const D3D12_RESOURCE_FLAGS uav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  ID3D12Resource *in = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, sizeof pairs, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON);
+  ID3D12Resource *out = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 16 * 48, uav, D3D12_RESOURCE_STATE_COMMON);
+  ID3D12DescriptorHeap *heap = view_heap(dev, 2, 1);
+  if (!rs || !pso || !in || !out || !heap) {
+    CHECK(0);
+  } else {
+    buffer_upload(c, in, 0, pairs, sizeof pairs);
+    buffer_srv(dev, heap, 0, in, DXGI_FORMAT_R32_TYPELESS, 0, 32, 0, D3D12_BUFFER_SRV_FLAG_RAW);
+    buffer_uav(dev, heap, NULL, 1, out, NULL, 0, DXGI_FORMAT_R32_TYPELESS, 0, 16 * 12, 0, D3D12_BUFFER_UAV_FLAG_RAW);
+    ID3D12GraphicsCommandList *list = NULL;
+    CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+    CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, pso, &IID_ID3D12GraphicsCommandList, (void **)&list));
+    if (list) {
+      ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 1, &heap);
+      ID3D12GraphicsCommandList_SetComputeRootSignature(list, rs);
+      ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(list, 0, 16, kIdentity, 0);
+      ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 1, heap_gpu(dev, heap, 0));
+      ID3D12GraphicsCommandList_Dispatch(list, 1, 1, 1);
+      scene_run(c, list);
+      ID3D12GraphicsCommandList_Release(list);
+      UINT got[16 * 12];
+      memset(got, 0xEE, sizeof got);
+      CHECK(buffer_download(c, out, 0, got, sizeof got));
+      int wrong = 0;
+      for (UINT p = 0; p < 16; ++p) {
+        UINT want[12];
+        bits_reference(pairs[p][0], pairs[p][1], want);
+        for (UINT k = 0; k < 12; ++k)
+          if (got[p * 12 + k] != want[k] && wrong++ < 6) printf("  bit operations: %08x %08x result %u: %08x, not %08x\n", pairs[p][0], pairs[p][1], k, got[p * 12 + k], want[k]);
+      }
+      printf("bit operations: %d of 192 results wrong\n", wrong);
+      CHECK(wrong == 0);
+    }
+  }
+  if (heap) ID3D12DescriptorHeap_Release(heap);
+  if (out) ID3D12Resource_Release(out);
+  if (in) ID3D12Resource_Release(in);
+  if (pso) ID3D12PipelineState_Release(pso);
+  if (rs) ID3D12RootSignature_Release(rs);
+}
 /* What a Shader Model 6.0 compute shader has besides the wave operations, which the DXIL translator takes as the DXBC front end does (dxil_cs_typed): typed views of a texture
  * and a buffer (loads, stores, atomics, compare-exchange), a Buffer<>, GetDimensions of each kind, compare-exchange on raw and structured buffers, a hidden counter,
  * atomics on group-shared memory. The DXIL and the DXBC (Microsoft's compiler) of the same HLSL run on resources made the same way; everything they write must agree. */
@@ -7744,6 +8043,108 @@ static int tt_pipeline_made(Scene *c, const void *ps, SIZE_T ps_bytes) {
   return SUCCEEDED(hr) && pso;
 }
 
+/* Residency feedback of buffer and unordered access loads (cs_tiled_loads: ld_raw_s, ld_structured_s, ld_uav_typed_s of a typed buffer view and of a texture): a reserved buffer of
+ * two tiles and a reserved 256 x 128 R32_UINT texture of two tiles, the first tile of each mapped and the second nowhere. Thread 0 reads the mapped tiles (the values written,
+ * CheckAccessFullyMapped 1), thread 1 the unmapped ones (0 and 0). A device of tier 1 refuses the shader. */
+static void test_tiled_loads(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  D3D12_FEATURE_DATA_D3D12_OPTIONS opts;
+  memset(&opts, 0, sizeof opts);
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS, &opts, sizeof opts));
+  const D3D12_DESCRIPTOR_RANGE_TYPE types[5] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+                                                D3D12_DESCRIPTOR_RANGE_TYPE_UAV};
+  const UINT regs[5] = {0, 1, 0, 1, 2};
+  ID3D12RootSignature *rs = ranges_signature(dev, 5, types, regs, NULL, 0);
+  ID3D12PipelineState *pso = NULL;
+  if (rs && opts.TiledResourcesTier >= D3D12_TILED_RESOURCES_TIER_2) {
+    pso = compute_pso(dev, rs, dx_cs_tiled_loads_dxbc, sizeof dx_cs_tiled_loads_dxbc);
+  } else if (rs) {
+    D3D12_COMPUTE_PIPELINE_STATE_DESC cd;      /* (made by hand: compute_pso checks that it is made) */
+    memset(&cd, 0, sizeof cd);
+    cd.pRootSignature = rs;
+    cd.CS.pShaderBytecode = dx_cs_tiled_loads_dxbc;
+    cd.CS.BytecodeLength = sizeof dx_cs_tiled_loads_dxbc;
+    ID3D12Device_CreateComputePipelineState(dev, &cd, &IID_ID3D12PipelineState, (void **)&pso);
+  }
+  printf("tiled loads: tier %d, pipeline %s\n", (int)opts.TiledResourcesTier, pso ? "made" : "refused");
+  if (opts.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_2) {
+    CHECK(!pso);      /* (no residency feedback there) */
+    if (pso) ID3D12PipelineState_Release(pso);
+    if (rs) ID3D12RootSignature_Release(rs);
+    return;
+  }
+  const D3D12_RESOURCE_FLAGS uav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  D3D12_RESOURCE_DESC bd = {D3D12_RESOURCE_DIMENSION_BUFFER, 0, 2 * 65536, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, uav};
+  ID3D12Resource *buffer = NULL;
+  CHECK_HR(ID3D12Device_CreateReservedResource(dev, &bd, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&buffer));
+  ID3D12Resource *image = tt_reserved(dev, D3D12_RESOURCE_DIMENSION_TEXTURE2D, 256, 128, 1, 1, DXGI_FORMAT_R32_UINT, uav, NULL);
+  ID3D12Resource *results = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 64, uav, D3D12_RESOURCE_STATE_COMMON);
+  D3D12_HEAP_DESC hd;
+  memset(&hd, 0, sizeof hd);
+  hd.SizeInBytes = 4 * 65536;
+  hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+  hd.Properties.CreationNodeMask = hd.Properties.VisibleNodeMask = 1;
+  hd.Alignment = 65536;
+  ID3D12Heap *heap = NULL;
+  CHECK_HR(ID3D12Device_CreateHeap(dev, &hd, &IID_ID3D12Heap, (void **)&heap));
+  ID3D12DescriptorHeap *views = view_heap(dev, 5, 1), *cpu = view_heap(dev, 5, 0);
+  if (!pso || !buffer || !image || !results || !heap || !views || !cpu) {
+    CHECK(0);
+  } else {
+    const D3D12_TILED_RESOURCE_COORDINATE first = {0, 0, 0, 0}, second_buffer = {1, 0, 0, 0}, second_image = {1, 0, 0, 0};
+    tt_map(c, buffer, first, 1, heap, 0);
+    tt_map(c, buffer, second_buffer, 1, NULL, 0);
+    tt_map(c, image, first, 1, heap, 1);
+    tt_map(c, image, second_image, 1, NULL, 0);
+    /* (the words at byte 16 of each buffer tile; the one in the unmapped tile is dropped) */
+    const UINT word = 0x1234u;
+    buffer_upload(c, buffer, 16, &word, 4);
+    buffer_upload(c, buffer, 65536 + 16, &word, 4);
+    buffer_srv(dev, views, 0, buffer, DXGI_FORMAT_R32_TYPELESS, 0, 32768, 0, D3D12_BUFFER_SRV_FLAG_RAW);
+    buffer_srv(dev, views, 1, buffer, DXGI_FORMAT_UNKNOWN, 0, 32768, 4, 0);
+    buffer_uav(dev, views, cpu, 2, results, NULL, 0, DXGI_FORMAT_R32_TYPELESS, 0, 16, 0, D3D12_BUFFER_UAV_FLAG_RAW);
+    buffer_uav(dev, views, cpu, 3, buffer, NULL, 0, DXGI_FORMAT_R32_UINT, 0, 32768, 0, 0);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC u;
+    memset(&u, 0, sizeof u);
+    u.Format = DXGI_FORMAT_R32_UINT;
+    u.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    ID3D12Device_CreateUnorderedAccessView(dev, image, NULL, &u, heap_cpu(dev, views, 4));
+    ID3D12Device_CreateUnorderedAccessView(dev, image, NULL, &u, heap_cpu(dev, cpu, 4));
+    ID3D12GraphicsCommandList *list = NULL;
+    CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+    CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, pso, &IID_ID3D12GraphicsCommandList, (void **)&list));
+    if (list) {
+      ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 1, &views);
+      const UINT fill[4] = {77, 77, 77, 77}, nines[4] = {9, 9, 9, 9};
+      ID3D12GraphicsCommandList_ClearUnorderedAccessViewUint(list, heap_gpu(dev, views, 4), heap_cpu(dev, cpu, 4), image, fill, 0, NULL);
+      ID3D12GraphicsCommandList_ClearUnorderedAccessViewUint(list, heap_gpu(dev, views, 2), heap_cpu(dev, cpu, 2), results, nines, 0, NULL);
+      ID3D12GraphicsCommandList_SetComputeRootSignature(list, rs);
+      ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(list, 0, 16, kIdentity, 0);
+      ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 1, heap_gpu(dev, views, 0));
+      ID3D12GraphicsCommandList_Dispatch(list, 1, 1, 1);
+      scene_run(c, list);
+      ID3D12GraphicsCommandList_Release(list);
+      UINT r[16];
+      memset(r, 0xEE, sizeof r);
+      CHECK(buffer_download(c, results, 0, r, 64));
+      printf("tiled loads: mapped %x %u %x %u %x %u %u %u; unmapped %x %u %x %u %x %u %u %u\n", r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[12], r[13], r[14],
+             r[15]);
+      /* (the typed buffer's value is not looked at: Microsoft's compiler gives that ld_uav_typed_s the view's swizzle .wxxx - the value read is the texel's w, the 1 an R32_UINT
+       * element lacks -, where the plain ld_uav_typed of the same Load has its x) */
+      const UINT want[16] = {0x1234, 1, 0x1234, 1, 1, 1, 77, 1, 0, 0, 0, 0, 1, 0, 0, 0};
+      CHECK(memcmp(r, want, sizeof want) == 0);
+    }
+  }
+  if (cpu) ID3D12DescriptorHeap_Release(cpu);
+  if (views) ID3D12DescriptorHeap_Release(views);
+  if (heap) ID3D12Heap_Release(heap);
+  if (results) ID3D12Resource_Release(results);
+  if (image) ID3D12Resource_Release(image);
+  if (buffer) ID3D12Resource_Release(buffer);
+  if (pso) ID3D12PipelineState_Release(pso);
+  if (rs) ID3D12RootSignature_Release(rs);
+}
+
 /* The tier per device (4 on the CPU renderer: residency feedback, volumes, arrays with packed levels; 1 on virgl, whose TGSI shaders have no residency feedback) and what each
  * allows: 2D textures with tiles mapped and not (an unmapped tile reads as zero: through copies and through shaders, whose residency feedback says so), a render target whose
  * unmapped tiles drop what is drawn, volumes, arrays whose slices each have packed levels, block-compressed tiles, the lookups' own clamp; the exact tilings of each. */
@@ -7758,7 +8159,7 @@ static void test_tiled_tiers(Scene *c) {
   /* (tiled formats: block-compressed ones too, not depth; no multisampled reserved textures) */
   CHECK(format_support2(dev, DXGI_FORMAT_BC1_UNORM) & D3D12_FORMAT_SUPPORT2_TILED);
   CHECK(format_support2(dev, DXGI_FORMAT_BC7_UNORM) & D3D12_FORMAT_SUPPORT2_TILED);
-  CHECK(!(format_support2(dev, DXGI_FORMAT_D32_FLOAT) & D3D12_FORMAT_SUPPORT2_TILED) && !(format_support2(dev, DXGI_FORMAT_R32G32B32_FLOAT) & D3D12_FORMAT_SUPPORT2_TILED));
+  CHECK(!(format_support2(dev, DXGI_FORMAT_R32G32B32_FLOAT) & D3D12_FORMAT_SUPPORT2_TILED));      /* (the depth formats: below) */
   D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS ms = {DXGI_FORMAT_R8G8B8A8_UNORM, 4, D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE, 7};
   CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &ms, sizeof ms));
   CHECK(ms.NumQualityLevels == 0);
@@ -8015,6 +8416,62 @@ static void test_tiled_tiers(Scene *c) {
       CHECK(same);
       ID3D12Resource_Release(sw);
     }
+  }
+  {
+    /* --- reserved depth buffers: D32_FLOAT and D16_UNORM of 256 x 128 (two tiles of 128 x 128 floats, one of 256 x 128 codes - 256 x 256 is two), tile 0 mapped: a clear reaches
+     * tile 0 of the heap as floats / 16-bit codes, tile 1's are dropped (CopyTiles out: zeros); D24S8 has no tiles (two planes) */
+    CHECK((format_support2(dev, DXGI_FORMAT_D32_FLOAT) & D3D12_FORMAT_SUPPORT2_TILED) && (format_support2(dev, DXGI_FORMAT_D16_UNORM) & D3D12_FORMAT_SUPPORT2_TILED));
+    CHECK(!(format_support2(dev, DXGI_FORMAT_D24_UNORM_S8_UINT) & D3D12_FORMAT_SUPPORT2_TILED));
+    HRESULT dhr = S_OK;
+    ID3D12Resource *stencil = tt_reserved(dev, D3D12_RESOURCE_DIMENSION_TEXTURE2D, 256, 128, 1, 1, DXGI_FORMAT_D24_UNORM_S8_UINT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, &dhr);
+    CHECK(!stencil && dhr == E_INVALIDARG);
+    if (stencil) ID3D12Resource_Release(stencil);
+    ID3D12DescriptorHeap *dsvs = NULL;
+    D3D12_DESCRIPTOR_HEAP_DESC dh = {D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    CHECK_HR(ID3D12Device_CreateDescriptorHeap(dev, &dh, &IID_ID3D12DescriptorHeap, (void **)&dsvs));
+    for (int sixteen = 0; sixteen < 2 && dsvs; ++sixteen) {
+      const UINT h = sixteen ? 256 : 128;
+      ID3D12Resource *t = tt_reserved(dev, D3D12_RESOURCE_DIMENSION_TEXTURE2D, 256, h, 1, 1, sixteen ? DXGI_FORMAT_D16_UNORM : DXGI_FORMAT_D32_FLOAT,
+                                      D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, NULL);
+      CHECK(t != NULL);
+      if (!t) continue;
+      UINT total = 0, n = 1;
+      D3D12_PACKED_MIP_INFO packed;
+      D3D12_TILE_SHAPE shape;
+      D3D12_SUBRESOURCE_TILING st;
+      ID3D12Device_GetResourceTiling(dev, t, &total, &packed, &shape, &n, 0, &st);
+      CHECK(total == 2 && shape.WidthInTexels == (sixteen ? 256u : 128u) && shape.HeightInTexels == 128 && st.WidthInTiles == (sixteen ? 1u : 2u));
+      tt_map(c, t, (D3D12_TILED_RESOURCE_COORDINATE){0, 0, 0, 0}, 1, heap, 6);
+      const D3D12_CPU_DESCRIPTOR_HANDLE dsv = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(dsvs);
+      ID3D12Device_CreateDepthStencilView(dev, t, NULL, dsv);
+      ID3D12GraphicsCommandList *list = NULL;
+      CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+      CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+      if (!list) { ID3D12Resource_Release(t); continue; }
+      ID3D12GraphicsCommandList_ClearDepthStencilView(list, dsv, D3D12_CLEAR_FLAG_DEPTH, 0.25f, 0, 0, NULL);
+      D3D12_TILED_RESOURCE_COORDINATE at = {0, 0, 0, 0};
+      D3D12_TILE_REGION_SIZE two = {2, FALSE, 0, 0, 0};
+      ID3D12GraphicsCommandList_CopyTiles(list, t, &at, &two, down, 0, D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
+      scene_run(c, list);
+      ID3D12GraphicsCommandList_Release(list);
+      const BYTE *q = NULL;
+      CHECK_HR(ID3D12Resource_Map(down, 0, NULL, (void **)&q));
+      int cleared = q != NULL, empty = q != NULL;
+      for (UINT i = 0; q && i < 65536; i += sixteen ? 2 : 4) {
+        UINT32 v = 0, w = 0;
+        memcpy(&v, q + i, sixteen ? 2 : 4);
+        memcpy(&w, q + 65536 + i, sixteen ? 2 : 4);
+        float f = 0;
+        memcpy(&f, &v, 4);
+        cleared &= sixteen ? v == 16384u : f == 0.25f;      /* (0.25 as a 16-bit code: 0.25 * 65535, rounded) */
+        empty &= w == 0;
+      }
+      if (q) ID3D12Resource_Unmap(down, 0, NULL);
+      printf("tiled depth buffer %s: the mapped tile %s, the unmapped one %s\n", sixteen ? "D16" : "D32", cleared ? "cleared" : "wrong", empty ? "empty" : "written");
+      CHECK(cleared && empty);
+      ID3D12Resource_Release(t);
+    }
+    if (dsvs) ID3D12DescriptorHeap_Release(dsvs);
   }
   {
     /* --- a lookup's own clamp (Sample with a clamp: sample_cl_s): four levels of 8 x 8, the clamp of 2 gives level 2 */
@@ -9185,12 +9642,14 @@ static void test_extras(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fenc
   test_copy_queue_timestamps(&c);
   test_indirect(&c);
   test_bundle(&c);
+  test_bundle_root_arguments(&c);
   test_tiled(&c);
   test_predication(&c);
   test_stream_output(&c);
   test_mip_tails(&c);
   test_vertex_formats(&c);
   test_all_vertex_formats(&c);
+  test_unbound_vertex_buffers(&c);
   test_depth_only(&c);
   test_multisample(&c);
   test_limits(&c);
@@ -9203,8 +9662,10 @@ static void test_extras(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fenc
   test_packed_yuv(&c);
   test_texture_uavs(&c);
   test_narrow_volume_uavs(&c);
+  test_typeless_volume_views(&c);
   test_typed_buffers(&c);
   test_dxil_resources(&c);
+  test_bit_operations(&c);
   test_counters(&c);
   test_uav_only_draws(&c);
   test_feature_levels(&c);
@@ -9218,6 +9679,7 @@ static void test_extras(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fenc
   test_mip_layers(&c);
   test_formats(&c);
   test_tiled_tiers(&c);
+  test_tiled_loads(&c);
   test_fixed_state_gaps(&c);
   test_shader_query_gaps(&c);
   test_msaa_shaders(&c);

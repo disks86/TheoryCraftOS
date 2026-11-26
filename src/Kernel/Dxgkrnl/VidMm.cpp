@@ -316,8 +316,21 @@ void for_tile_runs(const Allocation& a, const ReservedLayout& l, uint64_t tile, 
 }
 // A run of `texels` of a reserved texture between its image's pixels and the heap's texels: the same bytes, or - a narrow layout - the first channels of each pixel, widened back
 // to (r, g or 0, 0, the maximum; 1 for an integer image) as CopyBufferImage widens. An empty `heap` (a tile mapped nowhere) gives zero texels.
+// (a reserved depth buffer's heap texels: floats as the backing has them - DepthFloat32 or no layout -, or 16-bit normalised codes, DepthUnorm16, Direct3D's D16)
+bool depth16_tiles(const AllocationDesc& d) { return (d.flags & kAllocDepthStencil) && (d.tile_narrow & 0xFFu) == static_cast<uint32_t>(NarrowLayout::DepthUnorm16); }
+uint16_t depth16_code(float v) { return static_cast<uint16_t>(!(v > 0.0f) ? 0u : v >= 1.0f ? 65535u : static_cast<uint32_t>(v * 65535.0f + 0.5f)); }
 void image_from_heap(const AllocationDesc& d, ByteView image, ConstByteView heap, uint32_t texels) {
-  if (!(d.tile_narrow & 0xFFu)) {
+  if (depth16_tiles(d)) {
+    for (uint32_t i = 0; i < texels; ++i) {
+      ByteView to;
+      if (!image.try_subview(uint64_t{i} * 4, 4, &to)) return;
+      ConstByteView from;
+      const uint32_t code = !heap.empty() && heap.try_subview(uint64_t{i} * 2, 2, &from) ? ByteReader(from).le16() : 0u;
+      ByteWriter(to).le32(__builtin_bit_cast(uint32_t, static_cast<float>(code) / 65535.0f));
+    }
+    return;
+  }
+  if (!(d.tile_narrow & 0xFFu) || (d.flags & kAllocDepthStencil)) {
     if (heap.empty()) image.fill(0);
     else image.copy_from(heap);
     return;
@@ -337,7 +350,15 @@ void image_from_heap(const AllocationDesc& d, ByteView image, ConstByteView heap
 }
 // Whether a run of a reserved texture's pixels differs from the texels the heap holds for it (what heap_from_image would write).
 bool image_differs_from_heap(const AllocationDesc& d, ConstByteView image, ConstByteView heap, uint32_t texels) {
-  if (!(d.tile_narrow & 0xFFu)) return !image.equals(heap);
+  if (depth16_tiles(d)) {
+    for (uint32_t i = 0; i < texels; ++i) {
+      ConstByteView from, to;
+      if (!image.try_subview(uint64_t{i} * 4, 4, &from) || !heap.try_subview(uint64_t{i} * 2, 2, &to)) return true;
+      if (depth16_code(__builtin_bit_cast(float, ByteReader(from).le32())) != ByteReader(to).le16()) return true;
+    }
+    return false;
+  }
+  if (!(d.tile_narrow & 0xFFu) || (d.flags & kAllocDepthStencil)) return !image.equals(heap);
   const NarrowLayout narrow = static_cast<NarrowLayout>(d.tile_narrow & 0xFFu);
   const uint32_t sample = narrow == NarrowLayout::R16 || narrow == NarrowLayout::R16G16 ? 2 : 1, pixel = 4 * sample, texel = narrow_pixel_bytes(narrow);
   for (uint32_t i = 0; i < texels; ++i) {
@@ -348,7 +369,16 @@ bool image_differs_from_heap(const AllocationDesc& d, ConstByteView image, Const
   return false;
 }
 void heap_from_image(const AllocationDesc& d, ByteView heap, ConstByteView image, uint32_t texels) {
-  if (!(d.tile_narrow & 0xFFu)) {
+  if (depth16_tiles(d)) {
+    for (uint32_t i = 0; i < texels; ++i) {
+      ConstByteView from;
+      ByteView to;
+      if (!image.try_subview(uint64_t{i} * 4, 4, &from) || !heap.try_subview(uint64_t{i} * 2, 2, &to)) return;
+      ByteWriter(to).le16(depth16_code(__builtin_bit_cast(float, ByteReader(from).le32())));
+    }
+    return;
+  }
+  if (!(d.tile_narrow & 0xFFu) || (d.flags & kAllocDepthStencil)) {
     heap.copy_from(image);
     return;
   }
@@ -372,12 +402,21 @@ NtStatus VidMm::create(const AllocationDesc& requested, SharedPointer<Allocation
   // A reserved resource is a buffer of whole tiles, or a sampled texture of colour pixels or blocks of one sample - of any kind and levels, also drawn into or a storage image -
   // (its tiles of tile_shape(), numbered as ReservedLayout says), whose texels in the heaps may be narrower than its pixels (tile_narrow). The rest of its description is checked as
   // any texture's below.
-  const bool reserved_texture = reserved && (desc.flags & kAllocTexture) && !(desc.flags & ~(kAllocTexture | kAllocRenderTarget | kAllocStorageImage));
+  // A reserved depth buffer (also read by shaders): D32Float without a stencil plane, of one sample, on a device that moves depth planes to and from memory
+  // (kFeature2DepthCopies: what gathers its tiles into the device's image and back); its texels in the heaps floats, or 16-bit codes (tile_narrow DepthUnorm16: Direct3D's D16).
+  const bool reserved_depth_buffer = reserved && (desc.flags & kAllocDepthStencil) && !(desc.flags & ~(kAllocDepthStencil | kAllocTexture));
+  const bool reserved_texture = reserved && (((desc.flags & kAllocTexture) && !(desc.flags & ~(kAllocTexture | kAllocRenderTarget | kAllocStorageImage))) || reserved_depth_buffer);
   if (reserved && (heap || requested.heap || (desc.flags & (kAllocQueryResult | kAllocConstantBuffer | kAllocHeap | kAllocShared))) ) return status::kInvalidParameter;
   if (reserved && !reserved_texture && (!(desc.flags & (kAllocVertexBuffer | kAllocIndexBuffer | kAllocUnorderedAccess | kAllocStreamOutput)) || desc.size == 0 || desc.size % kTileBytes)) return status::kInvalidParameter;
   if (desc.tile_narrow & ~(0xFFu | kTileStandardSwizzle)) return status::kInvalidParameter;
   if ((desc.tile_narrow & kTileStandardSwizzle) && !reserved_texture) return status::kInvalidParameter;
-  if (desc.tile_narrow & 0xFFu) {
+  if (reserved_depth_buffer) {
+    const uint32_t n = desc.tile_narrow & 0xFFu;
+    if (desc.format != Format::D32Float || desc.samples != 1 || desc.kind == graphics::TextureKind::Texture3D || desc.kind == graphics::TextureKind::Texture2DMS ||
+        (desc.tile_narrow & kTileStandardSwizzle) || (n != 0 && n != static_cast<uint32_t>(NarrowLayout::DepthFloat32) && n != static_cast<uint32_t>(NarrowLayout::DepthUnorm16)))
+      return status::kInvalidParameter;
+    if (!(device_.info().features2 & graphics::kFeature2DepthCopies)) return status::kNotSupported;
+  } else if (desc.tile_narrow & 0xFFu) {
     // (a narrow layout: of an 8-bit four-channel image for R8 / R8G8, of a 16-bit one for R16 / R16G16 - what CopyBufferImage widens into)
     const uint32_t n = desc.tile_narrow & 0xFFu;
     const bool eight = n == static_cast<uint32_t>(NarrowLayout::R8) || n == static_cast<uint32_t>(NarrowLayout::R8G8);
@@ -387,7 +426,7 @@ NtStatus VidMm::create(const AllocationDesc& requested, SharedPointer<Allocation
       return status::kInvalidParameter;
   }
   ReservedLayout tiles;
-  if (reserved_texture && ((!dxgk::is_color(desc.format) && !dxgk::is_compressed(desc.format)) || desc.samples != 1 || desc.kind == graphics::TextureKind::Texture2DMS ||
+  if (reserved_texture && ((!dxgk::is_color(desc.format) && !dxgk::is_compressed(desc.format) && !reserved_depth_buffer) || desc.samples != 1 || desc.kind == graphics::TextureKind::Texture2DMS ||
                            !reserved_layout(desc, &tiles) || tiles.total > 0xFFFFFFFFull))
     return status::kInvalidParameter;
   if (track_state && (requested.initial_state & ~kStateMask)) return status::kInvalidParameter;
@@ -508,10 +547,11 @@ NtStatus VidMm::create(const AllocationDesc& requested, SharedPointer<Allocation
     }
     const uint64_t total = image_bytes(desc);
     if (depth_flag) {
-      // (no backing: the device keeps it, every level and layer)
+      // (no backing: the device keeps it, every level and layer - but a reserved one's, the floats its tiles are gathered into and scattered from)
       AllocationDesc pixels = desc;
       pixels.format = Format::A8R8G8B8;
       device_bytes = image_bytes(pixels) / 4 * (desc.format == Format::D24S8 ? 5 : 4);
+      if (reserved) cpu_bytes = image_bytes(pixels);
     } else {
       cpu_bytes = total;
       device_bytes = desc.flags & kAllocStaging ? 0 : total;
@@ -666,6 +706,21 @@ void VidMm::heap_changed(Allocation& heap, const Allocation* except) {
   }
 }
 
+// A reserved depth buffer's backing (a float a texel, subresource_range's layout) into its device image (`to_device`), or the image's depth planes into it (kFeature2DepthCopies).
+bool VidMm::move_depth_planes(Allocation& a, bool to_device) {
+  for (uint32_t level = 0; level < a.desc_.mip_levels; ++level)
+    for (uint32_t layer = 0; layer < a.level_layers(level); ++layer) {
+      uint64_t offset = 0, bytes = 0;
+      ByteView range;
+      ArrayView<float> depth;
+      if (!a.subresource_range(level, layer, &offset, &bytes) || !a.cpu_.try_subview(offset, bytes, &range) || !range.try_cast<float>(&depth)) return false;
+      const bool ok = to_device ? a.image_->write_depth_subresource(level, layer, ArrayView<const float>(depth.data(), depth.size()), ArrayView<const uint8_t>())
+                                : a.image_->read_depth_subresource(level, layer, depth, ArrayView<uint8_t>());
+      if (!ok) return false;
+    }
+  return true;
+}
+
 void VidMm::gather_tiles(Allocation& a) {
   const Allocation* last = nullptr;
   for (const Allocation::TileBinding& b : a.tiles_)
@@ -743,6 +798,15 @@ void VidMm::settle_tiles(Allocation& a) {
 // A reserved texture's device image learns which of its tiles are mapped (graphics::ImageResidency): one byte per tile of each slice's standard levels, then one for the slice's
 // packed levels - mapped when all their tiles are (Direct3D leaves a partly mapped tail undefined).
 void VidMm::push_residency(Allocation& a) {
+  if (a.buffer_ && a.reserved_) {
+    // (a reserved buffer: a byte per tile, graphics::IBuffer::set_residency - what its loads with a status report)
+    scratch_.clear();
+    if (!scratch_.put_zeros(a.tiles_.count())) return;
+    ByteView bytes = scratch_.writable_view();
+    for (uint64_t t = 0; t < a.tiles_.count(); ++t) bytes[t] = a.tiles_[t].heap ? 1 : 0;
+    (void)a.buffer_->set_residency(ConstByteView(bytes));   // (a device without kFeature2TileResidency keeps none)
+    return;
+  }
   if (!a.image_ || !a.reserved_) return;
   ReservedLayout layout;
   if (!reserved_layout(a.desc_, &layout)) return;
@@ -853,7 +917,9 @@ bool VidMm::upload_contents(Allocation& a) {
     return true;
   }
   if (a.is_depth()) {
-    a.device_stale_ = false;   // (nothing to upload: the contents of a depth buffer start undefined)
+    // (nothing to upload: the contents of a depth buffer start undefined - but a reserved one's, its tiles gathered: every subresource's depth plane, IImage::write_depth_subresource)
+    if (a.reserved_ && !move_depth_planes(a, true)) return false;
+    a.device_stale_ = false;
     return true;
   }
   // (every layer of every level, a 2D image of its own: IImage::write_subresource, or the _float form for the wide formats)
@@ -1020,6 +1086,13 @@ bool VidMm::read_back(Allocation& a) {
     a.gpu_newer_ = false;
     return true;
   }
+  if (a.image_ && a.is_depth() && a.reserved_) {
+    // (a reserved depth buffer the GPU drew into: its depth planes into the backing, then to the mapped tiles)
+    if (!move_depth_planes(a, false)) return false;
+    a.gpu_newer_ = false;
+    settle_tiles(a);
+    return true;
+  }
   if (!a.image_ || a.is_depth() || a.desc_.samples != 1) {   // (a multisampled image comes back as the resolved one)
     a.gpu_newer_ = false;
     return true;
@@ -1125,6 +1198,36 @@ void set_integer_alpha(ByteView pixel, uint32_t channel) {
 }
 }  // namespace
 
+namespace {
+// Where source `i` of a mirror goes: its levels first, each with its layers - an array's layer count at every level, a volume's slices at that level (they halve) - and how many
+// subresources the mirror has in all.
+bool mirror_place(const Allocation& mirror, uint64_t i, uint32_t* level, uint32_t* layer) {
+  const AllocationDesc& m = mirror.desc();
+  if (m.kind == graphics::TextureKind::Texture3D) {
+    for (uint32_t l = 0; l < m.mip_levels; ++l) {
+      const uint32_t n = mirror.level_layers(l);
+      if (i < n) {
+        *level = l, *layer = static_cast<uint32_t>(i);
+        return true;
+      }
+      i -= n;
+    }
+    return false;
+  }
+  const uint64_t layers = m.kind == graphics::TextureKind::Texture2DArray ? m.layers : 1u;
+  if (layers == 0 || i / layers >= m.mip_levels) return false;
+  *level = static_cast<uint32_t>(i / layers), *layer = static_cast<uint32_t>(i % layers);
+  return true;
+}
+uint64_t mirror_subresource_count(const Allocation& mirror) {
+  const AllocationDesc& m = mirror.desc();
+  if (m.kind != graphics::TextureKind::Texture3D) return uint64_t{m.kind == graphics::TextureKind::Texture2DArray ? m.layers : 1u} * m.mip_levels;
+  uint64_t n = 0;
+  for (uint32_t l = 0; l < m.mip_levels; ++l) n += mirror.level_layers(l);
+  return n;
+}
+}  // namespace
+
 NtStatus VidMm::set_mirror(Allocation& mirror, ArrayView<const SharedPointer<Allocation>> sources, uint32_t mode, uint32_t channels, ArrayView<const uint32_t> subresources) {
   if (mode & ~(kMirrorInteger | kMirrorWriteBack) || channels > 0xF) return status::kInvalidParameter;
   if (sources.empty()) {
@@ -1134,15 +1237,13 @@ NtStatus VidMm::set_mirror(Allocation& mirror, ArrayView<const SharedPointer<All
   }
   const AllocationDesc& m = mirror.desc_;
   const MirrorLayout layout = mirror_layout(m.format);
-  // (a mirror of several sources is an array, each layer a source, or a volume of one level, each slice a source - a subresource of one: a volume's slices at a level, which an
-  // unordered access view of a narrow volume writes; its slices are one after the other as an array's layers are)
+  // (a mirror of several sources is an array, each layer a source, or a volume, each slice of each level a source - a subresource of one: a volume's slices, which an unordered
+  // access view of a narrow volume writes and a typed view of a typeless one reads; its slices are one after the other as an array's layers are)
   const bool volume = m.kind == graphics::TextureKind::Texture3D;
   const bool array = m.kind == graphics::TextureKind::Texture2DArray || volume;
-  // (the mirror's subresources in order, levels first: source i is layer i % layers of level i / layers; a mirror of several levels needs subresources of its sources)
-  const uint64_t layers = array ? m.layers : 1u;
-  if (!mirror.is_image() || mirror.is_mirror() || mirror.placed() || mirror.reserved_ || !(m.flags & kAllocTexture) || m.mip_levels < 1 || (volume && m.mip_levels != 1) ||
-      m.samples != 1 || layout.family == 0 || (!array && m.kind != graphics::TextureKind::Texture2D) || sources.size() != layers * m.mip_levels ||
-      ((m.mip_levels > 1 || volume) && subresources.empty()))
+  // (the mirror's subresources in order, levels first (mirror_place); a mirror of several levels needs subresources of its sources)
+  if (!mirror.is_image() || mirror.is_mirror() || mirror.placed() || mirror.reserved_ || !(m.flags & kAllocTexture) || m.mip_levels < 1 || m.samples != 1 || layout.family == 0 ||
+      (!array && m.kind != graphics::TextureKind::Texture2D) || sources.size() != mirror_subresource_count(mirror) || ((m.mip_levels > 1 || volume) && subresources.empty()))
     return status::kInvalidParameter;
   // (a mirror that writes back is a render target or a storage image - an array of them gives each layer to its source; one channel at least goes back)
   if ((mode & kMirrorWriteBack) && (!(m.flags & (kAllocRenderTarget | kAllocStorageImage)) || channels == 0)) return status::kInvalidParameter;
@@ -1153,7 +1254,8 @@ NtStatus VidMm::set_mirror(Allocation& mirror, ArrayView<const SharedPointer<All
     if (!source || &source->manager() != this || source.get() == &mirror || !source->is_image() || source->is_mirror()) return status::kInvalidParameter;
     const AllocationDesc& d = source->desc_;
     const uint32_t level = subresources.empty() ? 0 : subresources[i] & 0xFFFF, layer = subresources.empty() ? 0 : subresources[i] >> 16;
-    const uint32_t mirror_level = static_cast<uint32_t>(i / layers);
+    uint32_t mirror_level = 0, mirror_layer = 0;
+    if (!mirror_place(mirror, i, &mirror_level, &mirror_layer)) return status::kInvalidParameter;
     if (subresources.empty() ? (d.kind != graphics::TextureKind::Texture2D || d.mip_levels != 1) : (level >= d.mip_levels || layer >= source->level_layers(level))) return status::kInvalidParameter;
     if (d.samples != 1 || graphics::mip_extent(d.width, level) != graphics::mip_extent(m.width, mirror_level) || graphics::mip_extent(d.height, level) != graphics::mip_extent(m.height, mirror_level) ||
         mirror_layout(d.format).family != layout.family)
@@ -1185,9 +1287,8 @@ bool VidMm::mirror_needs_read_back(const Allocation& mirror) const {
 
 // The mirror's subresource that source `i` shows (its levels first, each with its layers): where it is in the mirror's memory.
 static bool mirror_subresource(const Allocation& mirror, uint64_t i, uint64_t* offset, uint64_t* bytes) {
-  const graphics::TextureKind kind = mirror.desc().kind;   // (a volume mirror is of one level: its slices as an array's layers)
-  const uint64_t layers = kind == graphics::TextureKind::Texture2DArray || kind == graphics::TextureKind::Texture3D ? mirror.desc().layers : 1u;
-  return mirror.subresource_range(static_cast<uint32_t>(i / layers), static_cast<uint32_t>(i % layers), offset, bytes);
+  uint32_t level = 0, layer = 0;
+  return mirror_place(mirror, i, &level, &layer) && mirror.subresource_range(level, layer, offset, bytes);
 }
 
 bool VidMm::refresh_mirror(Allocation& mirror, bool may_read_back, bool* stale) {

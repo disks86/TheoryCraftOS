@@ -406,14 +406,22 @@ static UINT narrow_mirror(Resource *r, UINT level, UINT first, UINT count, int a
 
 /* A mirror in kernel format `kformat` of levels level .. level + levels - 1 and layers first .. first + count - 1 of a typeless narrow texture the kernel keeps as its own narrow
  * image (format_native_narrow: R8, R8G8, R16, R16G16 TYPELESS): what a view of another kind is (R8_UINT, R16_FLOAT ...: the same bytes; the kernel's SetMirror of that family).
- * A 2D image or a 2D array (`array`) - the kernel's images can be shown as cubes from an array of six -, not of a volume's slices. A mirror of the one level of a 2D texture of one
- * level is made on any device; the others need the device's levels of every image (DEV_FEATURE2_MIPMAPPED_LAYERS: each subresource of the mirror names the one of the texture it
- * shows). Made the first time, then the same one; 0 when the kernel cannot make it. */
-#define TYPED_MIRROR_MAX 256
+ * A 2D image, a 2D array (`array`) - the kernel's images can be shown as cubes from an array of six - or a volume: of a volume, `first` and `count` are slices of `level` (a view of
+ * several levels is of all the slices of each: the mirror is a volume of those levels). A mirror of the one level of a 2D texture of one level is made on any device; the others
+ * need the device's levels of every image (DEV_FEATURE2_MIPMAPPED_LAYERS: each subresource of the mirror names the one of the texture it shows). At most TYPED_MIRROR_MAX
+ * subresources (the kernel's: 256 layers at each of 16 levels). Made the first time, then the same one; 0 when the kernel cannot make it. */
+#define TYPED_MIRROR_MAX 4096
 static UINT typed_mirror(Resource *r, UINT kformat, UINT level, UINT levels, UINT first, UINT count, int array, UINT mode, UINT channels) {
-  if (r->planes || !r->fmt || r->kind == 1 || !kformat || levels == 0 || level >= r->mips || levels > r->mips - level || count == 0 || first >= r->layers || count > r->layers - first ||
-      (!array && count != 1) || (UINT64)levels * count > TYPED_MIRROR_MAX)
+  const int volume = r->kind == 1;
+  const UINT layers = volume ? (level < r->mips ? mip_extent(r->layers, level) : 0) : r->layers;      /* (a volume's slices at the level) */
+  if (r->planes || !r->fmt || !kformat || levels == 0 || level >= r->mips || levels > r->mips - level || count == 0 || first >= layers || count > layers - first ||
+      (!array && !volume && count != 1) || (volume && levels > 1 && (first != 0 || count != layers)))
     return 0;
+  if (volume) array = 0;
+  /* (the subresources: a volume's slices at each of its levels, an array's layers at each) */
+  UINT64 n = 0;
+  for (UINT l = 0; l < levels; ++l) n += volume && levels > 1 ? mip_extent(r->layers, level + l) : count;
+  if (n > TYPED_MIRROR_MAX) return 0;
   const int whole = r->kind == 0 && r->mips == 1 && !array;      /* (the texture's one image: no subresources named) */
   if (!whole && !(r->d.dev->caps.features2 & DEV_FEATURE2_MIPMAPPED_LAYERS)) return 0;
   EnterCriticalSection(&g_lock);
@@ -437,21 +445,22 @@ static UINT typed_mirror(Resource *r, UINT kformat, UINT level, UINT levels, UIN
     md.width = mip_extent((UINT)r->desc.Width, level), md.height = mip_extent(r->desc.Height, level);
     md.mips = levels;
     md.samples = 1;
-    md.kind = array ? 2 : 0;
-    md.layers = array ? count : 1;
+    md.kind = volume ? 1 : array ? 2 : 0;
+    md.layers = volume || array ? count : 1;
     if (KMT_OK(kmt_create_allocation(r->d.dev->kdev, &md, &alloc, NULL, NULL))) {
-      const UINT n = levels * count;
       UINT w = 0;
       request[w++] = ESC_SET_MIRROR;
       request[w++] = alloc;
       request[w++] = mode & (MIRROR_INTEGER | MIRROR_WRITE_BACK);
       request[w++] = channels;
-      request[w++] = n;
-      for (UINT i = 0; i < n; ++i) request[w++] = r->alloc;
-      /* (the subresource each of the mirror's shows, its levels first: the texture's level in the low half, its layer in the high one) */
+      request[w++] = (UINT)n;
+      for (UINT i = 0; i < (UINT)n; ++i) request[w++] = r->alloc;
+      /* (the subresource each of the mirror's shows, its levels first: the texture's level in the low half, its layer - a volume's slice - in the high one) */
       if (!whole)
-        for (UINT l = 0; l < levels; ++l)
-          for (UINT k = 0; k < count; ++k) request[w++] = (level + l) | (first + k) << 16;
+        for (UINT l = 0; l < levels; ++l) {
+          const UINT at_level = volume && levels > 1 ? mip_extent(r->layers, level + l) : count;
+          for (UINT k = 0; k < at_level; ++k) request[w++] = (level + l) | (first + k) << 16;
+        }
       if (KMT_OK(dev_escape(r->d.dev, request, w, NULL, 0))) {
         const Mirror m = {alloc, 0, first, count, (UINT)array, mode, channels, level, kformat, levels};
         r->mirrors[r->mirror_count++] = m;
@@ -881,8 +890,9 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
        * packed levels - each slice its own - from tier 4; at tiers 2 and 3 all its levels must be at least a tile, at tier 1 whole tiles (D3D12_TILED_RESOURCES_TIER)) */
       const D3D12_TILED_RESOURCES_TIER tier = dev_tiled_tier(dev);
       const int standard_swizzle = desc->Layout == D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE;
-      if (!format_tiled(fi) || r->planes || (desc->Layout != D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE && !standard_swizzle) || desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D || want_depth ||
-          (r->kind == 1 && tier < D3D12_TILED_RESOURCES_TIER_3)) { hr = E_INVALIDARG; goto fail; }
+      /* (a depth buffer: D32_FLOAT or D16_UNORM - format_tiled_depth -, in the undefined swizzle, whose tiles the kernel keeps as floats or 16-bit codes) */
+      if (!(want_depth ? format_tiled_depth(dev, fi) && !standard_swizzle : format_tiled(fi)) || r->planes || (desc->Layout != D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE && !standard_swizzle) ||
+          desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D || (r->kind == 1 && tier < D3D12_TILED_RESOURCES_TIER_3)) { hr = E_INVALIDARG; goto fail; }
       if (uav && fi->narrow) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }      /* (see above: no mirror of a reserved image) */
       if (r->mips > 1 && !device_format_levels(dev, fi->kernel)) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
       D3D12_RESOURCE_DESC whole = *desc;
@@ -894,10 +904,10 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
       if (tl.slices > 1 && tier == D3D12_TILED_RESOURCES_TIER_1)
         for (UINT l = 0; l < tl.mips; ++l)
           if (mip_extent((UINT)desc->Width, l) % tl.tile_w || mip_extent(desc->Height, l) % tl.tile_h) { hr = E_INVALIDARG; goto fail; }
-      ad.flags = KA_TEXTURE | KA_RESERVED | (target ? KA_RENDER_TARGET : 0) | (uav ? KA_STORAGE_IMAGE : 0);
+      ad.flags = want_depth ? (ad.flags & (KA_DEPTH | KA_TEXTURE)) | KA_RESERVED : KA_TEXTURE | KA_RESERVED | (target ? KA_RENDER_TARGET : 0) | (uav ? KA_STORAGE_IMAGE : 0);
       /* (NARROW_* is the kernel's NarrowLayout; 64KB_STANDARD_SWIZZLE: the elements of a standard level's tile are in Direct3D's standard swizzle - kTileStandardSwizzle -,
-       * so CopyTiles moves them so; the packed levels' layout is the driver's either way) */
-      ad.tile_narrow = fi->narrow | (standard_swizzle ? KTILE_STANDARD_SWIZZLE : 0u);
+       * so CopyTiles moves them so; the packed levels' layout is the driver's either way. A D16 depth buffer's tiles: 16-bit codes, DEPTH_LAYOUT_UNORM16) */
+      ad.tile_narrow = want_depth ? (fi->dxgi == DXGI_FORMAT_D16_UNORM ? DEPTH_LAYOUT_UNORM16 : 0u) : fi->narrow | (standard_swizzle ? KTILE_STANDARD_SWIZZLE : 0u);
       r->reserved = 1;
     }
     ad.format = fi->kernel;

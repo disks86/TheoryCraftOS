@@ -115,6 +115,7 @@ enum DxOp : uint32_t {
   kFMax = 35, kFMin = 36, kIMax = 37, kIMin = 38, kUMax = 39, kUMin = 40, kIMul = 41, kUMul = 42, kFMad = 46, kIMad = 48, kUMad = 49, kDot2 = 54, kDot3 = 55, kDot4 = 56, kCreateHandle = 57,
   kCBufferLoadLegacy = 59, kCalculateLod = 81, kSample = 60, kSampleBias = 61, kSampleLevel = 62, kSampleGrad = 63, kSampleCmp = 64, kSampleCmpLevelZero = 65, kTextureGather = 73, kTextureGatherCmp = 74, kTextureLoad = 66, kBufferLoad = 68, kBufferStore = 69, kAtomicBinOp = 78, kBarrier = 80, kDiscard = 82,
   kCheckAccessFullyMapped = 71,
+  kBfrev = 30, kCountbits = 31, kFirstbitLo = 32, kFirstbitHi = 33, kFirstbitSHi = 34, kIbfe = 51, kUbfe = 52, kBfi = 53,
   kDerivCoarseX = 83, kDerivCoarseY = 84, kDerivFineX = 85, kDerivFineY = 86, kFma = 47, kMakeDouble = 101, kSplitDouble = 102, kThreadId = 93, kGroupId = 94, kThreadIdInGroup = 95, kFlattenedThreadIdInGroup = 96,
   kAttributeAtVertex = 137, kViewId = 138, kIsHelperLane = 221, kLegacyF32ToF16 = 130, kLegacyF16ToF32 = 131, kRawBufferLoad = 139, kRawBufferStore = 140,
   kTextureStore = 67, kBufferUpdateCounter = 70, kGetDimensions = 72, kAtomicCompareExchange = 79,
@@ -314,6 +315,7 @@ class Translator {
   bool unary(const Instruction& ins, uint32_t dxbc_opcode, uint32_t source_arg, uint32_t modifier = 0, bool saturate = false);
   bool binary(const Instruction& ins, uint32_t dxbc_opcode, uint32_t first_arg);
   bool ternary(const Instruction& ins, uint32_t dxbc_opcode, uint32_t first_arg);
+  bool bits(const Instruction& ins, uint32_t dxbc_opcode, uint32_t operands);
   bool sincos(const Instruction& ins, bool cosine);
   bool texture_gather(const Instruction& ins, bool compare);
   // A lookup whose texture (args[1]) is an element of an array chosen by a variable: the lookup is made once for each element, behind a test of the index, into one result register.
@@ -2144,6 +2146,23 @@ bool Translator::binary(const Instruction& ins, uint32_t dxbc_opcode, uint32_t f
   return define(ins.result, r);
 }
 
+// The bit operations (Bfrev .. FirstbitSHi of one operand, Ibfe / Ubfe of three, Bfi of four): DXBC's of the same operands in the same order, on 32-bit integers.
+bool Translator::bits(const Instruction& ins, uint32_t dxbc_opcode, uint32_t operands) {
+  if (operands == 0 || operands > 4 || ins.arg_count < 1 + operands || !m_.is_int(ins.type, 32)) return error(status::kNotSupported);
+  Val v[4];
+  for (uint32_t k = 0; k < operands; ++k) {
+    if (!m_.is_int(value_type(ins.args[1 + k]), 32)) return error(status::kNotSupported);   // (the 16- and 64-bit forms)
+    v[k] = use(ins.args[1 + k]);
+  }
+  const Val r = new_scalar(ins.result);
+  if (r.kind == VK::None) return false;
+  const uint32_t at = begin(dxbc_opcode);
+  dst_scalar(r);
+  for (uint32_t k = 0; k < operands; ++k) src(v[k]);
+  finish(at);
+  return define(ins.result, r);
+}
+
 bool Translator::ternary(const Instruction& ins, uint32_t dxbc_opcode, uint32_t first_arg) {
   if (!float32(ins.type) && !m_.is_int(ins.type, 32)) return error(status::kNotSupported);
   const Val a = use(ins.args[first_arg]), b = use(ins.args[first_arg + 1]), c = use(ins.args[first_arg + 2]);
@@ -2908,14 +2927,16 @@ bool Translator::buffer_load(const Instruction& ins) {
   const uint32_t slot = h.c;
   if (structured) {
     const Val offset = use(ins.args[3]);   // (undef: the start of the element)
-    const uint32_t at = begin(167);        // ld_structured dst, index, offset, u#
+    const uint32_t at = begin(r_out.c ? 0xE3 : 167);        // ld_structured dst, index, offset, u# (a read status: ld_structured_s dst, status, ...)
     dst_temp(r_out.a, 0xF);
+    if (r_out.c) status_dst(r_out);
     src(index), src(offset);
     put(view ? srv_token() : uav_token(0, false)), put(slot);
     finish(at);
   } else {
-    const uint32_t at = begin(165);        // ld_raw dst, byte address, u#
+    const uint32_t at = begin(r_out.c ? 0xE2 : 165);        // ld_raw dst, byte address, u# (ld_raw_s)
     dst_temp(r_out.a, 0xF);
+    if (r_out.c) status_dst(r_out);
     src(index);
     put(view ? srv_token() : uav_token(0, false)), put(slot);
     finish(at);
@@ -3315,6 +3336,14 @@ bool Translator::dx_call(const Instruction& ins) {
     case kFMad: return ternary(ins, 50, 1);
     case kIMad: return ternary(ins, 35, 1);
     case kUMad: return ternary(ins, 82, 1);
+    case kBfrev: return bits(ins, 141, 1);
+    case kCountbits: return bits(ins, 134, 1);
+    case kFirstbitLo: return bits(ins, 136, 1);
+    case kFirstbitHi: return bits(ins, 135, 1);
+    case kFirstbitSHi: return bits(ins, 137, 1);
+    case kIbfe: return bits(ins, 139, 3);
+    case kUbfe: return bits(ins, 138, 3);
+    case kBfi: return bits(ins, 140, 4);
     case kDot2: return dot(ins, 2);
     case kDot3: return dot(ins, 3);
     case kDot4: return dot(ins, 4);

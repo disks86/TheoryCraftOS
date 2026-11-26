@@ -344,7 +344,7 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
         /* (levels: the kernel's 8-bit and block-compressed images have them; its wider ones - 16 and 32-bit channels, 10-bit, integer - and depth buffers on a device with levels of
          * every image, DEV_FEATURE2_MIPMAPPED_LAYERS) */
         if (device_format_levels(This, i->kernel) && (!i->depth || (This->caps.features2 & DEV_FEATURE2_MIPMAPPED_LAYERS))) f->Support1 |= D3D12_FORMAT_SUPPORT1_MIP;
-        if (format_tiled(i)) f->Support2 |= D3D12_FORMAT_SUPPORT2_TILED;      /* (the kernel's reserved textures: tile_layout) */
+        if (format_tiled(i) || format_tiled_depth(This, i)) f->Support2 |= D3D12_FORMAT_SUPPORT2_TILED;      /* (the kernel's reserved textures and depth buffers: tile_layout) */
         if (i->depth) f->Support1 |= D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL;
         else if (format_integer(f->Format)) f->Support1 |= D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_RENDER_TARGET;      /* (integers: loaded, not filtered or blended) */
         else if (i->compressed) f->Support1 |= D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE;      /* (sampled only) */
@@ -412,10 +412,11 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
       if (size != sizeof *m) return E_INVALIDARG;
       /* (one quality level - the standard sample pattern - for the counts the adapter has, on the formats a render target or depth buffer can have; asked with
        * D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE, for reserved textures: one sample of a tiled format - the kernel's multisampled images have no backing its tiles
-       * could be gathered into, so there are no multisampled reserved textures) */
+       * could be gathered into (no device takes a multisampled image's samples to or from memory: IImage has no such transfer, and neither GL nor Vulkan copies a multisampled
+       * image to a buffer), so there are no multisampled reserved textures) */
       if (m->Flags & ~D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE) return E_INVALIDARG;
       if (m->Flags & D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE) {
-        m->NumQualityLevels = m->SampleCount == 1 && format_tiled(format_info(m->Format)) ? 1 : 0;
+        m->NumQualityLevels = m->SampleCount == 1 && (format_tiled(format_info(m->Format)) || format_tiled_depth(This, format_info(m->Format))) ? 1 : 0;
         return S_OK;
       }
       /* (R24G8_TYPELESS, the family of a depth buffer read by shaders, has the levels of its depth format, as on Windows) */

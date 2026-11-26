@@ -848,6 +848,16 @@ class Adapter::StreamRunner {
     uint32_t slot = 0;
     if (!p.at_end()) slot = p.le32();      // (a third word: the vertex buffer slot, below the device's DeviceLimits::vertex_buffers)
     if (!exact(p) || slot >= adapter_.caps_.max_vertex_buffers) return kBad;
+    if (index == kNoVertexBuffer) {   // (no buffer: what the attributes read of it is 0 on an adapter with kFeature3NullVertexBuffers, the draw is refused elsewhere)
+      if (offset != 0) return kBad;
+      vertex_[slot] = nullptr;
+      vertex_offset_[slot] = 0;
+      if (!exec_ || !(adapter_.caps_.features3 & graphics::kFeature3NullVertexBuffers)) return status::kSuccess;
+      const NtStatus s = ensure_cb();
+      if (s != status::kSuccess) return s;
+      cb_->bind_vertex_buffer_slot(slot, nullptr, 0);
+      return status::kSuccess;
+    }
     Allocation* a = alloc(index);
     if (!a || !a->is_buffer() || !(a->desc().flags & kAllocVertexBuffer) || offset > a->desc().size || !use(a, state::kVertexAndConstantBuffer)) return kBad;
     vertex_[slot] = a;
@@ -1184,20 +1194,25 @@ class Adapter::StreamRunner {
       if (made != pipeline_->geometry_input()) return refuse(__LINE__);
     }
     const bool vertices = pipeline_->attribute_count() > 0;
-    // Every vertex buffer the attributes read is bound, and the vertices the draw reads (per vertex) and the instances (per instance) are inside it.
+    // Every vertex buffer the attributes read is bound (or the slot reads zeros: kFeature3NullVertexBuffers), and the vertices the draw reads (per vertex) and the instances
+    // (per instance) are inside it: the last element's attributes (slot_extent) end within the buffer.
+    const bool null_slots = (adapter_.caps_.features3 & graphics::kFeature3NullVertexBuffers) != 0;
     for (uint32_t slot = 0; slot < graphics::kMaxVertexBuffers; ++slot) {
       if (!(pipeline_->vertex_slots() >> slot & 1)) continue;
-      if (!vertex_[slot]) return refuse(__LINE__);
-      const uint64_t stride = pipeline_->slot_stride(slot);
-      if (pipeline_->per_instance_slots() >> slot & 1) {
+      if (!vertex_[slot]) {
+        if (!null_slots) return refuse(__LINE__);
+        continue;
+      }
+      const uint64_t stride = pipeline_->slot_stride(slot), extent = pipeline_->slot_extent(slot);
+      if ((pipeline_->per_instance_slots() >> slot & 1) && instance_count) {
         // (the last element an instance reads: the attributes that step slowest stop soonest; one that never steps reads first_instance)
         const uint32_t rate = pipeline_->slot_step_rate(slot);
-        const uint64_t end = uint64_t{first_instance} + (rate ? (instance_count - 1) / rate : 0) + 1;
-        if (vertex_offset_[slot] + end * stride > vertex_[slot]->desc().size) return refuse(__LINE__);
+        const uint64_t last = uint64_t{first_instance} + (rate ? (instance_count - 1) / rate : 0);
+        if (vertex_offset_[slot] + last * stride + extent > vertex_[slot]->desc().size) return refuse(__LINE__);
       }
-      if (!indexed && (pipeline_->per_vertex_slots() >> slot & 1)) {
-        const uint64_t end = uint64_t{first} + count;   // (times a stride of at most 2048: < 2^44)
-        if (vertex_offset_[slot] + end * stride > vertex_[slot]->desc().size) return refuse(__LINE__);
+      if (!indexed && (pipeline_->per_vertex_slots() >> slot & 1) && count) {
+        const uint64_t last = uint64_t{first} + count - 1;   // (times a stride of at most 2048: < 2^44)
+        if (vertex_offset_[slot] + last * stride + extent > vertex_[slot]->desc().size) return refuse(__LINE__);
       }
     }
     if (indexed) {
@@ -1222,7 +1237,9 @@ class Adapter::StreamRunner {
         if (v > highest) highest = v;
       }
       for (uint32_t slot = 0; slot < graphics::kMaxVertexBuffers; ++slot)
-        if ((pipeline_->per_vertex_slots() >> slot & 1) && vertex_offset_[slot] + static_cast<uint64_t>(highest + 1) * pipeline_->slot_stride(slot) > vertex_[slot]->desc().size) return refuse(__LINE__);
+        if ((pipeline_->per_vertex_slots() >> slot & 1) && vertex_[slot] && highest >= 0 &&
+            vertex_offset_[slot] + static_cast<uint64_t>(highest) * pipeline_->slot_stride(slot) + pipeline_->slot_extent(slot) > vertex_[slot]->desc().size)
+          return refuse(__LINE__);
     }
     NtStatus s = ensure_cb();
     if (s == status::kSuccess) s = apply_raster();
@@ -3243,13 +3260,17 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
     if (used < texture_count) texture_count = used;
     if (paired > texture_count) texture_count = paired;
   }
-  uint32_t vertex_slots = 0, instance_slots = 0, slot_rates[graphics::kMaxVertexBuffers] = {};
+  uint32_t vertex_slots = 0, instance_slots = 0, slot_rates[graphics::kMaxVertexBuffers] = {}, slot_extents[graphics::kMaxVertexBuffers] = {};
   for (uint32_t i = 0; i < d.attribute_count; ++i) {
     const graphics::VertexAttribute& a = d.attributes[i];
     if (a.location >= caps_.max_vertex_attributes || a.slot >= caps_.max_vertex_buffers || static_cast<uint32_t>(a.format) >= graphics::kVertexFormatCount) return status::kInvalidParameter;
     if (static_cast<uint32_t>(a.format) > static_cast<uint32_t>(graphics::VertexFormat::Float4) && !(caps_.features & graphics::kFeatureVertexFormats)) return status::kNotSupported;
     const uint32_t stride = a.slot == 0 ? d.vertex_stride : d.slot_strides[a.slot];
-    if (stride == 0 || a.offset > stride || graphics::vertex_format_bytes(a.format) > stride - a.offset) return status::kInvalidParameter;
+    // (an attribute lies within its element; at stride 0 - every vertex reading the same element, kFeature3ZeroStride - within the largest one)
+    const uint32_t room = stride ? stride : (caps_.features3 & graphics::kFeature3ZeroStride) ? kMaxVertexStride : 0;
+    if (room == 0 || a.offset > room || graphics::vertex_format_bytes(a.format) > room - a.offset) return status::kInvalidParameter;
+    const uint32_t end = a.offset + graphics::vertex_format_bytes(a.format);
+    if (end > slot_extents[a.slot]) slot_extents[a.slot] = end;
     (a.per_instance ? instance_slots : vertex_slots) |= 1u << a.slot;
     if (a.per_instance && a.step_rate && (slot_rates[a.slot] == 0 || a.step_rate < slot_rates[a.slot])) slot_rates[a.slot] = a.step_rate;
   }
@@ -3389,7 +3410,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   pipeline->stride_ = d.vertex_stride;
   pipeline->vertex_slot_mask_ = vertex_slots;
   pipeline->instance_slot_mask_ = instance_slots;
-  for (uint32_t s = 0; s < graphics::kMaxVertexBuffers; ++s) pipeline->slot_step_rates_[s] = slot_rates[s];
+  for (uint32_t s = 0; s < graphics::kMaxVertexBuffers; ++s) pipeline->slot_step_rates_[s] = slot_rates[s], pipeline->slot_extents_[s] = slot_extents[s];
   for (uint32_t s = 1; s < graphics::kMaxVertexBuffers; ++s) pipeline->slot_strides_[s] = d.slot_strides[s];
   for (uint32_t i = 0; i < d.attribute_count; ++i) pipeline->per_instance_ = pipeline->per_instance_ || d.attributes[i].per_instance;
   pipeline->attribute_count_ = d.attribute_count;

@@ -107,10 +107,11 @@ static HRESULT buf_tiled_make(Dev *d, Buf *b) {
   return S_OK;
 }
 
-/* Whether textures of the format may be tiled: Direct3D 12's D3D12_FORMAT_SUPPORT2_TILED (the formats the kernel keeps of 1 to 16 bytes a texel, not block-compressed, depth
- * or video ones), for a format this runtime knows. */
+/* Whether textures of the format may be tiled: Direct3D 12's D3D12_FORMAT_SUPPORT2_TILED (the formats the kernel keeps of 1 to 16 bytes a texel, block-compressed ones, D32_FLOAT -
+ * Direct3D 12's reserved depth buffers, of floats -; not video formats), for a format this runtime knows. Not D16_UNORM: this runtime keeps D16 textures in D32_FLOAT below, whose
+ * tiles are of other sizes than Direct3D 11's of a 16-bit format (and an R16_TYPELESS depth texture, so, is refused at CreateTexture2D). */
 static BOOL tex_tiled_format(Dev *d, DXGI_FORMAT format) {
-  if (!tex_format(format)) return FALSE;
+  if (!tex_format(format) || format == DXGI_FORMAT_D16_UNORM) return FALSE;
   D3D12_FEATURE_DATA_FORMAT_SUPPORT s = {format, D3D12_FORMAT_SUPPORT1_NONE, D3D12_FORMAT_SUPPORT2_NONE};
   return SUCCEEDED(ID3D12Device_CheckFeatureSupport(d->d12, D3D12_FEATURE_FORMAT_SUPPORT, &s, sizeof s)) && (s.Support2 & D3D12_FORMAT_SUPPORT2_TILED) != 0;
 }

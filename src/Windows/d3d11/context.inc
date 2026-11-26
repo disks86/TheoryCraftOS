@@ -894,7 +894,12 @@ static BOOL draw_prepare(Ctx *c, BOOL indexed) {
   ID3D12GraphicsCommandList_OMSetStencilRef(list, c->stencil_ref);
   ID3D12GraphicsCommandList_OMSetBlendFactor(list, c->blend_factor);
   for (UINT slot = 0; slot < VERTEX_SLOTS; ++slot) {
-    if (!sources[slot]) continue;
+    if (!sources[slot]) {
+      /* (no buffer: a slot the layout reads gives 0 - the components its format lacks 0, 0, 0, 1 -, as Direct3D 11's unbound input slot; Direct3D 12's null view, not
+       * the buffer an earlier draw of the list bound there) */
+      ID3D12GraphicsCommandList_IASetVertexBuffers(list, slot, 1, NULL);
+      continue;
+    }
     D3D12_VERTEX_BUFFER_VIEW view = {ID3D12Resource_GetGPUVirtualAddress(sources[slot]) + offsets[slot], sizes[slot], strides[slot]};
     ID3D12GraphicsCommandList_IASetVertexBuffers(list, slot, 1, &view);
     if (sources[slot] == c->vb[slot]->converted) c->vb[slot]->converted_used = d->epoch;
