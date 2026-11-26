@@ -25,7 +25,7 @@ A method defined with `#define <prefix>_<Method> <function>` counts too (the IUn
 import re, os, sys
 
 INC = '/usr/x86_64-w64-mingw32/include/'
-HEADERS = ['d3d12.h', 'd3d12video.h', 'd3d12sdklayers.h', 'dxgi1_6.h', 'dxgi1_5.h', 'dxgi1_4.h', 'dxgi1_3.h', 'dxgi1_2.h', 'dxgi.h', 'd3dcommon.h', 'd3d11.h', 'd3d11_1.h', 'd3d11_2.h', 'd3d11_3.h', 'd3d11_4.h', 'd3d9.h']
+HEADERS = ['d3d12.h', 'd3d12video.h', 'd3d12sdklayers.h', 'dxgi1_6.h', 'dxgi1_5.h', 'dxgi1_4.h', 'dxgi1_3.h', 'dxgi1_2.h', 'dxgi.h', 'd3dcommon.h', 'd3d11.h', 'd3d11_1.h', 'd3d11_2.h', 'd3d11_3.h', 'd3d11_4.h', 'd3d9.h', 'd3d8.h']
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src', 'Windows')
 
 # (interface, vtable variable, [prefixes in the order they are tried])
@@ -121,6 +121,18 @@ SPECS = {
         ('IDirect3DStateBlock9', 'sb_vtbl', ['sb', 'child', 'obj']),
         ('IDirect3DVertexShader9', 'vs_vtbl', ['shader', 'child', 'obj']),
         ('IDirect3DPixelShader9', 'ps_vtbl', ['shader', 'child', 'obj']),
+    ],
+    'd3d8': [
+        ('IDirect3D8', 'd3d_vtbl', ['d3d', 'obj']),
+        ('IDirect3DDevice8', 'dev_vtbl', ['dev', 'obj']),
+        ('IDirect3DVertexBuffer8', 'vb_vtbl', ['vb', 'res', 'obj']),
+        ('IDirect3DIndexBuffer8', 'ib_vtbl', ['ib', 'res', 'obj']),
+        ('IDirect3DTexture8', 'tex_vtbl', ['tex', 'btex', 'res', 'obj']),
+        ('IDirect3DCubeTexture8', 'cube_vtbl', ['cube', 'btex', 'res', 'obj']),
+        ('IDirect3DVolumeTexture8', 'vol_vtbl', ['vol', 'btex', 'res', 'obj']),
+        ('IDirect3DSurface8', 'surf_vtbl', ['surf', 'obj']),
+        ('IDirect3DVolume8', 'volume_vtbl', ['volume', 'obj']),
+        ('IDirect3DSwapChain8', 'sc_vtbl', ['sc', 'obj']),
     ],
 }
 
