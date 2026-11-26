@@ -648,9 +648,11 @@ static inline int dd_blit(DdImage *dst, const DdRect *dr, const DdImage *src, co
   return DD_PIX_OK;
 }
 
-/* A rectangle of an image as A8R8G8B8 rows (`out_pitch` bytes apart, at least 4 * width; `out_size` bytes in all). With `key`, pixels whose colour bits
- * are in [key_low, key_high] get alpha 0 and the others keep their alpha (what Direct3D makes of a colour-keyed texture, and the presentation of a
- * palette or 16-bit primary surface). Depth and bump formats cannot be read as colours (DD_PIX_UNSUPPORTED). */
+/* A rectangle of an image as A8R8G8B8 rows (`out_pitch` bytes apart, at least 4 * width; `out_size` bytes in all). With `key` (what Direct3D makes of a
+ * colour-keyed texture), pixels whose bits - colour and alpha, of the pixel and of the key alike - are in [key_low, key_high] get alpha 0, and the
+ * others keep their alpha, except that an alpha of 0 becomes 1 (of 255), so that alpha 0 means "keyed" and nothing else: the pixel stage takes such
+ * texels away (d3d9's TCOS_TSS_KEY_KILL). Windows compares a texture's alpha with the key's (Wine's test_ck_rgba). Depth and bump formats cannot be
+ * read as colours (DD_PIX_UNSUPPORTED). */
 static inline int dd_to_argb(const DdImage *src, const DdRect *r, uint8_t *out, size_t out_size, uint32_t out_pitch, int key, uint32_t key_low, uint32_t key_high) {
   if (!dd_image_check(src)) return DD_PIX_BAD_IMAGE;
   if (!dd_rect_inside(src, r)) return DD_PIX_BAD_RECT;
@@ -659,7 +661,8 @@ static inline int dd_to_argb(const DdImage *src, const DdRect *r, uint8_t *out, 
   if (!out || out_pitch < (uint64_t)w * 4u || (uint64_t)out_pitch * (h - 1u) + (uint64_t)w * 4u > out_size) return DD_PIX_BAD_IMAGE;
   const DdFormatInfo *f = dd_format(src->fmt);
   const int raw_key = key && (f->bytes || f->kind == DD_KIND_PALETTE) && f->kind != DD_KIND_YUV_PACKED;
-  const uint32_t mask = dd_colour_mask(src->fmt);
+  const uint32_t mask = dd_colour_mask(src->fmt) | (f->kind == DD_KIND_RGB ? f->a : 0u);
+  const uint32_t low = key_low & mask, high = key_high & mask;
   for (uint32_t y = 0; y < h; ++y) {
     uint8_t *o = out + (size_t)y * out_pitch;
     for (uint32_t x = 0; x < w; ++x, o += 4) {
@@ -668,7 +671,8 @@ static inline int dd_to_argb(const DdImage *src, const DdRect *r, uint8_t *out, 
       if (raw_key || (f->bytes && f->kind != DD_KIND_YUV_PACKED) || f->kind == DD_KIND_PALETTE) {
         const uint32_t raw = dd_get_raw(src, sx, sy);
         c = dd_raw_to_argb(src, raw);
-        if (raw_key && dd_key_in(raw, mask, key_low, key_high)) c &= 0x00FFFFFFu;
+        if (raw_key && dd_key_in(raw, mask, low, high)) c &= 0x00FFFFFFu;
+        else if (raw_key && !(c >> 24)) c |= 0x01000000u;
       } else {
         c = dd_read_argb(src, sx, sy);
       }

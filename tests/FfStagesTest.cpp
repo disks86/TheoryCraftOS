@@ -61,10 +61,12 @@ SmContext g_context;
 
 struct Colour { float v[4]; };
 
-// The texture of a unit: a colour that depends on the unit and on where it is looked up.
+// The texture of a unit: a colour that depends on the unit and on where it is looked up (its alpha `g_texel_alpha` where that is not below 0).
+float g_texel_alpha = -1.0f;
 Colour texel_of(uint32_t unit, float u, float v) {
   return {{0.5f + 0.45f * sinf(u * 3.0f + static_cast<float>(unit)), 0.5f + 0.4f * cosf(v * 2.0f + 0.3f * static_cast<float>(unit)),
-           0.15f + 0.1f * static_cast<float>(unit) + 0.05f * sinf(u + v), 0.3f + 0.08f * static_cast<float>(unit) + 0.1f * cosf(u - v)}};
+           0.15f + 0.1f * static_cast<float>(unit) + 0.05f * sinf(u + v),
+           g_texel_alpha >= 0.0f ? g_texel_alpha : 0.3f + 0.08f * static_cast<float>(unit) + 0.1f * cosf(u - v)}};
 }
 struct Textures final : graphics::ITextureSet {
   graphics::Vec4 sample(uint32_t unit, float u, float v) const override {
@@ -442,11 +444,49 @@ void test_damage(HostAllocator& allocator) {
   printf("  %u keys of any bytes written (%u translated); the longest shader here has %zu tokens, and %u shorter buffers and shaders are refused\n", written, taken, count, refused);
 }
 
+// A colour-keyed texture (the stage's `kill`, ddraw.dll's colour key): a texel of alpha 0 takes the pixel away, whatever the stages make of the alpha;
+// a texel of alpha 1/255 (the least a keyed texture's other texels have) does not, even where the alpha the stages give is 0.
+void test_kill(HostAllocator& allocator) {
+  FfsKey key = initial();
+  set_stage(&key, 0, FFS_MODULATE, FFS_TEXTURE, FFS_DIFFUSE, FFS_MODULATE, FFS_TEXTURE, FFS_DIFFUSE);
+  key.stage[0].kill = 1;
+  FfsKey untextured = key;
+  ffs_normalize(&untextured, 0x0);
+  CHECK(!untextured.stage[0].kill && !untextured.stage[0].sample);      // (no texture: nothing to key)
+  ffs_normalize(&key, 0x1);
+  CHECK(key.stages == 1 && key.stage[0].kill && key.stage[0].sample);
+  Program p;
+  CHECK(make(allocator, key, &p));
+  if (!p.program) return;
+  for (unsigned set = 0; set < 16; ++set) {
+    Inputs in = inputs();
+    if (set & 1) in.diffuse.v[3] = 0.0f;      // (MODULATE of the alpha gives 0: Wine's test_colorkey_precision)
+    g_texel_alpha = 0.0f;
+    CHECK(run(p, in).v[0] == -1.0f);
+    g_texel_alpha = 1.0f / 255.0f;
+    CHECK(same(run(p, in), reference(key, in)));
+    g_texel_alpha = 1.0f;
+    CHECK(same(run(p, in), reference(key, in)));
+  }
+  g_texel_alpha = -1.0f;
+  // a key without kill has no texkill: a texel of alpha 0 is drawn
+  FfsKey plain = initial();
+  ffs_normalize(&plain, 0x1);
+  Program q;
+  CHECK(make(allocator, plain, &q));
+  if (!q.program) return;
+  g_texel_alpha = 0.0f;
+  const Inputs in = inputs();
+  CHECK(run(q, in).v[0] != -1.0f);
+  g_texel_alpha = -1.0f;
+}
+
 }  // namespace
 
 int main() {
   HostAllocator allocator;
   test_written(allocator);
+  test_kill(allocator);
   test_key();
   test_random(allocator);
   test_damage(allocator);

@@ -412,13 +412,13 @@ static int stage0_kind(const D3dDevice *dev) {
 static void bind_textures(D3dDevice *dev) {
   D3dDD *d = dev->dd3;
   const BOOL keying = dev->st.rs[D3DRENDERSTATE_COLORKEYENABLE] != 0;
-  BOOL keyed = FALSE;
+  UINT kill = 0;
   const int before = stage0_kind(dev);
   for (UINT st = 0; st < D3D_STAGES; ++st) {
     Surface *s = dev->st.texture[st];
     D3dRes *r = s ? texture_res(d, texture_root(s), keying) : NULL;
     IDirect3DBaseTexture9 *bt = r ? (r->cube ? (IDirect3DBaseTexture9 *)r->cube : (IDirect3DBaseTexture9 *)r->texture) : NULL;
-    if (r && r->keyed) keyed = TRUE;
+    if (r && r->keyed) kill |= 1u << st;
     if (r != dev->bound_res[st] || dev->bound_stamp[st] != d->tex_stamp || (dev->dirty.texture >> st) & 1u) {
       D3D_CALL(d->dev, SetTexture, st, bt);
       dev->bound_res[st] = r;
@@ -426,20 +426,14 @@ static void bind_textures(D3dDevice *dev) {
     }
   }
   dev->dirty.texture = 0;
-  /* (keyed texels are alpha 0: the alpha test takes them away when the program does not test alpha itself) */
-  const BOOL test = keyed && !dev->st.rs[D3DRENDERSTATE_ALPHATESTENABLE];
-  if (test != dev->bound_keyed_test) {
-    if (test) {
-      D3D_CALL(d->dev, SetRenderState, D9_RS_ALPHATESTENABLE, TRUE);
-      D3D_CALL(d->dev, SetRenderState, D9_RS_ALPHAFUNC, D9_RS_CMP_GREATER);
-      D3D_CALL(d->dev, SetRenderState, D9_RS_ALPHAREF, 0);
-    } else {
-      D3D_CALL(d->dev, SetRenderState, D9_RS_ALPHATESTENABLE, dev->st.rs[D3DRENDERSTATE_ALPHATESTENABLE]);
-      D3D_CALL(d->dev, SetRenderState, D9_RS_ALPHAFUNC, dev->st.rs[D3DRENDERSTATE_ALPHAFUNC]);
-      D3D_CALL(d->dev, SetRenderState, D9_RS_ALPHAREF, dev->st.rs[D3DRENDERSTATE_ALPHAREF]);
-    }
-    dev->bound_keyed_test = test;
+  /* (keyed texels are alpha 0 and no other texel of a keyed texture is: the pixel stage takes them away by the texel itself, before the stages and
+   * the alpha test - Windows discards them whatever alpha the stages make, Wine's test_colorkey_precision and test_ck_rgba) */
+  for (UINT st = 0; st < D3D_STAGES; ++st) {
+    const UINT bit = 1u << st;
+    if (dev->bound_key_kill != ~0u && (dev->bound_key_kill & bit) == (kill & bit)) continue;
+    D3D_CALL(d->dev, SetTextureStageState, st, D9_TSS_KEY_KILL, (kill & bit) ? TRUE : FALSE);
   }
+  dev->bound_key_kill = kill;
   /* (MODULATE takes the texture's alpha only if it has one: stage 0 again when that changed) */
   if (dev->legacy_blend && stage0_kind(dev) != before) MASK_SET(dev->dirty.rs, D3DRENDERSTATE_TEXTUREMAPBLEND);
 }
@@ -456,7 +450,7 @@ static HRESULT d3_flush(D3dDevice *dev) {
   if (dev->all_dirty) {
     mask_all(&dev->dirty, dev->st.light_count);
     for (UINT st = 0; st < D3D_STAGES; ++st) dev->bound_res[st] = NULL;
-    dev->bound_keyed_test = FALSE;
+    dev->bound_key_kill = ~0u;
     d->bound_target = d->bound_depth = NULL;
     dev->all_dirty = FALSE;
     /* (Direct3D 1-3 draw transformed vertices: no Direct3D 9 lighting) */
@@ -483,7 +477,6 @@ static HRESULT d3_flush(D3dDevice *dev) {
       if (dev->version < 7 && (state == D3DRENDERSTATE_FOGVERTEXMODE || state == D3DRENDERSTATE_LIGHTING)) continue;
       DlStateOps ops;
       if (dl_render_state(dev->version < 7 ? 3 : 7, state, dev->st.rs[state], &ctx, &ops) == DL_OK) ops_apply(dev, &ops);
-      if (state == D3DRENDERSTATE_ALPHATESTENABLE || state == D3DRENDERSTATE_ALPHAFUNC || state == D3DRENDERSTATE_ALPHAREF) dev->bound_keyed_test = FALSE;
     }
   }
   /* texture stage states (stage 0's take the sampler states of the render states too) */

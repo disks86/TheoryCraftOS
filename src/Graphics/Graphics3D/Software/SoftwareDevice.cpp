@@ -2172,11 +2172,21 @@ void fragment_at(const DrawState& s, int32_t x, int32_t y, float z, float inv_w,
   }
 }
 
+// A window position snapped to the rasterizer's grid of 1/256 pixel (Direct3D's 16.8 fixed point; Vulkan and OpenGL hardware snap alike): a vertex that
+// lands a rounding error past a pixel centre - Direct3D 9's whole-number centres moved by half a pixel and back through the viewport, say - is where
+// the program put it, and the fill rule decides that pixel as it would on a GPU. (Positions far off the screen stay as they are.)
+inline float snap_subpixel(float v) {
+  if (!(v > -1048576.0f && v < 1048576.0f)) return v;
+  const float t = v * 256.0f;
+  const int64_t n = static_cast<int64_t>(t < 0 ? t - 0.5f : t + 0.5f);
+  return static_cast<float>(n) * (1.0f / 256.0f);
+}
+
 ScreenVertex to_screen(const DrawState& s, const ClipVertex& v, uint32_t varyings) {
   ScreenVertex sv;
   const float inv_w = 1.0f / v.position.w;
-  sv.x = s.viewport.x + (v.position.x * inv_w * 0.5f + 0.5f) * s.viewport.width;
-  sv.y = s.viewport.y + (v.position.y * inv_w * 0.5f + 0.5f) * s.viewport.height;
+  sv.x = snap_subpixel(s.viewport.x + (v.position.x * inv_w * 0.5f + 0.5f) * s.viewport.width);
+  sv.y = snap_subpixel(s.viewport.y + (v.position.y * inv_w * 0.5f + 0.5f) * s.viewport.height);
   sv.z = s.viewport.min_depth + v.position.z * inv_w * (s.viewport.max_depth - s.viewport.min_depth);
   sv.inv_w = inv_w;
   for (uint32_t k = 0; k < varyings; ++k) sv.varying[k] = v.varying[k];
@@ -2381,8 +2391,8 @@ void draw_triangle(const DrawState& s, const ClipVertex& a, const ClipVertex& b,
     const Vec4& p = poly[i].position;
     if (!(p.w > 1e-9f)) return;  // behind the eye even after clipping: nothing sensible to draw
     const float inv_w = 1.0f / p.w;
-    sv[i].x = s.viewport.x + (p.x * inv_w * 0.5f + 0.5f) * s.viewport.width;
-    sv[i].y = s.viewport.y + (p.y * inv_w * 0.5f + 0.5f) * s.viewport.height;
+    sv[i].x = snap_subpixel(s.viewport.x + (p.x * inv_w * 0.5f + 0.5f) * s.viewport.width);
+    sv[i].y = snap_subpixel(s.viewport.y + (p.y * inv_w * 0.5f + 0.5f) * s.viewport.height);
     sv[i].z = s.viewport.min_depth + p.z * inv_w * (s.viewport.max_depth - s.viewport.min_depth);
     sv[i].inv_w = inv_w;
     for (uint32_t k = 0; k < varyings; ++k) sv[i].varying[k] = poly[i].varying[k];

@@ -101,7 +101,10 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 #define PIPELINES 64u
 #define RENDER_STATES 256u
 #define SAMPLER_STATES 14u             /* D3DSAMP_ADDRESSU (1) .. D3DSAMP_DMAPOFFSET (13) */
-#define STAGE_STATES 33u               /* D3DTSS_COLOROP (1) .. D3DTSS_CONSTANT (32) */
+#define STAGE_STATES 34u               /* D3DTSS_COLOROP (1) .. D3DTSS_CONSTANT (32), and TCOS_TSS_KEY_KILL */
+/* A stage state of this d3d9.dll's own, for ddraw.dll's Direct3D: a texel of alpha 0 of the stage's texture takes the pixel away in the fixed-function
+ * pixel stage (a colour-keyed texture: ddraw.dll gives keyed texels alpha 0 and the others at least 1), whatever the stage then does with the alpha. */
+#define TCOS_TSS_KEY_KILL 33u
 #define MAX_LEVELS 13u                 /* of a texture of 4096 pixels */
 #define MAX_SUBS (MAX_LEVELS * 6u)     /* the subresources of a texture: face * levels + level */
 #define MAX_ELEMENTS 64u

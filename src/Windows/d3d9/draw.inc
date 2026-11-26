@@ -472,6 +472,7 @@ static const Shader *fixed_shader_get(Dev *d) {
     stage->colour_arg[0] = (uint8_t)t[D3DTSS_COLORARG0]; stage->colour_arg[1] = (uint8_t)t[D3DTSS_COLORARG1]; stage->colour_arg[2] = (uint8_t)t[D3DTSS_COLORARG2];
     stage->alpha_arg[0] = (uint8_t)t[D3DTSS_ALPHAARG0]; stage->alpha_arg[1] = (uint8_t)t[D3DTSS_ALPHAARG1]; stage->alpha_arg[2] = (uint8_t)t[D3DTSS_ALPHAARG2];
     stage->to_temp = (t[D3DTSS_RESULTARG] & D3DTA_SELECTMASK) == D3DTA_TEMP;
+    stage->kill = t[TCOS_TSS_KEY_KILL] != 0;
     const Tex *bound = s->tex[n];
     if (bound && bound->res && !bound->depth) textured |= 1u << n;
   }
@@ -869,16 +870,22 @@ static HRESULT draw(Dev *d, D3DPRIMITIVETYPE type, UINT primitives, const Source
   const UINT slots = texture_slots(ps);
   const BOOL fan = type == D3DPT_TRIANGLEFAN;
   const UINT out_indices = fan ? primitives * 3 : indices ? elements : 0;
-  if (vertices > VERTEX_RING / stride || out_indices > INDEX_RING / 4 || constant_registers(vs, ps) > CONSTANT_REGISTERS) return D3DERR_INVALIDCALL;
+  /* D3DSHADE_FLAT (the fixed-function vertex stage): each primitive's vertices are copied with the colours of its first vertex - the second of a fan's
+   * triangle, as Direct3D 9 has it - and drawn as a list (the colours are interpolated otherwise; there is no provoking-vertex state below). */
+  const BOOL flat = !vs && d->state.rs[D3DRS_SHADEMODE] == D3DSHADE_FLAT && type != D3DPT_POINTLIST;
+  const UINT flat_vertices = flat ? (type == D3DPT_LINELIST || type == D3DPT_LINESTRIP ? primitives * 2 : primitives * 3) : 0;
+  if (vertices > VERTEX_RING / stride || flat_vertices > VERTEX_RING / stride - vertices || out_indices > INDEX_RING / 4 || constant_registers(vs, ps) > CONSTANT_REGISTERS)
+    return D3DERR_INVALIDCALL;
 
   /* what may have to send the list first */
   settle(d, d->target[0]->tex->sampled);      /* (a texture the list's draws sampled cannot become its target) */
   for (UINT i = 1; i < TARGETS && d->target[i]; ++i) settle(d, d->target[i]->tex->sampled);
   textures_refresh(d, ps);
-  if (d->vertex_used + vertices * stride > VERTEX_RING || d->index_used + out_indices * 4 > INDEX_RING || d->constant_used + ((constant_registers(vs, ps) * 16 + 255) & ~255u) > CONSTANT_RING ||
+  if (d->vertex_used + (vertices + flat_vertices) * stride > VERTEX_RING || d->index_used + out_indices * 4 > INDEX_RING || d->constant_used + ((constant_registers(vs, ps) * 16 + 255) & ~255u) > CONSTANT_RING ||
       d->view_used + slots > VIEW_HEAP || d->sampler_used + slots > VIEW_HEAP || (d->open_queries && queries_need_slots(d)))
     flush(d);
-  ID3D12PipelineState *pipeline = pipeline_get(d, vs, ps, type);
+  const D3DPRIMITIVETYPE draw_type = !flat ? type : type == D3DPT_LINELIST || type == D3DPT_LINESTRIP ? D3DPT_LINELIST : D3DPT_TRIANGLELIST;
+  ID3D12PipelineState *pipeline = pipeline_get(d, vs, ps, draw_type);
   if (!pipeline) return D3DERR_INVALIDCALL;
 
   /* the vertices, and the indices counted from the first of them */
@@ -930,6 +937,40 @@ static HRESULT draw(Dev *d, D3DPRIMITIVETYPE type, UINT primitives, const Source
     }
     d->index_used += out_indices * 4;
   }
+  UINT flat_at = 0;
+  if (flat) {
+    /* (the decoded vertices of each primitive in turn, with the provoking vertex's colour and specular colour; the fog factor stays each vertex's) */
+    flat_at = d->vertex_used;
+    BYTE *base = d->vertex_data + vertex_at, *out = d->vertex_data + flat_at;
+    const UINT per = flat_vertices / primitives;
+    const INT lowest = (INT)first_vertex - index_base;
+    for (UINT p = 0; p < primitives; ++p) {
+      UINT element[3];
+      if (type == D3DPT_LINELIST) element[0] = 2 * p, element[1] = 2 * p + 1;
+      else if (type == D3DPT_LINESTRIP) element[0] = p, element[1] = p + 1;
+      else if (type == D3DPT_TRIANGLELIST) element[0] = 3 * p, element[1] = 3 * p + 1, element[2] = 3 * p + 2;
+      else if (type == D3DPT_TRIANGLESTRIP) {      /* (every other triangle of a strip turns the other way: as a list it keeps its winding) */
+        element[0] = p;
+        element[1] = (p & 1) ? p + 2 : p + 1;
+        element[2] = (p & 1) ? p + 1 : p + 2;
+      } else element[0] = 0, element[1] = p + 1, element[2] = p + 2;
+      UINT vertex[3];
+      for (UINT k = 0; k < per; ++k) {
+        UINT value = element[k];
+        if (indices) value = index_bytes == 4 ? ((const UINT *)indices)[element[k]] : ((const WORD *)indices)[element[k]];
+        const INT64 v = indices ? (INT64)value - lowest : (INT64)value;
+        vertex[k] = v >= 0 && v < (INT64)vertices ? (UINT)v : 0;
+      }
+      const UINT provoking = type == D3DPT_TRIANGLEFAN ? vertex[1] : vertex[0];
+      for (UINT k = 0; k < per; ++k) {
+        BYTE *o = out + (SIZE_T)(p * per + k) * stride;
+        memcpy(o, base + (SIZE_T)vertex[k] * stride, stride);
+        memcpy(o + 16, base + (SIZE_T)provoking * stride + 16, 16);      /* (the colour) */
+        memcpy(o + 36, base + (SIZE_T)provoking * stride + 36, 12);      /* (the specular colour, after the fog factor) */
+      }
+    }
+    d->vertex_used += flat_vertices * stride;
+  }
 
   if (d->open_queries) queries_before_draw(d);      /* (occlusion queries count from the first draw after their begin) */
   ID3D12GraphicsCommandList *list = d->list;
@@ -967,9 +1008,9 @@ static HRESULT draw(Dev *d, D3DPRIMITIVETYPE type, UINT primitives, const Source
     d->root_set = root;
   }
   ID3D12GraphicsCommandList_SetPipelineState(list, pipeline);
-  ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, type == D3DPT_POINTLIST ? D3D_PRIMITIVE_TOPOLOGY_POINTLIST : type == D3DPT_LINELIST ? D3D_PRIMITIVE_TOPOLOGY_LINELIST
-                                                         : type == D3DPT_LINESTRIP ? D3D_PRIMITIVE_TOPOLOGY_LINESTRIP
-                                                         : type == D3DPT_TRIANGLESTRIP ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, draw_type == D3DPT_POINTLIST ? D3D_PRIMITIVE_TOPOLOGY_POINTLIST : draw_type == D3DPT_LINELIST ? D3D_PRIMITIVE_TOPOLOGY_LINELIST
+                                                         : draw_type == D3DPT_LINESTRIP ? D3D_PRIMITIVE_TOPOLOGY_LINESTRIP
+                                                         : draw_type == D3DPT_TRIANGLESTRIP ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
   ID3D12GraphicsCommandList_OMSetStencilRef(list, d->state.rs[D3DRS_STENCILREF] & 0xFF);
   {
     /* (D3DRS_BLENDFACTOR: a D3DCOLOR, alpha in the top byte) */
@@ -977,7 +1018,7 @@ static HRESULT draw(Dev *d, D3DPRIMITIVETYPE type, UINT primitives, const Source
     const float factor[4] = {((c >> 16) & 0xFF) / 255.0f, ((c >> 8) & 0xFF) / 255.0f, (c & 0xFF) / 255.0f, (c >> 24) / 255.0f};
     ID3D12GraphicsCommandList_OMSetBlendFactor(list, factor);
   }
-  D3D12_VERTEX_BUFFER_VIEW vertex_view = {ID3D12Resource_GetGPUVirtualAddress(d->vertex_ring) + vertex_at, vertices * stride, stride};
+  D3D12_VERTEX_BUFFER_VIEW vertex_view = {ID3D12Resource_GetGPUVirtualAddress(d->vertex_ring) + (flat ? flat_at : vertex_at), (flat ? flat_vertices : vertices) * stride, stride};
   ID3D12GraphicsCommandList_IASetVertexBuffers(list, 0, 1, &vertex_view);
   ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(list, 0, constants_of(d, &layout, vs, ps, d->state.ps == NULL));
   if (blend) {
@@ -988,7 +1029,9 @@ static HRESULT draw(Dev *d, D3DPRIMITIVETYPE type, UINT primitives, const Source
   D3D12_GPU_DESCRIPTOR_HANDLE views = {d->table_views}, samplers = {d->table_samplers};
   ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(list, 1, views);
   ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(list, 2, samplers);
-  if (out_indices) {
+  if (flat) {
+    ID3D12GraphicsCommandList_DrawInstanced(list, flat_vertices, 1, 0, 0);
+  } else if (out_indices) {
     D3D12_INDEX_BUFFER_VIEW index_view = {ID3D12Resource_GetGPUVirtualAddress(d->index_ring) + index_at, out_indices * 4, DXGI_FORMAT_R32_UINT};
     ID3D12GraphicsCommandList_IASetIndexBuffer(list, &index_view);
     ID3D12GraphicsCommandList_DrawIndexedInstanced(list, out_indices, 1, 0, 0, 0);

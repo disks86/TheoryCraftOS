@@ -288,6 +288,20 @@ static void test_to_argb() {
   CHECK(dd_to_argb(&p.im, &r, out, sizeof out, 8, 1, 3, 3) == DD_PIX_OK);
   CHECK(out[0] == 0x33 && out[1] == 0x22 && out[2] == 0x11 && out[3] == 0x00 && out[7] == 0xFF);      // (keyed: alpha 0; the other opaque)
   CHECK(dd_to_argb(&p.im, &r, out, 7, 8, 0, 0, 0) == DD_PIX_BAD_IMAGE);      // (an output a byte short)
+  // a key of a format with alpha compares the alpha too (Wine's test_ck_rgba); an unkeyed texel of alpha 0 becomes 1, so alpha 0 means keyed
+  {
+    Image a(DD_FMT_A8R8G8B8, 3, 1);
+    dd_put_raw(&a.im, 0, 0, 0xFF00FF00u); dd_put_raw(&a.im, 1, 0, 0x7F00FF00u); dd_put_raw(&a.im, 2, 0, 0x00123456u);
+    uint8_t keyed[12];
+    DdRect ar = R(0, 0, 3, 1);
+    CHECK(dd_to_argb(&a.im, &ar, keyed, sizeof keyed, 12, 1, 0xFF00FF00u, 0xFF00FF00u) == DD_PIX_OK);
+    CHECK(keyed[3] == 0x00 && keyed[1] == 0xFF && keyed[7] == 0x7F && keyed[11] == 0x01 && keyed[8] == 0x56);
+    CHECK(dd_to_argb(&a.im, &ar, keyed, sizeof keyed, 12, 0, 0, 0) == DD_PIX_OK && keyed[11] == 0x00);      // (no key: alpha as it is)
+    Image x(DD_FMT_X8R8G8B8, 1, 1);
+    dd_put_raw(&x.im, 0, 0, 0x0000FF00u);
+    DdRect xr = R(0, 0, 1, 1);
+    CHECK(dd_to_argb(&x.im, &xr, keyed, sizeof keyed, 4, 1, 0xFF00FF00u, 0xFF00FF00u) == DD_PIX_OK && keyed[3] == 0x00);      // (no alpha bits: they are not compared)
+  }
   Image z(DD_FMT_D16, 1, 1);
   r = R(0, 0, 1, 1);
   CHECK(dd_to_argb(&z.im, &r, out, sizeof out, 4, 0, 0, 0) == DD_PIX_UNSUPPORTED);

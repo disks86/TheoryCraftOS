@@ -70,6 +70,30 @@ static DWORD indexed_vertex_count(const WORD *indices, DWORD index_count, DWORD 
   return top > vertex_count ? top : vertex_count;
 }
 
+/* Transformed vertices (`count`, `stride` bytes apart, z at byte 8) as they are drawn: with the z test off they are not clipped by their depth (Windows,
+ * and wined3d's depth clamp: Wine's test_zenable draws z from -0.5 to 1.5), so where one is outside [0, 1] a copy in scratch buffer `slot` with z
+ * clamped to it - which nothing then tests or writes. The vertices themselves otherwise; NULL if out of memory. */
+static const BYTE *transformed_z_clamped(D3dDevice *dev, UINT slot, const BYTE *vertices, DWORD count, DWORD stride) {
+  if (dev->st.rs[D3DRENDERSTATE_ZENABLE] != D3DZB_FALSE || stride < 12) return vertices;
+  BOOL outside = FALSE;
+  for (DWORD v = 0; v < count && !outside; ++v) {
+    float z;
+    memcpy(&z, vertices + (SIZE_T)v * stride + 8, sizeof z);
+    outside = !(z >= 0.0f && z <= 1.0f);
+  }
+  if (!outside) return vertices;
+  BYTE *copy = d3_scratch(dev->dd3, slot, (SIZE_T)count * stride);
+  if (!copy) return NULL;
+  memcpy(copy, vertices, (SIZE_T)count * stride);
+  for (DWORD v = 0; v < count; ++v) {
+    float z;
+    memcpy(&z, copy + (SIZE_T)v * stride + 8, sizeof z);
+    z = z >= 0.0f ? (z <= 1.0f ? z : 1.0f) : 0.0f;      /* (a NaN becomes 0) */
+    memcpy(copy + (SIZE_T)v * stride + 8, &z, sizeof z);
+  }
+  return copy;
+}
+
 /* Draws vertices as Direct3D 9 takes them (Direct3D 7's vertices, and transformed vertices of every version). */
 static HRESULT draw_direct(D3dDevice *dev, DWORD type, DWORD fvf, const BYTE *vertices, DWORD vertex_count, const WORD *indices, DWORD index_count, DWORD flags) {
   if (!primitive_type_ok(type)) return DDERR_INVALIDPARAMS;
@@ -84,9 +108,14 @@ static HRESULT draw_direct(D3dDevice *dev, DWORD type, DWORD fvf, const BYTE *ve
   IDirect3DVertexDeclaration9 *decl = d3_decl(dev->dd3, fvf);
   if (!decl) return DDERR_INVALIDPARAMS;
   D3D_CALL(d9, SetVertexDeclaration, decl);
+  const DWORD used = indices ? indexed_vertex_count(indices, index_count, vertex_count) : vertex_count;
+  if ((fvf & D3DFVF_POSITION_MASK) == D3DFVF_XYZRHW) {
+    vertices = transformed_z_clamped(dev, 2, vertices, used, stride);
+    if (!vertices) return DDERR_OUTOFMEMORY;
+  }
   if (dev->st.rs[D3DRENDERSTATE_ZVISIBLE] && dev->occlusion) D3D_CALL(dev->occlusion, Issue, 2 /* D3DISSUE_BEGIN */);
   if (indices) {
-    const DWORD n = indexed_vertex_count(indices, index_count, vertex_count);
+    const DWORD n = used;
     hr = D3D_CALL(d9, DrawIndexedPrimitiveUP, type, 0, n, prims, indices, D3DFMT_INDEX16, vertices, stride);
     if (dev->version >= 7) clip_status_ff(dev, fvf, vertices, stride, n, flags);
   } else {
@@ -182,8 +211,10 @@ static HRESULT draw_processed(D3dDevice *dev, const DlTransform *t, DWORD type, 
     BYTE *out = d3_scratch(d, 1, (SIZE_T)count * stride);
     if (!out) return DDERR_OUTOFMEMORY;
     dl_project_fvf(t, out_fvf, cv, count, dl_bytes(out, (SIZE_T)count * stride));
-    if (indices) hr = D3D_CALL(d9, DrawIndexedPrimitiveUP, type, 0, count, prims, indices, D3DFMT_INDEX16, out, stride);
-    else hr = D3D_CALL(d9, DrawPrimitiveUP, type, prims, out, stride);
+    const BYTE *drawn = transformed_z_clamped(dev, 2, out, count, stride);
+    if (!drawn) return DDERR_OUTOFMEMORY;
+    if (indices) hr = D3D_CALL(d9, DrawIndexedPrimitiveUP, type, 0, count, prims, indices, D3DFMT_INDEX16, drawn, stride);
+    else hr = D3D_CALL(d9, DrawPrimitiveUP, type, prims, drawn, stride);
   } else {
     Assembly a;
     zero(&a, sizeof a);

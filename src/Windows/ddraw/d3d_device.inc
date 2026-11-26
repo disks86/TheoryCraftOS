@@ -259,9 +259,7 @@ static HRESULT dv_set_render_target(D3dDevice *dev, Surface *target, IUnknown *i
   IUnknown_AddRef(iface);
   IUnknown *old = dev->rt_iface;
   dev->rt_iface = iface;
-  dev->target = target;
-  dev->st.rs[D3DRENDERSTATE_ZENABLE] = attached_depth(target) ? D3DZB_TRUE : D3DZB_FALSE;
-  MASK_SET(dev->dirty.rs, D3DRENDERSTATE_ZENABLE);
+  dev->target = target;      /* (ZENABLE stays as the program set it: Wine binds the new target's depth buffer and leaves the state, test_viewport) */
   if (old) IUnknown_Release(old);
   return D3D_OK;
 }
@@ -450,9 +448,10 @@ static HRESULT dv_set_current_viewport(D3dDevice *dev, D3dViewport *vp) {
   return D3D_OK;
 }
 static HRESULT dv_get_current_viewport(D3dDevice *dev, D3dViewport **out) {
+  /* (no current viewport comes first, and leaves the pointer as it was: Wine's test_viewport_object of Direct3D 2 and 3) */
+  if (!dev->current_viewport) return D3DERR_NOCURRENTVIEWPORT;
   if (!out) return DDERR_INVALIDPARAMS;
   *out = dev->current_viewport;
-  if (!*out) return D3DERR_NOCURRENTVIEWPORT;
   IDirect3DViewport3_AddRef((IDirect3DViewport3 *)*out);
   return D3D_OK;
 }

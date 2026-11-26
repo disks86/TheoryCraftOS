@@ -874,6 +874,7 @@ DL_API void dl_light_vertex(const DlTransform *t, const DlLighting *l, const flo
     if (!(facing > 0.0f)) continue;
     for (int i = 0; i < 3; ++i) diffuse_sum[i] += weight * facing * light->diffuse[i];
     if (!l->specular) continue;
+    if (l->legacy && !(l->material.power > 0.0f)) continue;      /* (Direct3D 1-3: a power of 0 has no highlight - Wine's test_specular_lighting) */
     float half[3] = {to_light[0] + to_viewer[0], to_light[1] + to_viewer[1], to_light[2] + to_viewer[2]};
     ffl_normalize(half);
     const float shine = ffl_dot(n, half);
@@ -1215,7 +1216,8 @@ DL_API DlResult dl_transform_vertices(const DlTransform *t, uint32_t count, DlCo
     dl_to_screen(&t->viewport, c, &s[0], &s[1], &s[2], &s[3]);
     dl_write(out, to, s, sizeof s);
     const uint32_t rest_in = in_stride > 16 ? in_stride - 16 : 0, rest_out = out_stride - 16;
-    const uint32_t rest = rest_in < rest_out ? rest_in : rest_out;
+    uint32_t rest = rest_in < rest_out ? rest_in : rest_out;
+    if (rest > 16) rest = 16;      /* (four numbers of the vertex's other data are copied, no more - Wine's test_transform_vertices) */
     if (rest) dl_copy(out, to + 16, in, at + 16, rest);
   }
   if (offscreen) *offscreen = all;
@@ -1799,8 +1801,8 @@ DL_API DlResult dl_find_device(const DlCaps9 *c, unsigned version, const DlFindD
     if ((f & DL_FDS_TEXTUREFILTERCAPS) && !dl_caps_have(have->dwTextureFilterCaps, want->dwTextureFilterCaps)) continue;
     if ((f & DL_FDS_TEXTUREBLENDCAPS) && !dl_caps_have(have->dwTextureBlendCaps, want->dwTextureBlendCaps)) continue;
     if ((f & DL_FDS_TEXTUREADDRESSCAPS) && !dl_caps_have(have->dwTextureAddressCaps, want->dwTextureAddressCaps)) continue;
+    /* (as much of the version's description as the slot holds; its dwSize stays the version's - Wine's test_find_device) */
     const uint32_t desc_size = slot < hal.dwSize ? slot : hal.dwSize;
-    hal.dwSize = hel.dwSize = desc_size;
     dl_write(result, 4, dl_device_guid(kind), 16);
     dl_copy(result, 20, dl_const_bytes(&hal, sizeof hal), 0, desc_size);
     dl_copy(result, 20 + slot, dl_const_bytes(&hel, sizeof hel), 0, desc_size);

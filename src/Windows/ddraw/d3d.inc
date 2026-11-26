@@ -58,6 +58,7 @@
 #define D9_TS_TEXTURE0 16u
 #define D9_TS_WORLD 256u
 #define D9_RS_ALPHATESTENABLE 15u
+#define D9_TSS_KEY_KILL 33u            /* d3d9.dll's own stage state (TCOS_TSS_KEY_KILL): a texel of alpha 0 takes the pixel away */
 #define D9_RS_ALPHAREF 24u
 #define D9_RS_ALPHAFUNC 25u
 #define D9_RS_CMP_GREATER 5u
@@ -271,7 +272,7 @@ struct D3dDevice {
   /* Direct3D 9 objects of the device */
   DWORD bound_stamp[D3D_STAGES];  /* the texture copies Direct3D 9 has bound (D3dDD.tex_stamp when bound) */
   D3dRes *bound_res[D3D_STAGES];
-  BOOL bound_keyed_test;         /* the alpha test set for colour keying */
+  UINT bound_key_kill;           /* bit n: stage n's TCOS_TSS_KEY_KILL is set in Direct3D 9 (~0: not known) */
   IDirect3DQuery9 *occlusion;    /* D3DRENDERSTATE_ZVISIBLE */
   /* Direct3D 1: the processed vertices of execute buffers (D3DTLVERTEX) and their clip-space forms */
   BYTE *tl;

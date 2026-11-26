@@ -136,7 +136,7 @@ the fan on the screen with `dl_tl_from_clip` / `dl_project_fvf` and draw it. Poi
 **IDirect3DViewport::TransformVertices**: `dl_transform_vertices(t, count, in, in_stride, out, out_stride, hout, hout_count, flags,
 &offscreen)` with the viewport's transform. As Windows does (Wine's tests): clip codes are worked out with D3DTRANSFORM_CLIPPED or
 UNCLIPPED; with CLIPPED a clipped vertex gets clip-space x y z w in `lpOut` instead of screen coordinates, `lpHOut` gets its codes and x y z
-before the viewport's clip space, and `*offscreen` is the codes every vertex shares; the bytes after the first 16 of each input vertex are
+before the viewport's clip space, and `*offscreen` is the codes every vertex shares; the next 16 bytes of each input vertex (no more, and no more than both strides hold) are
 copied to the output. DDERR_INVALIDPARAMS for neither flag, a missing lpHOut with CLIPPED, or views too small. (LightElements is
 DDERR_UNSUPPORTED, as in Wine.)
 
@@ -159,7 +159,7 @@ the four material sources, vertex fog (mode, start, end, density, range fog), an
 (`DlLightEntry`). `dl_lighting_init` sets each version's starting values.
 
 The model (both versions): colour = emissive + ambient * (global + sum of light ambients) + diffuse * sum(att * spot * max(N.L, 0) * light
-diffuse); specular = specular * sum(att * spot * (N.H)^power * light specular) for lights with N.L > 0 when SPECULARENABLE is on; H half way
+diffuse); specular = specular * sum(att * spot * (N.H)^power * light specular) for lights with N.L > 0 when SPECULARENABLE is on (Direct3D 1-3: none for a power of 0); H half way
 between L and the direction to the camera (from the vertex with a local viewer). The differences of Direct3D 1-3:
 
 - **attenuation** of point and spot lights is `a0 + a1 r + a2 r^2` with `r = (range - d) / range` (multiplied, not divided; a0 = 0, a1 = 1
@@ -229,7 +229,7 @@ Ramp for 1 and 2; T&L HAL for 7 only. MMX and Ramp devices are drawn as RGB (as 
 DDERR_INVALIDPARAMS. It goes through the version's list (1: HAL, RGB, Ramp; 2: HAL, MMX, RGB, Ramp; 3: HAL, RGB) and takes the first device
 that matches the GUID (D3DFDS_GUID), hardware or not (D3DFDS_HARDWARE), the colour model and every caps field the flags name (in the line caps
 with D3DFDS_LINES, else the triangle caps; of the hardware description for the HAL, the software one otherwise). The result gets the
-device's GUID and its two descriptions at the offsets of the result's size. DDERR_NOTFOUND when nothing matches. (Wine returns its own GUID
+device's GUID and its two descriptions at the offsets of the result's size, as much of each as fits, with the dwSize of the version's description. DDERR_NOTFOUND when nothing matches. (Wine returns its own GUID
 and ignores the caps; this is Windows' behaviour.)
 
 ## States

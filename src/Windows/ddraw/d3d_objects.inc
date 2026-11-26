@@ -206,7 +206,7 @@ static ULONG STDMETHODCALLTYPE vp_Release(IDirect3DViewport3 *i) {
 static HRESULT STDMETHODCALLTYPE vp_Initialize(IDirect3DViewport3 *i, IDirect3D *d3d) { (void)i; (void)d3d; return DDERR_ALREADYINITIALIZED; }
 static HRESULT STDMETHODCALLTYPE vp_GetViewport(IDirect3DViewport3 *i, D3DVIEWPORT *out) {
   D3dViewport *vp = (D3dViewport *)i;
-  if (!out) return DDERR_INVALIDPARAMS;
+  if (!out || out->dwSize != DL_VIEWPORT1_SIZE) return DDERR_INVALIDPARAMS;
   dd_lock();
   HRESULT hr = D3D_OK;
   if (!vp->set) hr = D3DERR_VIEWPORTDATANOTSET;
@@ -425,7 +425,7 @@ static HRESULT STDMETHODCALLTYPE vp_NextLight(IDirect3DViewport3 *i, IDirect3DLi
 }
 static HRESULT STDMETHODCALLTYPE vp_GetViewport2(IDirect3DViewport3 *i, D3DVIEWPORT2 *out) {
   D3dViewport *vp = (D3dViewport *)i;
-  if (!out) return DDERR_INVALIDPARAMS;
+  if (!out || out->dwSize != DL_VIEWPORT2_SIZE) return DDERR_INVALIDPARAMS;
   dd_lock();
   HRESULT hr = D3D_OK;
   if (!vp->set) hr = D3DERR_VIEWPORTDATANOTSET;
@@ -513,8 +513,7 @@ static HRESULT STDMETHODCALLTYPE eb_Unlock(IDirect3DExecuteBuffer *i) {
 static HRESULT STDMETHODCALLTYPE eb_SetExecuteData(IDirect3DExecuteBuffer *i, D3DEXECUTEDATA *data) {
   D3dExecuteBuffer *eb = (D3dExecuteBuffer *)i;
   if (!data || data->dwSize != DL_EXECUTEDATA_SIZE) return DDERR_INVALIDPARAMS;
-  const HRESULT hr = dl_execute_data_check((const DlExecuteData *)data, eb->size);
-  if (hr != DL_OK) return hr;
+  /* (only the size is checked here: the offsets and counts are Execute's to check - Wine's test_execute_data) */
   dd_lock();
   memcpy(&eb->data, data, DL_EXECUTEDATA_SIZE);
   dd_unlock();
@@ -662,7 +661,8 @@ static HRESULT d3_run(D3dDevice *dev, D3dExecuteBuffer *eb, const D3DRECT *pick)
             zvisible = TRUE;
           }
           if (zvisible && dev->occlusion) D3D_CALL(dev->occlusion, Issue, 2);
-          D3D_CALL(d9, DrawPrimitiveUP, out_type, prims, a.out, DL_VERTEX_SIZE);
+          const BYTE *drawn = transformed_z_clamped(dev, 2, a.out, a.count, DL_VERTEX_SIZE);
+          if (drawn) D3D_CALL(d9, DrawPrimitiveUP, out_type, prims, drawn, DL_VERTEX_SIZE);
           if (zvisible && dev->occlusion) {
             D3D_CALL(dev->occlusion, Issue, 1);
             DWORD visible = 0;

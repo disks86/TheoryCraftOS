@@ -54,6 +54,7 @@ typedef struct FfsStage {
   uint8_t alpha_op, alpha_arg[3];
   uint8_t to_temp;                      /* the result goes to the temporary register, not on to the next stage (D3DTSS_RESULTARG) */
   uint8_t sample;                       /* (ffs_normalize says) the stage looks up its texture */
+  uint8_t kill;                         /* a texel of alpha 0 takes the pixel away (DirectDraw's colour key: TCOS_TSS_KEY_KILL); the stage samples */
 } FfsStage;
 /* All of a pixel shader made here: two shaders of the same key are the same shader. */
 typedef struct FfsKey {
@@ -109,7 +110,8 @@ static void ffs_normalize(FfsKey *key, unsigned textured) {
     ffs_normalize_half(&s->colour_op, s->colour_arg, has);
     ffs_normalize_half(&s->alpha_op, s->alpha_arg, has);
     s->to_temp = s->to_temp ? 1 : 0;
-    s->sample = (uint8_t)(ffs_reads_texture(s->colour_op, s->colour_arg) || ffs_reads_texture(s->alpha_op, s->alpha_arg));
+    s->kill = (uint8_t)(s->kill && has);
+    s->sample = (uint8_t)(s->kill || ffs_reads_texture(s->colour_op, s->colour_arg) || ffs_reads_texture(s->alpha_op, s->alpha_arg));
     ++count;
   }
   key->stages = (uint8_t)count;
@@ -122,7 +124,8 @@ static void ffs_normalize(FfsKey *key, unsigned textured) {
  * an argument that is 1 - something, r6 the stage's result before it is clamped, r7 .. r9 what an operation needs for itself. */
 enum { FFS_R_CURRENT = 0, FFS_R_TEMP, FFS_R_TEXEL, FFS_R_ARGUMENT, FFS_R_RESULT = 6, FFS_R_SCRATCH };
 enum { FFS_T_TEMP = 0, FFS_T_INPUT = 1, FFS_T_CONST = 2, FFS_T_COORDINATE = 3, FFS_T_COLOUR_OUT = 8, FFS_T_SAMPLER = 10 };
-enum { FFS_I_MOV = 1, FFS_I_ADD = 2, FFS_I_SUB = 3, FFS_I_MAD = 4, FFS_I_MUL = 5, FFS_I_DP3 = 8, FFS_I_LRP = 18, FFS_I_DCL = 31, FFS_I_TEXLD = 66, FFS_I_DEF = 81 };
+enum { FFS_I_MOV = 1, FFS_I_ADD = 2, FFS_I_SUB = 3, FFS_I_MAD = 4, FFS_I_MUL = 5, FFS_I_DP3 = 8, FFS_I_LRP = 18, FFS_I_DCL = 31, FFS_I_TEXKILL = 65, FFS_I_TEXLD = 66,
+       FFS_I_DEF = 81 };
 #define FFS_XYZW 0xE4u
 #define FFS_WWWW 0xFFu
 #define FFS_HALF 0x00u                  /* c1: 0.5, 1, 4, 0 */
@@ -281,6 +284,13 @@ static size_t ffs_tokens(const FfsKey *key, uint32_t *out, size_t capacity) {
       ffs_put(w, ffs_register(FFS_T_TEMP, FFS_R_TEXEL) | (0xFu << 16));
       ffs_put(w, ffs_source_token(ffs_source(FFS_T_COORDINATE, n, FFS_XYZW)));
       ffs_put(w, ffs_source_token(ffs_source(FFS_T_SAMPLER, n, FFS_XYZW)));
+    }
+    if (s->kill) {      /* alpha * 256 - 0.5: below 0 for alpha 0 only (the smallest other alpha is 1/255) - then texkill */
+      ffs_instruction(w, FFS_I_MUL, FFS_R_SCRATCH, 0xF, 0, 2, ffs_source(FFS_T_TEMP, FFS_R_TEXEL, FFS_WWWW), ffs_number(FFS_FOUR), none);
+      for (unsigned k = 0; k < 3; ++k) ffs_instruction(w, FFS_I_MUL, FFS_R_SCRATCH, 0xF, 0, 2, ffs_temp(FFS_R_SCRATCH), ffs_number(FFS_FOUR), none);
+      ffs_instruction(w, FFS_I_SUB, FFS_R_SCRATCH, 0xF, 0, 2, ffs_temp(FFS_R_SCRATCH), ffs_number(FFS_HALF), none);
+      ffs_put(w, FFS_I_TEXKILL | (1u << 24));
+      ffs_put(w, ffs_register(FFS_T_TEMP, FFS_R_SCRATCH) | (0xFu << 16));
     }
     ffs_half(w, n, s->colour_op, s->colour_arg, 0x7, 0);
     ffs_half(w, n, s->alpha_op, s->alpha_arg, 0x8, 1);

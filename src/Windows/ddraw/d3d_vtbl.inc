@@ -23,6 +23,39 @@
 #define D3D2O(i) D3D_IMPL(DDraw, vt_d3d2, i)
 #define D3D1O(i) D3D_IMPL(DDraw, vt_d3d1, i)
 
+/* What Windows' runtime gives in EnumDevices of Direct3D 1-3 besides the caps (Wine's test_enum_devices records it, and marks Wine's answers
+ * todo): the software devices' hardware description is empty but for the sizes of its parts; their software description has these flags and
+ * device caps; the HAL's software description has the flags of its colour model, caps, transform, lighting and clipping only, the caps of
+ * transformed vertices in floats, no lights, no primitive caps, no depths and no texture or stipple sizes. */
+static void enum_desc_windows(int kind, DlDeviceDesc *hal, DlDeviceDesc *hel) {
+  if (kind != DL_DEVICE_HAL) {
+    const uint32_t size = hal->dwSize;
+    zero(hal, sizeof *hal);
+    hal->dwSize = size;
+    hal->dtcTransformCaps.dwSize = sizeof(D3DTRANSFORMCAPS);
+    hal->dlcLightingCaps.dwSize = sizeof(D3DLIGHTINGCAPS);
+    hal->dpcLineCaps.dwSize = sizeof(D3DPRIMCAPS);
+    hal->dpcTriCaps.dwSize = sizeof(D3DPRIMCAPS);
+    hel->dwFlags = D3DDD_COLORMODEL | D3DDD_DEVCAPS | D3DDD_TRANSFORMCAPS | D3DDD_LIGHTINGCAPS | D3DDD_BCLIPPING | D3DDD_TRICAPS | D3DDD_DEVICERENDERBITDEPTH |
+                   D3DDD_DEVICEZBUFFERBITDEPTH | D3DDD_MAXBUFFERSIZE | D3DDD_MAXVERTEXCOUNT;
+    hel->dwDevCaps = D3DDEVCAPS_FLOATTLVERTEX | D3DDEVCAPS_SORTINCREASINGZ | D3DDEVCAPS_SORTEXACT | D3DDEVCAPS_EXECUTESYSTEMMEMORY | D3DDEVCAPS_TLVERTEXSYSTEMMEMORY |
+                     D3DDEVCAPS_TEXTURESYSTEMMEMORY | D3DDEVCAPS_DRAWPRIMTLVERTEX;
+    return;
+  }
+  hel->dwFlags = D3DDD_COLORMODEL | D3DDD_DEVCAPS | D3DDD_TRANSFORMCAPS | D3DDD_LIGHTINGCAPS | D3DDD_BCLIPPING;
+  hel->dwDevCaps = D3DDEVCAPS_FLOATTLVERTEX;
+  hel->dlcLightingCaps.dwNumLights = 0;
+  zero(&hel->dpcLineCaps, sizeof hel->dpcLineCaps);
+  zero(&hel->dpcTriCaps, sizeof hel->dpcTriCaps);
+  hel->dpcLineCaps.dwSize = hel->dpcTriCaps.dwSize = sizeof(D3DPRIMCAPS);
+  hel->dwDeviceRenderBitDepth = hel->dwDeviceZBufferBitDepth = 0;
+  hel->dwMaxVertexCount = hal->dwMaxVertexCount;
+  if (hel->dwSize > DL_DEVICEDESC_V1_SIZE) {
+    hel->dwMinTextureWidth = hel->dwMinTextureHeight = hel->dwMaxTextureWidth = hel->dwMaxTextureHeight = 0;
+    hel->dwMinStippleWidth = hel->dwMinStippleHeight = hel->dwMaxStippleWidth = hel->dwMaxStippleHeight = 0;
+  }
+}
+
 /* EnumDevices of Direct3D 1, 2 and 3: each device's GUID, description, name and its hardware and software descriptions (in the version's size). */
 static HRESULT d3_enum_devices(DDraw *dd, UINT version, LPD3DENUMDEVICESCALLBACK cb, void *ctx) {
   if (!cb) return DDERR_INVALIDPARAMS;
@@ -35,6 +68,7 @@ static HRESULT d3_enum_devices(DDraw *dd, UINT version, LPD3DENUMDEVICESCALLBACK
     if (kind == DL_DEVICE_NONE) break;
     DlDeviceDesc hal, hel;
     dl_device_descs(caps, kind, version, &hal, &hel);
+    enum_desc_windows(kind, &hal, &hel);
     /* (writable copies: programs have written into the strings - Tomb Raider 3, Wine's note) */
     char name[64], description[128];
     lstrcpynA(name, dl_device_name(kind), sizeof name);
