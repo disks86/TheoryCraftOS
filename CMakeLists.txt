@@ -1513,7 +1513,7 @@ if(TCOS_ARCH STREQUAL "x86_64")
     COMMENT "Building ws2_32.dll")
   # The other system libraries of Windows (user32.dll, gdi32.dll ...): files with every export in place, none of them implemented yet. They are only stubs (see above).
   set(WINDOWS_STUB_LIBRARIES user32 gdi32 shell32 ole32 oleaut32 comctl32 comdlg32 rpcrt4 shlwapi winmm version imm32 secur32 crypt32 bcrypt ncrypt userenv setupapi iphlpapi
-      dbghelp psapi wininet winhttp wintrust netapi32 dwmapi uxtheme mswsock gdiplus msimg32 opengl32 glu32 dnsapi mpr wtsapi32 powrprof cfgmgr32 d3d9 d3d11 d3d12 dxgi dwrite shcore
+      dbghelp psapi wininet winhttp wintrust netapi32 dwmapi uxtheme mswsock gdiplus msimg32 opengl32 glu32 dnsapi mpr wtsapi32 powrprof cfgmgr32 d3d9 d3d8 d3d11 d3d12 dxgi dwrite shcore
       vulkan-1 avrt winspool wevtapi pdh wldap32 urlmon msi propsys hid usp10 winscard odbc32 xinput1_4 dsound dinput8 d2d1 d3dcompiler_47 lz32 oleacc oledlg credui ntdsapi samlib
       activeds normaliz sensapi authz rasapi32
       bcryptprimitives combase mfplat mf mfreadwrite dcomp uiautomationcore dhcpcsvc esent mmdevapi ndfapi tbs winusb cryptui bthprops xaudio2_9 xaudio2_8 shfolder msxml3 msxml6 cabinet)
@@ -1531,6 +1531,7 @@ if(TCOS_ARCH STREQUAL "x86_64")
   set(WINDOWS_IMPORTS_dxgi gdi32 user32)      # (the D3DKMT thunks, the display size and the window's device context)
   set(WINDOWS_IMPORTS_d3d12 gdi32)      # (the D3DKMT thunks of the kernel's Direct3D)
   set(WINDOWS_IMPORTS_d3d9 d3d12 gdi32 user32)      # (Direct3D 9 is a layer on d3d12.dll; gdi32 and user32 to put the picture into the window)
+  set(WINDOWS_IMPORTS_d3d8 d3d9)      # (Direct3D 8 is a layer on d3d9.dll's interfaces)
   set(WINDOWS_IMPORTS_d3d11 d3d12 dxgi gdi32)      # (Direct3D 11 is a layer on d3d12.dll; dxgi for the adapter and the swap chain; gdi32 for D3DKMT forwarders)
   set(WINDOWS_IMPORTS_shcore advapi32 ole32 win32u)      # (the registry, CoTaskMemAlloc, the DPI services of win32k)
   set(WINDOWS_IMPORTS_oleaut32 advapi32)      # (type library registration in the registry)
@@ -1864,7 +1865,7 @@ if(TCOS_ARCH STREQUAL "x86_64" AND MKFS_FAT AND TCOS_HOST_CXX)
   find_program(TCOS_WOW64_CC i686-w64-mingw32-gcc)
   # (the same list, in the order of building, is LIBRARIES in scripts/build-wow64-dlls.sh)
   set(WOW64_LIBRARIES ntdll kernel32 msvcrt advapi32 win32u gdi32 user32 comctl32 version oleaut32 ole32 shlwapi shcore shell32
-      rpcrt4 secur32 bcrypt crypt32 ncrypt userenv setupapi iphlpapi psapi wininet winhttp wintrust netapi32 dwmapi uxtheme mswsock gdiplus msimg32 opengl32 glu32 dnsapi mpr wtsapi32 powrprof cfgmgr32 d3d9 d3d11 d3d12 dxgi dwrite avrt winspool wevtapi pdh winmm dsound mmdevapi xaudio2_8 xaudio2_9 imm32 dbghelp wldap32 urlmon msi propsys hid usp10 winscard odbc32 xinput1_4 dinput8 d2d1 d3dcompiler_47 lz32 oleacc oledlg credui ntdsapi samlib activeds normaliz sensapi authz rasapi32 bcryptprimitives combase mfplat mf mfreadwrite dcomp uiautomationcore dhcpcsvc esent ndfapi tbs winusb cryptui bthprops comdlg32 ws2_32 shfolder msxml3 msxml6 cabinet)
+      rpcrt4 secur32 bcrypt crypt32 ncrypt userenv setupapi iphlpapi psapi wininet winhttp wintrust netapi32 dwmapi uxtheme mswsock gdiplus msimg32 opengl32 glu32 dnsapi mpr wtsapi32 powrprof cfgmgr32 d3d9 d3d8 d3d11 d3d12 dxgi dwrite avrt winspool wevtapi pdh winmm dsound mmdevapi xaudio2_8 xaudio2_9 imm32 dbghelp wldap32 urlmon msi propsys hid usp10 winscard odbc32 xinput1_4 dinput8 d2d1 d3dcompiler_47 lz32 oleacc oledlg credui ntdsapi samlib activeds normaliz sensapi authz rasapi32 bcryptprimitives combase mfplat mf mfreadwrite dcomp uiautomationcore dhcpcsvc esent ndfapi tbs winusb cryptui bthprops comdlg32 ws2_32 shfolder msxml3 msxml6 cabinet)
   set(_wow64_outputs "")
   if(TCOS_WOW64_CC)
     set(WOW64_DIR ${CMAKE_BINARY_DIR}/windows32)

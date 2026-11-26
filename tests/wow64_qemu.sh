@@ -14,6 +14,9 @@
 #            textures, depth, blending, a swap chain on a window. The same source built for x86-64 tests the 64-bit library.
 #   d3d9test  tests/windows/d3d9test.c: Direct3D 9 (d3d9.dll: the fixed-function pipeline and a program's own shaders, a layer on d3d12.dll) - a device on a window, draws read
 #            back, buffers, textures and their stages, blending, depth, a texture drawn into, Present, Reset. Also built for x86-64.
+#   d3d8test  tests/windows/d3d8test.c: Direct3D 8 (d3d8.dll, a layer on d3d9.dll's interfaces) - Direct3D 8's references and identities, draws read back
+#            (FVF vertices, buffers with SetIndices' base vertex index, a vertex shader of D3DVSD tokens, pixel shaders 1.0 and 1.1), state blocks by
+#            handle, CopyRects, Reset. Also built for x86-64 (tests/d3d12_qemu.sh d3d8test).
 #   com32    tests/windows/com32.c: COM between processes (docs/WindowsCom.md) - the program starts itself as a local server and as a service by creating
 #            objects of their classes, and calls them: numbers, strings, VARIANTs, objects, callbacks, several threads. Needs widl and windres.
 #   com64    the same source built for x86-64 (the one 64-bit program here: the code that passes calls on is different for each processor).
@@ -27,14 +30,14 @@
 # autorun. Needs i686-w64-mingw32-gcc.
 #   share32  tests/windows/d3dsharetest.c: Direct3D shared handles - resources, heaps and fences between two devices and with a second process that inherits the
 #            handles, and gdi32's D3DKMT sharing functions with a 32-bit program's structures.
-# Usage: tests/wow64_qemu.sh [hello32] [crt32] [seh32] [gui32] [lib32] [old32] [dx32] [d3d11test] [d3d9test] [com32] [com64] [xml32] [cab32] [cab64] [share32] [d3d12videotest] [d3d11videotest] [d3d12encodetest] [d3d12encodecodectest]      (no arguments: all)
+# Usage: tests/wow64_qemu.sh [hello32] [crt32] [seh32] [gui32] [lib32] [old32] [dx32] [d3d11test] [d3d9test] [d3d8test] [com32] [com64] [xml32] [cab32] [cab64] [share32] [d3d12videotest] [d3d11videotest] [d3d12encodetest] [d3d12encodecodectest]      (no arguments: all)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 build=${BUILD:-build-wow64-qemu}
 work=${TMPDIR:-/tmp}/tcos-wow64-qemu
 rm -rf "$work"; mkdir -p "$work"
 programs=("$@")
-[ ${#programs[@]} -eq 0 ] && programs=(hello32 crt32 seh32 gui32 lib32 old32 dx32 d3d11test d3d9test com32 com64 xml32 cab32 cab64 share32 d3d12videotest d3d11videotest d3d12encodetest d3d12encodecodectest)
+[ ${#programs[@]} -eq 0 ] && programs=(hello32 crt32 seh32 gui32 lib32 old32 dx32 d3d11test d3d9test d3d8test com32 com64 xml32 cab32 cab64 share32 d3d12videotest d3d11videotest d3d12encodetest d3d12encodecodectest)
 i686-w64-mingw32-gcc -O1 -ffreestanding -nostdlib -Isrc/Windows -Wl,--entry=_start32 -Wl,--subsystem,console -o "$work/hello32.exe" tests/windows/hello32.c
 i686-w64-mingw32-gcc -O1 -o "$work/crt32.exe" tests/windows/crt32.c
 i686-w64-mingw32-gcc -O1 -shared -o "$work/plug32.dll" tests/windows/plug32.c      # (a library crt32 loads while it runs)
@@ -55,6 +58,7 @@ PY
 i686-w64-mingw32-gcc -O1 -I "$work" -o "$work/dx32.exe" tests/windows/dx32.c -ldxgi -ld3d12 -luuid -lgdi32
 i686-w64-mingw32-gcc -O1 -I "$work" -o "$work/d3d11test.exe" tests/windows/d3d11test.c -ld3d11 -ld3d12 -ldxgi -luuid -ldxguid -luser32
 i686-w64-mingw32-gcc -O1 -o "$work/d3d9test.exe" tests/windows/d3d9test.c -ld3d9 -luser32
+i686-w64-mingw32-gcc -O1 -o "$work/d3d8test.exe" tests/windows/d3d8test.c -ld3d8 -luser32
 # (com32's interfaces: the type library is a resource of the program, the header and the identifiers are generated)
 widl -m32 -I /usr/include/wine/windows -t -T "$work/com32.tlb" -h -H "$work/com32_h.h" -u -U "$work/com32_i.c" tests/windows/com32.idl
 (cd "$work" && echo '1 TYPELIB "com32.tlb"' | i686-w64-mingw32-windres -o com32res.o)

@@ -1,0 +1,9 @@
+LIBRARY d3d8.dll
+EXPORTS
+; The exports of Windows' d3d8.dll (and Wine's d3d8.spec). The ordinals are the linker's: no table of Windows' own was at hand to sync them with
+; (scripts/sync-ordinals.py); programs take these by name.
+D3D8GetSWInfo
+DebugSetMute
+Direct3DCreate8
+ValidatePixelShader
+ValidateVertexShader

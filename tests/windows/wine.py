@@ -35,7 +35,7 @@ ENV = dict(os.environ, LC_ALL="C")
 # The DLLs this OS has files for (src/Windows): the tests of these are imported unless the command line names others.
 OUR_DLLS = ("ntdll kernel32 kernelbase advapi32 ws2_32 msvcrt ucrtbase win32u user32 gdi32 shell32 ole32 oleaut32 comctl32 comdlg32 rpcrt4 shlwapi winmm version imm32 "
             "secur32 crypt32 bcrypt ncrypt userenv setupapi iphlpapi dbghelp psapi wininet winhttp wintrust netapi32 dwmapi uxtheme mswsock gdiplus msimg32 opengl32 glu32 "
-            "dnsapi mpr wtsapi32 powrprof cfgmgr32 d3d9 d3d11 dxgi dwrite shcore avrt winspool.drv wevtapi pdh wldap32 urlmon msi propsys hid usp10 winscard odbc32 "
+            "dnsapi mpr wtsapi32 powrprof cfgmgr32 d3d9 d3d8 d3d11 dxgi dwrite shcore avrt winspool.drv wevtapi pdh wldap32 urlmon msi propsys hid usp10 winscard odbc32 "
             "xinput1_4 dsound dinput8 d2d1 d3dcompiler_47 lz32 oleacc oledlg credui ntdsapi samlib activeds normaliz sensapi authz rasapi32").split()
 # Libraries every test may need; a test names its own through the imports of its DLL (-l<dll>).
 COMMON_LIBS = ["ntdll", "user32", "advapi32", "gdi32", "kernel32", "uuid", "ole32", "oleaut32", "shell32", "comctl32", "winmm", "shlwapi", "version", "imm32", "ws2_32"]
@@ -165,7 +165,24 @@ def guid_library(out):
 
 def available(libs):
     have = set(os.path.basename(p)[3:-2] for p in glob.glob("/usr/x86_64-w64-mingw32/lib/lib*.a"))
-    return [l for l in libs if l[2:] in have]
+    out = []
+    for l in libs:
+        if l[2:] in have:
+            out.append(l)
+        elif OUT and os.path.exists(os.path.join(HERE, "..", "..", "..", "src", "Windows", l[2:], l[2:] + ".def")):
+            lib = own_import_library(l[2:])
+            if lib:
+                out.append(lib)
+    return out
+
+
+def own_import_library(name):
+    """An import library made from the OS's own src/Windows/<dll>/<dll>.def, for a DLL mingw-w64 has none of for x86-64 (d3d8: 64-bit Windows has the DLL,
+    mingw only the 32-bit library)."""
+    lib = os.path.join(OUT, "lib%s_own.a" % name)
+    if not os.path.exists(lib):
+        run([CC.replace("gcc", "dlltool"), "-d", os.path.join(HERE, "..", "..", "..", "src", "Windows", name, name + ".def"), "-l", lib])
+    return lib if os.path.exists(lib) else None
 
 
 # ---- build -------------------------------------------------------------------------------------------------------------------------------------------------
