@@ -45,8 +45,9 @@
  *     depth buffer, not of several samples when read by shaders, the samples of a multisampled one not copied to buffers (Direct3D 12 has no such copy)
  *   - ResourceMinLODClamp (a view's least level of detail, in the resource's levels) raises the sampler's MinLOD in the kernel; SampleCmp of a mipmapped texture compares the view's
  *     first level on virgl
- *   - samplers: the MINIMUM_ / MAXIMUM_ filters and coordinates in texels (D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES) where the kernel's device has them (the CPU renderer;
- *     a draw with one is refused on virgl); the separate minification and magnification filters on the CPU renderer and virgl (one filter, linear where either is, elsewhere)
+ *   - samplers: the MINIMUM_ / MAXIMUM_ filters and coordinates in texels (D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES) where the kernel's device has them (the CPU renderer
+ *     and Venus - whose shaders divide the coordinates by the level's size -; a draw with one is refused on virgl); the separate minification and magnification filters on the
+ *     CPU renderer, Venus and virgl (one filter, linear where either is, elsewhere)
  *   - lines: aliased, alpha-antialiased and quadrilateral 1.4 / 1.0 wide on the CPU renderer; virgl's are the host's smooth and multisampled lines (its aliased line on a target
  *     of one sample); the other devices draw aliased lines and refuse narrow quadrilateral ones
  *   - a pass with a depth buffer and no render target draws into a colour image of the buffer's size that nothing reads (cmdlist.inc depth_companion): it costs that memory
@@ -55,7 +56,8 @@
  *     virgl, Venus); arrays of them (DepthOrArraySize > 1) drawn into a slice at a time and resolved a slice at a time (ResolveSubresource / ResolveSubresourceRegion of a slice);
  *     no unordered access to them, no CPU access to their samples, no 16-bit or wider multisampled formats (the kernel's multisampled images are 8-bit colour and depth), the least and
  *     greatest of a slice other than 0 not on virgl and Venus
- *   - tiled resources (extras.inc, base.inc dev_tiled_tier): tier 4 on the CPU renderer, tier 1 on virgl (TGSI has no residency feedback or lookup clamp); reserved depth buffers
+ *   - tiled resources (extras.inc, base.inc dev_tiled_tier): tier 4 on the CPU renderer and Venus (the host's sparse images and sparse lookups, where its blocks are the
+ *     tiles), tier 1 on virgl (TGSI has no residency feedback or lookup clamp); reserved depth buffers
  *     of D32_FLOAT and D16_UNORM where the kernel's device moves depth planes (base.inc format_tiled_depth; not D24S8 / D32S8: two planes), no multisampled reserved textures (no
  *     device moves a multisampled image's samples to or from memory: no backing for the tiles, no tiled quality level); the status of buffer and UAV loads (ld_raw_s /
  *     ld_structured_s / ld_uav_typed_s) where there is residency feedback; heaps shared across adapters (DXGI_ERROR_UNSUPPORTED; shared handles of one adapter's resources and heaps, and of fences of any
@@ -63,7 +65,9 @@
  *   - of the later interfaces (ID3D12Device1 .. 14, ID3D12GraphicsCommandList1 .. 10: device1.inc, cmdlist1.inc, library.inc, rootsig.inc; what mingw lacks of them is in
  *     d3d12_types.h), the features reported at their "not supported" tier: ray tracing, mesh shaders, sampler feedback, work graphs, protected sessions, meta commands
  *     (D3D12_SAMPLER_DESC2, the strip cut of the command list and triangle fans are done: heaps.inc sampler_descriptor, cmdlist1.inc IASetIndexBufferStripCutValue); and on
- *     virgl (the CPU renderer has them: cmdlist1.inc) the depth bounds test, programmable sample positions, view instancing, variable-rate shading and barycentrics
+ *     virgl (the CPU renderer has them: cmdlist1.inc) the depth bounds test, programmable sample positions, view instancing, variable-rate shading and barycentrics; on
+ *     Venus all of them where the host's Vulkan has them (sample locations, fragment shading rate, fragment shader barycentrics; view instancing is the draw loop), the
+ *     variable-rate shading tier 2 without AdditionalShadingRatesSupported where the host's coarse pixels stop at 2x2 (RADV: DEV_FEATURE3_COARSE_PIXELS_2X2_ONLY)
  *   - of those: view instancing is tier 2 (draw-call looping; every stage runs for every view); centroid, noperspective and sample interpolation, per-sample shading
  *     (SV_SampleIndex), EvaluateAttributeAtSample / Snapped / Centroid, SV_Coverage in and out and the rasterizer's sample count and positions are the kernel's (DeviceFeature3:
  *     the CPU renderer, virgl and Venus); SV_InnerCoverage on the CPU renderer only, whose conservative rasterization stays tier 1 (tier 3 wants the post-snap degenerate triangles of

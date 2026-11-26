@@ -1460,6 +1460,9 @@ enum DeviceFeature3 : uint32_t {
   // A vertex buffer slot of stride 0 (GraphicsPipelineDesc::vertex_stride / slot_strides): every vertex, or instance, reads the same element; its attributes lie within
   // the first kMaxVertexStride bytes.
   kFeature3ZeroStride = 1u << 25,
+  // With kFeature2ShadingRate: the device's coarse pixels stop at 2x2 - the 2x4, 4x2 and 4x4 rates are made 2x2 (Direct3D's AdditionalShadingRatesSupported FALSE; the
+  // Venus device on hosts such as RADV whose fragment sizes end there). Without it a device that has the feature takes every rate.
+  kFeature3CoarsePixels2x2Only = 1u << 23,
 };
 // The sizes of the CPU renderer's waves (D3D12_FEATURE_DATA_D3D12_OPTIONS1 WaveLaneCountMin / Max): a pixel shader's quad, a compute shader's 32 lanes.
 constexpr uint32_t kWaveLanesPixel = 4, kWaveLanesCompute = 32, kWaveLanesOther = 4;

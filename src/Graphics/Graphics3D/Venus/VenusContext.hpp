@@ -65,6 +65,20 @@ struct VenusCaps {
   float max_anisotropy = 1;
   uint32_t timestamp_valid_bits = 0;
   float timestamp_period = 1;
+  // Direct3D 12's later rasterizer features (gap pass 5):
+  // programmable sample positions (VK_EXT_sample_locations' dynamic locations): the counts with a 2 x 2 grid of pixels (bit n: n samples), whether pipelines may
+  // differ in their locations within a rendering
+  uint32_t sample_location_quad_counts = 0;
+  bool variable_sample_locations = false;
+  // coarse pixel shading (VK_KHR_fragment_shading_rate): the pipeline's, the primitive's and the attachment's rates with every combiner, the attachment's texel
+  // size (a square), the largest coarse pixel (each axis 1, 2 or 4) and the most samples a coarse pixel takes
+  bool shading_rate = false;
+  uint32_t shading_rate_texel = 0, max_fragment_width = 1, max_fragment_height = 1, shading_rate_samples = 0;
+  bool fragment_barycentric = false;     // VK_KHR_fragment_shader_barycentric (SV_Barycentrics, GetAttributeAtVertex)
+  // sparse residency (Direct3D's tiled resources tier 2 and up): 2D and 3D images, the shaders' residency codes and minimum level of detail, the standard block
+  // shapes, unbound texels reading zero, and a queue that binds sparse memory
+  bool sparse_residency_2d = false, sparse_residency_3d = false, shader_resource_residency = false, shader_resource_min_lod = false;
+  bool residency_standard_2d = false, residency_standard_3d = false, residency_strict = false, sparse_queue = false;
 };
 
 class VenusContext {

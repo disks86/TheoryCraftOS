@@ -108,6 +108,9 @@ class VenusDevice final : public IGraphicsDevice {
   };
   uint32_t parity_gaps() const;
 
+  // Whether the device offers coarse shading (its pipelines then have the rate as dynamic state, and may draw with a shading-rate attachment).
+  bool offers_shading_rate() const { return (info().features2 & kFeature2ShadingRate) != 0; }
+
   // ---- for the device's objects ----
   VenusContext& context() { return ctx_; }
   const TcosKernelVulkan& vk() const { return ctx_.vk(); }
@@ -148,6 +151,16 @@ class VenusDevice final : public IGraphicsDevice {
   VenusPipeline* extreme_resolve_pipeline(VkFormat target, uint32_t samples, bool greatest);
   // A single-sampled colour image of `format` and `extent` a resolve goes through when the destination's format differs (kept for the next).
   VenusImage* resolve_scratch(Format format, Extent2D extent);
+  // The fragment shading rate attachment a rendering reads (kFeature2ShadingRate): an R8_UINT image of the host's texel size that covers the largest target, which
+  // the replay fills from the Direct3D layer's shading-rate image (tiles of kShadingRateTileSize) before each rendering that reads it. Made on first use, with its
+  // move to the GENERAL layout recorded into `cb` (the replay's: the queue's lock is held); nullptr when it cannot be made.
+  struct RateAttachment {
+    VkImage image = nullptr;
+    VkDeviceMemory memory = nullptr;
+    VkImageView view = nullptr;
+    uint32_t width = 0, height = 0;
+  };
+  const RateAttachment* rate_attachment(VkCommandBuffer cb);
   bool clock_interrupted() const { return __atomic_load_n(&clock_interrupted_, __ATOMIC_ACQUIRE); }
   void clear_clock_interrupted() { __atomic_store_n(&clock_interrupted_, false, __ATOMIC_RELEASE); }
   // submit's command buffer: begun (the queue's lock taken), and submitted, waited for and reset (the lock let go). Also used to split a long submit.
@@ -155,6 +168,8 @@ class VenusDevice final : public IGraphicsDevice {
   bool finish_main(VkCommandBuffer cb);
   bool lock_queue();
   void unlock_queue();
+  // Sparse memory bound and unbound on the queue (VenusImage::set_residency), and waited for. False if the host refused it.
+  bool bind_sparse(const VkBindSparseInfo& info);
   uint32_t uniform_alignment() const { return uniform_alignment_; }
   VkSampler sampler_for(const SamplerDesc& s, bool integer_texture);
   void add_video_memory(int64_t bytes);
@@ -197,9 +212,13 @@ class VenusDevice final : public IGraphicsDevice {
   };
   List<ResolvePipeline> resolve_pipelines_;
   VenusImage* resolve_scratch_ = nullptr;
+  RateAttachment rate_attachment_;
+  uint64_t accounted_rate_ = 0;
+  void free_rate_attachment();
   uint32_t uniform_alignment_ = 256;
   uint32_t max_image_dimension_ = 4096;
   uint32_t sample_counts_ = 0;
+  bool shading_rate_usable_ = false;   // (the host's coarse shading with its R8_UINT attachment, whatever its largest coarse pixel)
   kernel::Mutex staging_lock_;        // staging_ and what is in it
   kernel::Mutex queue_lock_;          // the queue and the two command buffers (images are written from several threads)
   bool clock_interrupted_ = false;

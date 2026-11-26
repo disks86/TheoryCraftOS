@@ -46,6 +46,7 @@ constexpr OpInfo kOps[] = {
     {"ATOMIMIN", 1, 3}, {"ATOMUMAX", 1, 3}, {"ATOMUMIN", 1, 3}, {"ATOMXCHG", 1, 3}, {"ATOMCAS", 1, 4},
     {"IF", 0, 1},      {"UIF", 0, 1},      {"ELSE", 0, 0},     {"ENDIF", 0, 0},   {"BGNLOOP", 0, 0}, {"ENDLOOP", 0, 0}, {"BRK", 0, 0},      {"CONT", 0, 0},
     {"RET", 0, 0},     {"END", 0, 0},      {"EMIT", 0, 1},     {"ENDPRIM", 0, 1}, {"MEMBAR", 0, 1},  {"BARRIER", 0, 0}, {"NOP", 0, 0},
+    {"SPARSE_BEGIN", 0, 1}, {"SPARSE_END", 1, 0},
 };
 static_assert(sizeof(kOps) / sizeof(kOps[0]) == static_cast<uint32_t>(Op::kCount), "every opcode has its name");
 
@@ -79,6 +80,9 @@ constexpr NamedSemantic kSemantics[] = {
     {"TESSINNER", Semantic::TessInner}, {"VERTICESOUT", Semantic::VertexOut}, {"VIEWPORT_MASK", Semantic::ViewportMask},
     {"HELPER_INVOCATION", Semantic::HelperInvocation}, {"BASEINSTANCE", Semantic::BaseInstance}, {"DRAWID", Semantic::DrawId},
     {"WORK_DIM", Semantic::WorkDim},    {"SUBGROUP_SIZE", Semantic::SubgroupSize}, {"SUBGROUP_INVOCATION", Semantic::SubgroupInvocation},
+    {"VIEWINDEX", Semantic::ViewIndex},
+    // (this reader's own, which only the Direct3D layer writes, for a device that offers their features: SV_Barycentrics, SV_ShadingRate)
+    {"BARYCENTRIC", Semantic::Barycentric}, {"SHADINGRATE", Semantic::ShadingRate},
 };
 
 struct NamedFormat {

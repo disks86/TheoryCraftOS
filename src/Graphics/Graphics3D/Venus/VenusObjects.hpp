@@ -75,6 +75,10 @@ class VenusImage final : public IImage {
   bool read_depth_subresource(uint32_t level, uint32_t layer, ArrayView<float> depth, ArrayView<uint8_t> stencil) override;
   bool write_depth_subresource(uint32_t level, uint32_t layer, ArrayView<const float> depth, ArrayView<const uint8_t> stencil) override;
   bool copy_subresource(IImage& source, uint32_t level, uint32_t layer, uint32_t source_level, uint32_t source_layer, uint32_t planes) override;
+  // Residency (kFeature2TileResidency): the image becomes a sparse one of the host's standard block shape the first time, whose blocks - the tiles - and per-slice
+  // mip tails - the packed levels - are bound where `r` says they are mapped and left unbound elsewhere, so that the shaders' sparse lookups report what Direct3D's
+  // residency feedback does and unbound texels read zero. The contents of the tiles bound anew are what the next writes give (the memory manager uploads after it).
+  bool set_residency(const ImageResidency& r) override;
 
   const ImageDesc& desc() const { return desc_; }
   VkImage image() const { return image_; }
@@ -99,6 +103,16 @@ class VenusImage final : public IImage {
   bool depth_planes_ok(uint32_t level, uint32_t layer, uint64_t depth, uint64_t stencil) const;
   bool copy_planes(bool to_image, uint32_t level, uint32_t layer, bool depth, bool stencil, uint64_t stencil_offset);
   Format kept_format() const;
+  bool make_image(bool sparse);   // (the VkImage, its memory - bound whole unless sparse - and its move to GENERAL, cleared to zero)
+  bool make_sparse(const ImageResidency& r);
+  bool bind_residency(const ImageResidency& r);
+  // the sparse image's shape (make_sparse): the block in texels and its bytes, the first level of the mip tail, the tail's size, offset and stride of the layers
+  bool sparse_ = false;
+  VkExtent3D block_{};
+  uint64_t block_bytes_ = 0;
+  uint32_t tail_first_ = 0;
+  uint64_t tail_size_ = 0, tail_offset_ = 0, tail_stride_ = 0;
+  bool single_tail_ = false;
 
   struct View {
     TextureView v;
@@ -152,10 +166,21 @@ struct VenusVariantKey {
   uint32_t samples = 1;
   uint32_t topology = 0;
   uint32_t patch_points = 0;
+  uint32_t flags = 0;          // kVariant* below
+  uint32_t unnormalized = 0;   // bit u: texture unit u's sampler takes coordinates in texels (kFeature2UnnormalizedCoordinates: the shader scales them)
   bool operator==(const VenusVariantKey& o) const { return __builtin_memcmp(this, &o, sizeof(*this)) == 0; }
 };
-static_assert(sizeof(VenusVariantKey) == tgsi::kMaxUnits + tgsi::kMaxStages * (tgsi::kMaxTexelViews + tgsi::kMaxImages) + 4 * (kMaxColorTargets + 4),
+static_assert(sizeof(VenusVariantKey) == tgsi::kMaxUnits + tgsi::kMaxStages * (tgsi::kMaxTexelViews + tgsi::kMaxImages) + 4 * (kMaxColorTargets + 6),
               "no padding: keys are compared as bytes");
+// The constant block of a draw (a uniform buffer, bound with a dynamic offset): the push constants, the samplers' comparison rows from kSamplerCompareRegister, the
+// rasterizer's row (kRasterizerRegister: the pass's samples) and after the rows every device fills (kDeviceConstantRegisters) the Venus device's system row (the view
+// instance's id, viewport and layer offsets: kFeature2ViewInstancing).
+constexpr uint32_t kVenusSystemRow = kDeviceConstantRegisters;
+constexpr uint32_t kVenusConstantRows = kVenusSystemRow + 1;
+static_assert(kVenusSystemRow != kRasterizerRegister && kVenusSystemRow >= kSamplerCompareRegister + kMaxTextureUnits, "the system row shares a row with the device's constants");
+// VenusVariantKey::flags
+constexpr uint32_t kVariantSampleLocations = 1u << 0;   // the sample positions set (kFeature2SamplePositions) are the rasterizer's: dynamic sample locations
+constexpr uint32_t kVariantViewOffsets = 1u << 1;       // view instancing adds to the primitives' viewport and layer (kFeature2ViewInstancing): the last stage writes both
 
 class VenusPipeline final : public IPipeline {
  public:

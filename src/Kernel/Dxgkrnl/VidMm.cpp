@@ -897,9 +897,10 @@ void VidMm::forget_tile_user(Allocation& heap, Allocation& reserved) {
 bool VidMm::upload(Allocation& a) {
   if (!a.reserved_) return upload_contents(a);
   gather_tiles(a);
-  if (!upload_contents(a)) return false;
+  // (the residency first: a device that keeps it as memory bound to the image - Venus' sparse images - drops what is written where nothing is bound, and gives
+  // a tile bound anew the memory's old bytes until the contents are written)
   push_residency(a);
-  return true;
+  return upload_contents(a);
 }
 
 bool VidMm::upload_contents(Allocation& a) {

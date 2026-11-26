@@ -179,7 +179,10 @@ class D3d9Program {
   // `varyings`: how many interpolants the host's vertex and pixel shaders declare (DeviceLimits::varyings).
   // `bindings` (or null): where the text's BUFFER, IMAGE and buffer SVIEW registers are bound (graphics::TgsiBindings).
   // `d3d_sample_order`: the device numbers a multisampled image's samples as Direct3D does (DeviceInfo::d3d_sample_order); else 4x indexes are turned around for virgl's host.
-  NtStatus emit_tgsi(String* out, uint32_t varyings = graphics::kBaseVaryings, graphics::TgsiBindings* bindings = nullptr, bool d3d_sample_order = false) const;
+  // `features2`: the device's graphics::DeviceFeature2 bits - what the text may say besides what virgl's host takes (SV_ViewID as VIEWINDEX, SV_Barycentrics as
+  // BARYCENTRIC inputs, GetAttributeAtVertex as a pixel shader's per-vertex inputs, SV_ShadingRate as SHADINGRATE: the Venus device's reader takes them).
+  NtStatus emit_tgsi(String* out, uint32_t varyings = graphics::kBaseVaryings, graphics::TgsiBindings* bindings = nullptr, bool d3d_sample_order = false,
+                     uint32_t features2 = 0) const;
 
   // For a vertex shader: whether it is the matrix transform of the fixed vertex kernel, found by running it on test vectors against the built-in shader. `colour_varying` is the varying
   // the colour attribute goes to.

@@ -383,6 +383,7 @@ struct Dev {
 #define DEV_FEATURE3_NULL_VERTEX_BUFFERS (1u << 24)     /* a slot with no buffer (the stream's kNoVertexBuffer) reads 0, 0, 0 and the format's 0 / 1 */
 #define DEV_FEATURE3_ZERO_STRIDE (1u << 25)              /* vertex buffers of stride 0 */
 #define VB_NONE 0xFFFFFFFFu                              /* OP_BIND_VB's allocation index of no buffer (dxgk::kNoVertexBuffer); CmdList.sent_vb_alloc of a slot sent so */
+#define DEV_FEATURE3_COARSE_PIXELS_2X2_ONLY (1u << 23)   /* with DEV_FEATURE2_SHADING_RATE: no 2x4, 4x2 or 4x4 rates (AdditionalShadingRatesSupported FALSE: they are made 2x2) */
 /* graphics::DeviceFeature2 in KmtCaps.features2 */
 #define DEV_FEATURE2_STORAGE_IMAGES (1u << 0)            /* unordered access views of textures (KA_STORAGE_IMAGE), in compute shaders */
 #define DEV_FEATURE2_STORAGE_IMAGES_IN_DRAWS (1u << 1)   /* ... and in pixel shaders */

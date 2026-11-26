@@ -57,7 +57,8 @@ extern "C" {
   X(CmdClearDepthStencilImage) X(CmdClearAttachments) X(CmdFillBuffer) X(CmdUpdateBuffer) X(CmdBeginQuery) X(CmdEndQuery) X(CmdResetQueryPool)                  \
   X(CmdWriteTimestamp) X(CmdCopyQueryPoolResults) X(CmdBeginConditionalRenderingEXT) X(CmdEndConditionalRenderingEXT)                                           \
   X(CmdBindTransformFeedbackBuffersEXT) X(CmdBeginTransformFeedbackEXT) X(CmdEndTransformFeedbackEXT) X(CmdBeginQueryIndexedEXT) X(CmdEndQueryIndexedEXT)       \
-  X(CmdDrawIndirectByteCountEXT)
+  X(CmdDrawIndirectByteCountEXT) X(CmdSetSampleLocationsEXT) X(GetPhysicalDeviceMultisamplePropertiesEXT) X(CmdSetFragmentShadingRateKHR)              \
+  X(GetPhysicalDeviceFragmentShadingRatesKHR) X(QueueBindSparse) X(GetImageSparseMemoryRequirements) X(GetPhysicalDeviceSparseImageFormatProperties)
 
 typedef struct TcosKernelVulkan {
 #define TCOS_KVK_MEMBER(name) PFN_vk##name name;

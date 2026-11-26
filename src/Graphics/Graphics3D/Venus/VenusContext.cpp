@@ -35,6 +35,7 @@ const char* const kWanted[] = {
     VK_EXT_LINE_RASTERIZATION_EXTENSION_NAME,      VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
     VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,            VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME,       VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME,
     VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME,
+    VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME,   VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
 };
 constexpr uint32_t kWantedCount = sizeof(kWanted) / sizeof(kWanted[0]);
 
@@ -84,6 +85,7 @@ bool VenusContext::open() {
         family_ = f;
         properties_ = p;
         caps_.timestamp_valid_bits = families[f].timestampValidBits;
+        caps_.sparse_queue = (families[f].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT) != 0;
         break;
       }
   }
@@ -132,6 +134,8 @@ bool VenusContext::open() {
   auto robust2 = vk_struct<VkPhysicalDeviceRobustness2FeaturesEXT>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT);
   auto bias = vk_struct<VkPhysicalDeviceDepthBiasControlFeaturesEXT>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_BIAS_CONTROL_FEATURES_EXT);
   auto interlock = vk_struct<VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT);
+  auto rate = vk_struct<VkPhysicalDeviceFragmentShadingRateFeaturesKHR>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR);
+  auto bary = vk_struct<VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR);
   auto v13 = vk_struct<VkPhysicalDeviceVulkan13Features>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES);
   auto v12 = vk_struct<VkPhysicalDeviceVulkan12Features>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES);
   auto v11 = vk_struct<VkPhysicalDeviceVulkan11Features>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES);
@@ -153,6 +157,8 @@ bool VenusContext::open() {
   link(robust2, enabled(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME));
   link(bias, enabled(VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME));
   link(interlock, enabled(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME));
+  link(rate, enabled(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME));
+  link(bary, enabled(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME));
   link(v13, true);
   link(v12, true);
   link(v11, true);
@@ -169,6 +175,14 @@ bool VenusContext::open() {
   bias.leastRepresentableValueForceUnormRepresentation = VK_FALSE;
   lines.stippledRectangularLines = lines.stippledBresenhamLines = lines.stippledSmoothLines = VK_FALSE;
   interlock.fragmentShaderShadingRateInterlock = VK_FALSE;
+  // (sparse memory only where a queue binds it; the aliased and the buffer kinds are not used)
+  if (!caps_.sparse_queue) {
+    features.features.sparseBinding = VK_FALSE;
+    features.features.sparseResidencyBuffer = features.features.sparseResidencyImage2D = features.features.sparseResidencyImage3D = VK_FALSE;
+    features.features.sparseResidency2Samples = features.features.sparseResidency4Samples = features.features.sparseResidency8Samples = VK_FALSE;
+    features.features.sparseResidency16Samples = features.features.sparseResidencyAliased = VK_FALSE;
+  }
+  features.features.sparseResidencyAliased = VK_FALSE;
 
   const VkPhysicalDeviceFeatures& f = features.features;
   caps_.geometry_shader = f.geometryShader, caps_.tessellation_shader = f.tessellationShader, caps_.dual_src_blend = f.dualSrcBlend, caps_.logic_op = f.logicOp;
@@ -203,17 +217,51 @@ bool VenusContext::open() {
   caps_.smooth_lines = caps_.line_rasterization && lines.smoothLines;
   caps_.rectangular_lines = caps_.line_rasterization && lines.rectangularLines;
   caps_.pixel_interlock = enabled(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME) && interlock.fragmentShaderPixelInterlock;
+  caps_.fragment_barycentric = enabled(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME) && bary.fragmentShaderBarycentric;
+  caps_.sparse_residency_2d = caps_.sparse_queue && f.sparseBinding && f.sparseResidencyImage2D;
+  caps_.sparse_residency_3d = caps_.sparse_queue && f.sparseBinding && f.sparseResidencyImage3D;
+  caps_.shader_resource_residency = f.shaderResourceResidency, caps_.shader_resource_min_lod = f.shaderResourceMinLod;
 
   // The driver's name (for the boot log and GL_RENDERER).
   auto driver = vk_struct<VkPhysicalDeviceDriverProperties>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES);
   auto locations = vk_struct<VkPhysicalDeviceSampleLocationsPropertiesEXT>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLE_LOCATIONS_PROPERTIES_EXT);
+  auto rate_props = vk_struct<VkPhysicalDeviceFragmentShadingRatePropertiesKHR>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR);
   auto p2 = vk_struct<VkPhysicalDeviceProperties2>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2);
   p2.pNext = &driver;
-  if (enabled(VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME)) driver.pNext = &locations;
+  if (enabled(VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME)) locations.pNext = p2.pNext, p2.pNext = &locations;
+  if (enabled(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME)) rate_props.pNext = p2.pNext, p2.pNext = &rate_props;
   vk_->GetPhysicalDeviceProperties2(physical_, &p2);
   for (uint32_t i = 0; i + 1 < sizeof(driver_name_) && driver.driverName[i]; ++i) driver_name_[i] = driver.driverName[i];
   caps_.sample_locations = enabled(VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME);
   caps_.sample_location_counts = caps_.sample_locations ? locations.sampleLocationSampleCounts : 0;
+  if (caps_.sample_locations) {
+    // (Direct3D's positions are sixteenths of a pixel, -8 .. 7 from the centre: the host must place a sample anywhere in 0 .. 15/16 at that precision; a quad's
+    // patterns need a grid of 2 x 2 for the count)
+    caps_.variable_sample_locations = locations.variableSampleLocations;
+    const bool precise = locations.sampleLocationSubPixelBits >= 4 && locations.sampleLocationCoordinateRange[0] <= 0.0f && locations.sampleLocationCoordinateRange[1] >= 0.9375f;
+    for (uint32_t n = 1; precise && n <= 16; n *= 2) {
+      if (!(caps_.sample_location_counts & n)) continue;
+      auto mp = vk_struct<VkMultisamplePropertiesEXT>(VK_STRUCTURE_TYPE_MULTISAMPLE_PROPERTIES_EXT);
+      vk_->GetPhysicalDeviceMultisamplePropertiesEXT(physical_, static_cast<VkSampleCountFlagBits>(n), &mp);
+      if (mp.maxSampleLocationGridSize.width >= 2 && mp.maxSampleLocationGridSize.height >= 2) caps_.sample_location_quad_counts |= 1u << n;
+    }
+  }
+  if (enabled(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME) && rate.pipelineFragmentShadingRate && rate.primitiveFragmentShadingRate && rate.attachmentFragmentShadingRate &&
+      rate_props.fragmentShadingRateNonTrivialCombinerOps && rate_props.fragmentShadingRateStrictMultiplyCombiner && rate_props.primitiveFragmentShadingRateWithMultipleViewports &&
+      rate_props.minFragmentShadingRateAttachmentTexelSize.width == rate_props.minFragmentShadingRateAttachmentTexelSize.height &&
+      rate_props.minFragmentShadingRateAttachmentTexelSize.width <= 16 && 16 % rate_props.minFragmentShadingRateAttachmentTexelSize.width == 0) {
+    caps_.shading_rate = true;
+    caps_.shading_rate_texel = rate_props.minFragmentShadingRateAttachmentTexelSize.width;
+    caps_.max_fragment_width = rate_props.maxFragmentSize.width < 4 ? rate_props.maxFragmentSize.width : 4;
+    caps_.max_fragment_height = rate_props.maxFragmentSize.height < 4 ? rate_props.maxFragmentSize.height : 4;
+    caps_.shading_rate_samples = rate_props.maxFragmentShadingRateCoverageSamples;
+  } else {
+    rate.pipelineFragmentShadingRate = rate.primitiveFragmentShadingRate = rate.attachmentFragmentShadingRate = VK_FALSE;
+  }
+  // (the sparse image properties: the standard block shapes, and what unbound texels read)
+  caps_.residency_standard_2d = properties_.sparseProperties.residencyStandard2DBlockShape;
+  caps_.residency_standard_3d = properties_.sparseProperties.residencyStandard3DBlockShape;
+  caps_.residency_strict = properties_.sparseProperties.residencyNonResidentStrict;
 
   const float priority = 1.0f;
   const VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, nullptr, 0, family_, 1, &priority};

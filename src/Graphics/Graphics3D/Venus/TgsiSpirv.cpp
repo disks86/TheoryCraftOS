@@ -37,6 +37,9 @@ enum class IoKind : uint8_t {
   FragCoord, Face, PrimId, SampleId, SamplePos, SampleMask, Layer, ViewportIndex, ClipDist, PointSize, FragDepth, Stencil,
   Color,           // a fragment colour (location semantic_index)
   TessOuter, TessInner, Patch, InvocationId, VertexId, InstanceId, TessCoord, BlockId, ThreadId, GridSize, BlockSize, VerticesIn, Helper,
+  ViewIndex,       // SV VIEWINDEX: the constants' system row (view instancing as a loop of draws)
+  Barycentric,     // BaryCoordKHR / BaryCoordNoPerspKHR (a vec3)
+  ShadingRate,     // a fragment's ShadingRateKHR, or a vertex or geometry shader's PrimitiveShadingRateKHR
 };
 
 struct Io {
@@ -66,6 +69,8 @@ struct XfbCopy {
   uint32_t reg = 0, var = 0, type = 0;
   uint8_t first = 0, count = 0;
 };
+
+struct TargetShape;
 
 class Compiler {
  public:
@@ -201,6 +206,7 @@ class Compiler {
   bool control(const Instruction& ins);
   uint32_t sampled_image(uint32_t unit, Target target);
   uint32_t texture_image(uint32_t unit);
+  uint32_t unnormalized_scale(uint32_t unit, const TargetShape& s, uint32_t coords);
   uint32_t buffer_word_pointer(const Operand& res, uint32_t word_index);
   uint32_t image_coordinate(Target t, uint32_t coord_bits);
   uint32_t image_texel_type(uint32_t k);
@@ -261,6 +267,17 @@ class Compiler {
   allocators::IAllocator& allocator_;
   bool multi_stream_ = false;
   bool writes_depth_ = false;
+  // view instancing's offsets (CompileOptions::view_offsets): the layer and viewport outputs made when the text has none
+  uint32_t view_layer_var_ = 0, view_viewport_var_ = 0;
+  uint32_t system_component(uint32_t c);   // (a uint of the constants' system row)
+  void write_view_offsets();
+  // residency feedback (SPARSE_BEGIN .. SPARSE_END): whether every lookup between them read resident texels, and the finest level of detail they may use
+  bool sparse_ = false, sparse_clamp_ = false;
+  uint32_t resident_var_ = 0, min_lod_var_ = 0;
+  uint32_t sparse_types_[3][2] = {};   // (the residency code and texel struct of each texel type)
+  bool sparse(const Instruction& ins);
+  uint32_t sparse_struct(uint32_t texel);
+  uint32_t sparse_result(uint32_t texel, uint32_t value);   // (the texel of a sparse lookup's result, its residency added to resident_var_)
 };
 
 // ---- small helpers --------------------------------------------------------------------------------------------------------------------------------------
@@ -403,12 +420,18 @@ uint32_t Compiler::make_io(uint32_t storage, uint32_t type, uint32_t array_lengt
 bool Compiler::declare_input(const Declaration& d) {
   if (d.last >= kMaxIn) return fail("too many input registers", d.line);
   const bool per_vertex = d.two_dimensional;
-  if (per_vertex && !in_vertices_) return fail("a per-vertex input outside the geometry and tessellation stages", d.line);
+  const bool fragment_vertices = per_vertex && p_.stage == Stage::Fragment;   // (GetAttributeAtVertex: the three vertices of the primitive, PerVertexKHR)
+  if (per_vertex && !in_vertices_ && !fragment_vertices) return fail("a per-vertex input outside the geometry, tessellation and fragment stages", d.line);
+  if (fragment_vertices && d.semantic != Semantic::Generic) return fail("a per-vertex fragment input that is not GENERIC", d.line);
+  if (fragment_vertices) {
+    b_.capability(CapFragmentBarycentricKHR);
+    b_.extension("SPV_KHR_fragment_shader_barycentric");
+  }
   for (uint32_t r = d.first; r <= d.last; ++r) {
     Io& io = in_[r];
     io.per_vertex = per_vertex;
     io.index = d.semantic_index + (r - d.first);
-    const uint32_t n = per_vertex ? in_vertices_ : 0;
+    const uint32_t n = fragment_vertices ? 3 : per_vertex ? in_vertices_ : 0;
     switch (d.semantic) {
       case Semantic::None:
       case Semantic::Generic:
@@ -424,9 +447,11 @@ bool Compiler::declare_input(const Declaration& d) {
         io.value = p_.stage == Stage::Vertex && r < 16 ? o_.attribute_type[r] : ValueType::Float;
         io.type = io.value == ValueType::Float ? f4_ : io.value == ValueType::Sint ? i4_ : u4_;
         io.kind = IoKind::Generic;
-        // (a fragment input that is flat, or not of floats, is decorated Flat by make_io)
-        io.var = make_io(Input, io.type, n, location, ~0u, d.interpolation == Interpolation::Constant || io.value != ValueType::Float);
-        if (p_.stage == Stage::Fragment) {
+        // (a fragment input that is flat, or not of floats, is decorated Flat by make_io; one of the primitive's vertices is PerVertexKHR and nothing else)
+        io.var = make_io(Input, io.type, n, location, ~0u, !fragment_vertices && (d.interpolation == Interpolation::Constant || io.value != ValueType::Float));
+        if (fragment_vertices) {
+          b_.decorate(io.var, DecPerVertexKHR);
+        } else if (p_.stage == Stage::Fragment) {
           if (d.interpolation == Interpolation::Constant) {
           } else if (d.interpolation == Interpolation::Linear) {
             b_.decorate(io.var, DecNoPerspective);
@@ -489,6 +514,20 @@ bool Compiler::declare_input(const Declaration& d) {
         io.kind = IoKind::TessInner, io.type = f_;
         io.var = make_io(Input, b_.t_array(f_, 2), 0, 0, BiTessLevelInner, false);
         b_.decorate(io.var, DecPatch);
+        break;
+      case Semantic::Barycentric:
+        if (p_.stage != Stage::Fragment || per_vertex) return fail("barycentrics outside the fragment stage", d.line);
+        b_.capability(CapFragmentBarycentricKHR);
+        b_.extension("SPV_KHR_fragment_shader_barycentric");
+        io.kind = IoKind::Barycentric, io.type = f3_;
+        io.var = make_io(Input, f3_, 0, 0, d.interpolation == Interpolation::Linear ? BiBaryCoordNoPerspKHR : BiBaryCoordKHR, false);
+        break;
+      case Semantic::ShadingRate:
+        if (p_.stage != Stage::Fragment || per_vertex) return fail("a shading rate input outside the fragment stage", d.line);
+        b_.capability(CapFragmentShadingRateKHR);
+        b_.extension("SPV_KHR_fragment_shading_rate");
+        io.kind = IoKind::ShadingRate, io.type = i_, io.value = ValueType::Sint;
+        io.var = make_io(Input, i_, 0, 0, BiShadingRateKHR, true);
         break;
       case Semantic::ClipDist:
         io.kind = IoKind::ClipDist, io.type = f_;
@@ -598,6 +637,13 @@ bool Compiler::declare_output(const Declaration& d) {
         io.kind = IoKind::SampleMask, io.type = i_;
         io.var = make_io(Output, b_.t_array(i_, 1), 0, 0, BiSampleMask, false);
         break;
+      case Semantic::ShadingRate:
+        if (p_.stage != Stage::Vertex && p_.stage != Stage::Geometry) return fail("a primitive's shading rate from a stage other than the vertex and geometry ones", d.line);
+        b_.capability(CapFragmentShadingRateKHR);
+        b_.extension("SPV_KHR_fragment_shading_rate");
+        io.kind = IoKind::ShadingRate, io.type = i_;
+        io.var = make_io(Output, i_, 0, 0, BiPrimitiveShadingRateKHR, false);
+        break;
       default: return fail("an output semantic this compiler does not take", d.line);
     }
   }
@@ -692,6 +738,10 @@ bool Compiler::declare_sv(const Declaration& d) {
       case Semantic::Position:
         io.kind = IoKind::FragCoord, io.type = f4_;
         io.var = make_io(Input, f4_, 0, 0, BiFragCoord, false);
+        break;
+      case Semantic::ViewIndex:
+        if (!o_.system_row || p_.stage == Stage::Compute) return fail("a view index without the constants' system row", d.line);
+        io.kind = IoKind::ViewIndex, io.type = u_;
         break;
       default: return fail("a system value this compiler does not take", d.line);
     }
@@ -856,6 +906,19 @@ bool Compiler::declare() {
   // an output block for the stages before the rasterizer (the position is always written there) and the point size
   const bool last_vertex_stage = p_.stage == Stage::Vertex || p_.stage == Stage::TessEval || p_.stage == Stage::Geometry;
   if (last_vertex_stage && !out_block_) out_block_ = per_vertex_block(Output, 0);
+  if (last_vertex_stage && o_.view_offsets) {
+    if (!o_.system_row) return fail("view offsets without the constants' system row");
+    if (p_.stage != Stage::Geometry && !o_.output_layer_any_stage) return fail("view offsets from a vertex or domain shader (the device lacks shaderOutputLayer)");
+    if (!out_has_kind(IoKind::Layer)) {
+      b_.capability(p_.stage == Stage::Geometry ? CapGeometry : CapShaderLayer);
+      view_layer_var_ = make_io(Output, i_, 0, 0, BiLayer, false);
+    }
+    if (!out_has_kind(IoKind::ViewportIndex)) {
+      b_.capability(p_.stage == Stage::Geometry ? CapMultiViewport : CapShaderViewportIndex);
+      b_.capability(CapMultiViewport);
+      view_viewport_var_ = make_io(Output, i_, 0, 0, BiViewportIndex, false);
+    }
+  }
   return ok_;
 }
 
@@ -975,6 +1038,8 @@ uint32_t Compiler::load_input(const Operand& o) {
       for (uint32_t c = 0; c < n; ++c) parts[c] = bitcast(u_, load(f_, chain(Input, f_, io.var, {b_.c_int(static_cast<int32_t>(c))})));
       return emit(OpCompositeConstruct, u4_, {parts[0], parts[1], parts[2], parts[3]});
     }
+    case IoKind::Barycentric: return to_bits(load(f3_, io.var), f3_, ValueType::Float, 3);
+    case IoKind::ShadingRate: return splat(u4_, bitcast(u_, load(i_, io.var)));
     default: return fail("an input this compiler does not read"), zero4();
   }
 }
@@ -1007,7 +1072,8 @@ uint32_t Compiler::load_output(const Operand& o) {
       return emit(OpCompositeConstruct, u4_, {b_.c_uint(0), b_.c_uint(0), z, b_.c_uint(0)});
     }
     case IoKind::Layer:
-    case IoKind::ViewportIndex: return splat(u4_, bitcast(u_, load(i_, io.var)));
+    case IoKind::ViewportIndex:
+    case IoKind::ShadingRate: return splat(u4_, bitcast(u_, load(i_, io.var)));
     default: return fail("an output this compiler does not read back"), zero4();
   }
 }
@@ -1039,6 +1105,7 @@ uint32_t Compiler::load_sv(const Operand& o) {
     case IoKind::Face: return bitcast(u4_, splat(f4_, select(f_, load(bool_, io.var), b_.c_float(1.0f), b_.c_float(-1.0f))));
     case IoKind::Helper: return splat(u4_, select(u_, load(bool_, io.var), b_.c_uint(~0u), b_.c_uint(0)));
     case IoKind::FragCoord: return bitcast(u4_, load(f4_, io.var));
+    case IoKind::ViewIndex: return splat(u4_, system_component(0));
     default: return fail("an undeclared system value"), zero4();
   }
 }
@@ -1180,7 +1247,15 @@ void Compiler::store_output(const Operand& d, uint32_t bits) {
       if (mask & 4) store(io.var, bitcast(f_, extract(u_, bits, 2)));
       break;
     case IoKind::Layer:
-    case IoKind::ViewportIndex:
+    case IoKind::ViewportIndex: {
+      if (!(mask & 1)) break;
+      uint32_t value = extract(u_, bits, 0);
+      // (view instancing: the view's viewport and layer offsets are added - as unsigned 32-bit numbers, wrapping - to what the shader writes)
+      if (o_.view_offsets) value = emit(OpIAdd, u_, {value, system_component(io.kind == IoKind::Layer ? 2 : 1)});
+      store(io.var, bitcast(i_, value));
+      break;
+    }
+    case IoKind::ShadingRate:
       if (mask & 1) store(io.var, bitcast(i_, extract(u_, bits, 0)));
       break;
     case IoKind::SampleMask:
@@ -1628,6 +1703,25 @@ uint32_t Compiler::sampled_image(uint32_t unit, Target target) {
   return emit(OpSampledImage, b_.t_sampled_image(sview_type_[unit]), {image, sampler});
 }
 
+// The coordinates of a lookup through a sampler of coordinates in texels (CompileOptions::unnormalized_units): x (and y) over the size of the view's first level,
+// which is what a normalised lookup of the same point reads. The view's other coordinates (an array's layer) stay as they are.
+uint32_t Compiler::unnormalized_scale(uint32_t unit, const TargetShape& s, uint32_t coords) {
+  if (unit >= kMaxUnits || !(o_.unnormalized_units >> unit & 1)) return coords;
+  if (s.dim != Dim1D && s.dim != Dim2D) return fail("coordinates in texels of a view that is not one- or two-dimensional"), coords;
+  b_.capability(CapImageQuery);
+  const uint32_t image = texture_image(unit);
+  const uint32_t axes = s.dim == Dim1D ? 1 : 2;
+  const uint32_t size_n = axes + (s.arrayed ? 1 : 0);
+  const uint32_t size = emit(OpImageQuerySizeLod, size_n == 1 ? i_ : b_.t_vector(i_, size_n), {image, b_.c_int(0)});
+  uint32_t out = coords;
+  for (uint32_t k = 0; k < axes; ++k) {
+    const uint32_t extent = emit(OpConvertSToF, f_, {size_n == 1 ? size : extract(i_, size, k)});
+    const uint32_t scaled = emit(OpFDiv, f_, {extract(f_, out, k), extent});
+    out = emit(OpCompositeInsert, f4_, {scaled, out, k});
+  }
+  return out;
+}
+
 bool Compiler::texture(const Instruction& ins) {
   const Op op = ins.op;
   // the unit: the SAMP operand
@@ -1701,6 +1795,7 @@ bool Compiler::texture(const Instruction& ins) {
         const uint32_t w = extract(f_, c, 3);
         c = emit(OpFDiv, f4_, {c, splat(f4_, w)});
       }
+      c = unnormalized_scale(unit, s, c);
       const uint32_t coords = coords_f(c);
       uint32_t words[12] = {texel, 0, si, coords};
       uint32_t count = 4;
@@ -1715,23 +1810,32 @@ bool Compiler::texture(const Instruction& ins) {
       } else if (!implicit && op != Op::Txd) {
         mask |= ImLod;
         operands[on++] = op == Op::Txl ? extract(f_, src(ins, 0, Ty::F), 3) : op == Op::Txl2 ? scalar(ins, 1, Ty::F) : b_.c_float(0.0f);
+        // (residency feedback's clamp on a lookup of a level given: the finest it may be)
+        if (sparse_ && sparse_clamp_) operands[on - 1] = ext(f_, GlslNMax, {operands[on - 1], load(f_, min_lod_var_)});
       }
       if (op == Op::Txd) {
         const uint32_t gn = s.coords;
         const uint32_t gt = b_.t_vector(f_, gn);
-        const uint32_t dx = src(ins, 1, Ty::F), dy = src(ins, 2, Ty::F);
+        const uint32_t dx = unnormalized_scale(unit, s, src(ins, 1, Ty::F)), dy = unnormalized_scale(unit, s, src(ins, 2, Ty::F));
         mask |= ImGrad;
         operands[on++] = gn == 4 ? dx : gn == 1 ? extract(f_, dx, 0) : shuffle(gt, dx, dx, sel, gn);
         operands[on++] = gn == 4 ? dy : gn == 1 ? extract(f_, dy, 0) : shuffle(gt, dy, dy, sel, gn);
       }
       mask = with_offset(mask, operands, on);
+      if (sparse_ && sparse_clamp_ && (implicit || op == Op::Txd)) mask |= ImMinLod, operands[on++] = load(f_, min_lod_var_);   // (MinLod is the last operand)
       if (mask) {
         words[count++] = mask;
         for (uint32_t i = 0; i < on; ++i) words[count++] = operands[i];
       }
       result = b_.id();
       words[1] = result;
-      b_.op_list(Builder::kCode, implicit ? OpImageSampleImplicitLod : OpImageSampleExplicitLod, words, count);
+      if (sparse_) {
+        words[0] = sparse_struct(texel);
+        b_.op_list(Builder::kCode, implicit ? OpImageSparseSampleImplicitLod : OpImageSparseSampleExplicitLod, words, count);
+        result = sparse_result(texel, result);
+      } else {
+        b_.op_list(Builder::kCode, implicit ? OpImageSampleImplicitLod : OpImageSampleExplicitLod, words, count);
+      }
       break;
     }
     case Op::Txf: {
@@ -1758,7 +1862,13 @@ bool Compiler::texture(const Instruction& ins) {
       }
       result = b_.id();
       words[1] = result;
-      b_.op_list(Builder::kCode, OpImageFetch, words, count);
+      if (sparse_ && s.dim != DimBuffer) {
+        words[0] = sparse_struct(texel);
+        b_.op_list(Builder::kCode, OpImageSparseFetch, words, count);
+        result = sparse_result(texel, result);
+      } else {
+        b_.op_list(Builder::kCode, OpImageFetch, words, count);
+      }
       break;
     }
     case Op::Txq: {
@@ -1783,7 +1893,7 @@ bool Compiler::texture(const Instruction& ins) {
     case Op::Tg4: {
       if (s.ms || s.dim == DimBuffer || s.dim == Dim3D || s.dim == Dim1D) return fail("a gather from a view that has no gather");
       const uint32_t si = sampled_image(unit, target);
-      const uint32_t coords = coords_f(src(ins, 0, Ty::F));
+      const uint32_t coords = coords_f(unnormalized_scale(unit, s, src(ins, 0, Ty::F)));
       // the component: src1.x, an immediate
       const Operand& co = ins.src[1];
       if (co.file != File::Imm || co.index.indirect || co.index.value < 0 || static_cast<uint64_t>(co.index.value) >= p_.immediates.count())
@@ -1805,7 +1915,13 @@ bool Compiler::texture(const Instruction& ins) {
       }
       result = b_.id();
       words[1] = result;
-      b_.op_list(Builder::kCode, OpImageGather, words, count);
+      if (sparse_) {
+        words[0] = sparse_struct(texel);
+        b_.op_list(Builder::kCode, OpImageSparseGather, words, count);
+        result = sparse_result(texel, result);
+      } else {
+        b_.op_list(Builder::kCode, OpImageGather, words, count);
+      }
       break;
     }
     case Op::Txqs: {   // (the samples per texel of a multisampled view: OpImageQuerySamples)
@@ -1819,7 +1935,7 @@ bool Compiler::texture(const Instruction& ins) {
       if (!fragment) return fail("LODQ outside the fragment stage");
       b_.capability(CapImageQuery);
       const uint32_t si = sampled_image(unit, target);
-      uint32_t c = src(ins, 0, Ty::F);
+      uint32_t c = unnormalized_scale(unit, s, src(ins, 0, Ty::F));
       const uint32_t qn = s.dim == DimCube ? 3 : s.coords;
       const uint32_t coords = qn == 4 ? c : qn == 1 ? extract(f_, c, 0) : shuffle(b_.t_vector(f_, qn), c, c, sel, qn);
       const uint32_t lod = emit(OpImageQueryLod, f2_, {si, coords});
@@ -1830,6 +1946,50 @@ bool Compiler::texture(const Instruction& ins) {
   }
   write_bits(ins.dst[0], vt == ValueType::Uint ? result : bitcast(u4_, result));
   return ok_;
+}
+
+// ---- residency feedback -----------------------------------------------------------------------------------------------------------------------------
+bool Compiler::sparse(const Instruction& ins) {
+  if (!resident_var_) {
+    resident_var_ = b_.id();
+    b_.op(Builder::kFunctionVariables, OpVariable, {b_.t_pointer(Function, bool_), resident_var_, Function, b_.c_bool(true)});
+    min_lod_var_ = b_.id();
+    b_.op(Builder::kFunctionVariables, OpVariable, {b_.t_pointer(Function, f_), min_lod_var_, Function, b_.c_float(0.0f)});
+  }
+  if (ins.op == Op::SparseBegin) {
+    if (sparse_) return fail("SPARSE_BEGIN inside another");
+    b_.capability(CapSparseResidency);
+    store(resident_var_, b_.c_bool(true));
+    sparse_clamp_ = ins.src_count != 0;
+    if (sparse_clamp_) {
+      b_.capability(CapMinLod);
+      store(min_lod_var_, scalar(ins, 0, Ty::F));
+    }
+    sparse_ = true;
+    return ok_;
+  }
+  if (!sparse_) return fail("SPARSE_END without its SPARSE_BEGIN");
+  sparse_ = sparse_clamp_ = false;
+  // (1 when every texel was resident, else 0: the CPU machine's status)
+  write_bits(ins.dst[0], splat(u4_, select(u_, load(bool_, resident_var_), b_.c_uint(1), b_.c_uint(0))));
+  return ok_;
+}
+
+uint32_t Compiler::sparse_struct(uint32_t texel) {
+  const uint32_t k = texel == f4_ ? 0 : texel == i4_ ? 1 : 2;
+  if (!sparse_types_[k][0]) {
+    sparse_types_[k][0] = texel;
+    sparse_types_[k][1] = b_.id();
+    b_.op(Builder::kGlobals, OpTypeStruct, {sparse_types_[k][1], i_, texel});
+  }
+  return sparse_types_[k][1];
+}
+
+uint32_t Compiler::sparse_result(uint32_t texel, uint32_t value) {
+  const uint32_t code = extract(i_, value, 0);
+  const uint32_t resident = emit(OpImageSparseTexelsResident, bool_, {code});
+  store(resident_var_, emit(OpLogicalAnd, bool_, {load(bool_, resident_var_), resident}));
+  return extract(texel, value, 1);
 }
 
 // ---- storage ----------------------------------------------------------------------------------------------------------------------------------------
@@ -1998,13 +2158,27 @@ uint32_t Compiler::stream_of(const Instruction& ins) {
   return s;
 }
 
+uint32_t Compiler::system_component(uint32_t c) {
+  if (!o_.system_row) return fail("the constants' system row is not there"), b_.c_uint(0);
+  r_.constants = true;
+  return extract(u_, load(u4_, chain(Uniform, u4_, constants_, {b_.c_int(0), b_.c_int(static_cast<int32_t>(o_.system_row))})), c);
+}
+
+// (view instancing, CompileOptions::view_offsets: the layer and viewport of a stage whose text writes neither are the offsets alone)
+void Compiler::write_view_offsets() {
+  if (view_layer_var_) store(view_layer_var_, bitcast(i_, system_component(2)));
+  if (view_viewport_var_) store(view_viewport_var_, bitcast(i_, system_component(1)));
+}
+
 void Compiler::finish_outputs() {
   const bool last = p_.stage == Stage::Vertex || p_.stage == Stage::TessEval;
   if (last && o_.write_point_size && out_block_ && !out_has_kind(IoKind::PointSize)) store(chain(Output, f_, out_block_, {b_.c_int(1)}), b_.c_float(1.0f));
+  if (last) write_view_offsets();
 }
 
 void Compiler::emit_vertex(uint32_t stream) {
   if (o_.write_point_size && out_block_ && !out_has_kind(IoKind::PointSize)) store(chain(Output, f_, out_block_, {b_.c_int(1)}), b_.c_float(1.0f));
+  write_view_offsets();
   if (multi_stream_) emit_void(OpEmitStreamVertex, {b_.c_uint(stream)});
   else emit_void(OpEmitVertex, {});
 }
@@ -2150,6 +2324,7 @@ bool Compiler::instruction(const Instruction& ins) {
     default: break;
   }
   resume();
+  if (ins.op == Op::SparseBegin || ins.op == Op::SparseEnd) return sparse(ins);
   if (is_texture_op(ins.op)) return texture(ins);
   if (ins.op == Op::InterpCentroid || ins.op == Op::InterpSample || ins.op == Op::InterpOffset) return interpolate(ins);
   if (is_memory_op(ins.op)) return memory(ins);

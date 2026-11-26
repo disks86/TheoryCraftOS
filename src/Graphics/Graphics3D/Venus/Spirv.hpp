@@ -51,6 +51,7 @@ enum Op : uint16_t {
   OpEmitStreamVertex = 220, OpEndStreamPrimitive = 221, OpControlBarrier = 224, OpMemoryBarrier = 225, OpAtomicExchange = 229, OpAtomicCompareExchange = 230,
   OpAtomicIAdd = 234, OpAtomicSMin = 236, OpAtomicUMin = 237, OpAtomicSMax = 238, OpAtomicUMax = 239, OpAtomicAnd = 240, OpAtomicOr = 241, OpAtomicXor = 242,
   OpLoopMerge = 246, OpSelectionMerge = 247, OpLabel = 248, OpBranch = 249, OpBranchConditional = 250, OpReturn = 253, OpUnreachable = 255,
+  OpImageSparseSampleImplicitLod = 305, OpImageSparseSampleExplicitLod = 306, OpImageSparseFetch = 313, OpImageSparseGather = 314, OpImageSparseTexelsResident = 316,
   OpBeginInvocationInterlockEXT = 5364, OpEndInvocationInterlockEXT = 5365, OpDemoteToHelperInvocation = 5380,
 };
 
@@ -59,8 +60,8 @@ enum Capability : uint32_t {
   CapStorageImageMultisample = 27, CapClipDistance = 32, CapImageCubeArray = 34, CapSampleRateShading = 35, CapSampled1D = 43, CapImage1D = 44,
   CapSampledCubeArray = 45, CapSampledBuffer = 46, CapImageBuffer = 47, CapStorageImageExtendedFormats = 49, CapImageQuery = 50, CapDerivativeControl = 51,
   CapTransformFeedback = 53, CapGeometryStreams = 54, CapStorageImageReadWithoutFormat = 55, CapStorageImageWriteWithoutFormat = 56, CapMultiViewport = 57,
-  CapInterpolationFunction = 52, CapShaderLayer = 69, CapShaderViewportIndex = 70, CapDrawParameters = 4427, CapFragmentShaderPixelInterlockEXT = 5378,
-  CapDemoteToHelperInvocation = 5379,
+  CapSparseResidency = 41, CapMinLod = 42, CapInterpolationFunction = 52, CapShaderLayer = 69, CapShaderViewportIndex = 70, CapFragmentShadingRateKHR = 4422,
+  CapDrawParameters = 4427, CapFragmentBarycentricKHR = 5284, CapFragmentShaderPixelInterlockEXT = 5378, CapDemoteToHelperInvocation = 5379,
 };
 
 enum StorageClass : uint32_t {
@@ -70,7 +71,7 @@ enum StorageClass : uint32_t {
 enum Decoration : uint32_t {
   DecBlock = 2, DecArrayStride = 6, DecBuiltIn = 11, DecNoPerspective = 13, DecFlat = 14, DecPatch = 15, DecCentroid = 16, DecSample = 17,
   DecNonWritable = 24, DecNonReadable = 25, DecStream = 29, DecLocation = 30, DecComponent = 31, DecIndex = 32, DecBinding = 33, DecDescriptorSet = 34,
-  DecOffset = 35, DecXfbBuffer = 36, DecXfbStride = 37,
+  DecOffset = 35, DecXfbBuffer = 36, DecXfbStride = 37, DecPerVertexKHR = 5285,
 };
 
 enum BuiltIn : uint32_t {
@@ -78,6 +79,7 @@ enum BuiltIn : uint32_t {
   BiTessLevelInner = 12, BiTessCoord = 13, BiPatchVertices = 14, BiFragCoord = 15, BiFrontFacing = 17, BiSampleId = 18, BiSamplePosition = 19, BiSampleMask = 20,
   BiFragDepth = 22, BiHelperInvocation = 23, BiNumWorkgroups = 24, BiWorkgroupId = 26, BiLocalInvocationId = 27, BiGlobalInvocationId = 28,
   BiLocalInvocationIndex = 29, BiVertexIndex = 42, BiInstanceIndex = 43, BiBaseVertex = 4424, BiBaseInstance = 4425,
+  BiPrimitiveShadingRateKHR = 4432, BiShadingRateKHR = 4444, BiBaryCoordKHR = 5286, BiBaryCoordNoPerspKHR = 5287,
 };
 
 enum ExecutionModel : uint32_t { ModelVertex = 0, ModelTessControl = 1, ModelTessEval = 2, ModelGeometry = 3, ModelFragment = 4, ModelGLCompute = 5 };
@@ -91,7 +93,7 @@ enum ExecutionMode : uint32_t {
 
 enum Dim : uint32_t { Dim1D = 0, Dim2D = 1, Dim3D = 2, DimCube = 3, DimBuffer = 5 };
 
-enum ImageOperand : uint32_t { ImBias = 0x1, ImLod = 0x2, ImGrad = 0x4, ImConstOffset = 0x8, ImOffset = 0x10, ImSample = 0x40 };
+enum ImageOperand : uint32_t { ImBias = 0x1, ImLod = 0x2, ImGrad = 0x4, ImConstOffset = 0x8, ImOffset = 0x10, ImSample = 0x40, ImMinLod = 0x80 };
 
 enum Scope : uint32_t { ScopeDevice = 1, ScopeWorkgroup = 2, ScopeInvocation = 4 };
 enum Semantics : uint32_t {

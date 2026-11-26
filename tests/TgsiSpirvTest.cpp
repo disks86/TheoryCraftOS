@@ -335,6 +335,42 @@ static void test_hand_written() {
               "  7: STORE BUFFER[0].x, IMM[0].zzzz, TEMP[1].xxxx\n  8: MOV OUT[0], IN[0]\n  9: END\n",
               oi);
   compile_one("pixel interlock in a vertex shader", "VERT\nDCL IN[0]\nDCL OUT[0], POSITION\n  0: MOV OUT[0], IN[0]\n  1: END\n", oi, false);
+  // what the Direct3D layer writes for the Venus device's later features (gap pass 5): SV_ViewID (VIEWINDEX, the constants' system row) and view instancing's
+  // offsets added to the layer and the viewport, SV_Barycentrics, GetAttributeAtVertex (per-vertex fragment inputs), SV_ShadingRate both ways, residency feedback
+  // with a clamp (SPARSE_BEGIN / SPARSE_END), and the coordinates in texels of non-normalized samplers
+  graphics::tgsi::CompileOptions ov;
+  ov.constant_rows = 274, ov.system_row = 273, ov.view_offsets = true, ov.output_layer_any_stage = true;
+  compile_one("view index and offsets (vertex)",
+              "VERT\nDCL IN[0]\nDCL SV[7], VIEWINDEX\nDCL OUT[0], POSITION\nDCL OUT[1], GENERIC[0]\nDCL TEMP[0]\n  0: MOV OUT[0], IN[0]\n  1: U2F TEMP[0].x, SV[7].xxxx\n"
+              "  2: MOV OUT[1], TEMP[0].xxxx\n  3: END\n",
+              ov);
+  compile_one("view offsets (geometry with a layer)",
+              "GEOM\nPROPERTY GS_INPUT_PRIMITIVE TRIANGLES\nPROPERTY GS_OUTPUT_PRIMITIVE TRIANGLE_STRIP\nPROPERTY GS_MAX_OUTPUT_VERTICES 3\nPROPERTY GS_INVOCATIONS 1\n"
+              "DCL IN[][0], POSITION\nDCL SV[7], VIEWINDEX\nDCL OUT[0], POSITION\nDCL OUT[1], LAYER\nIMM[0] UINT32 {0, 0, 0, 0}\n  0: MOV OUT[0], IN[0][0]\n  1: MOV OUT[1].x, SV[7].xxxx\n"
+              "  2: EMIT IMM[0].xxxx\n  3: MOV OUT[0], IN[1][0]\n  4: EMIT IMM[0].xxxx\n  5: MOV OUT[0], IN[2][0]\n  6: EMIT IMM[0].xxxx\n  7: END\n",
+              ov);
+  compile_one("view index without the system row", "VERT\nDCL IN[0]\nDCL SV[7], VIEWINDEX\nDCL OUT[0], POSITION\n  0: MOV OUT[0], IN[0]\n  1: END\n", o, false);
+  compile_one("barycentrics and vertices",
+              "FRAG\nDCL IN[][1], GENERIC[1]\nDCL IN[31], BARYCENTRIC, PERSPECTIVE\nDCL IN[32], BARYCENTRIC, LINEAR\nDCL IN[34], SHADINGRATE, CONSTANT\nDCL SV[7], VIEWINDEX\n"
+              "DCL OUT[0], COLOR\nDCL TEMP[0..1]\n  0: ADD TEMP[0], IN[31], IN[32]\n  1: MAD TEMP[0], IN[2][1], TEMP[0].xxxx, IN[0][1]\n  2: U2F TEMP[1].x, IN[34].xxxx\n"
+              "  3: U2F TEMP[1].y, SV[7].xxxx\n  4: ADD TEMP[0].xy, TEMP[0].xyyy, TEMP[1].xyyy\n  5: MOV OUT[0], TEMP[0]\n  6: END\n",
+              ov);
+  compile_one("primitive shading rate",
+              "VERT\nDCL IN[0]\nDCL OUT[0], POSITION\nDCL OUT[17], SHADINGRATE\nIMM[0] UINT32 {5, 0, 0, 0}\n  0: MOV OUT[0], IN[0]\n  1: MOV OUT[17].x, IMM[0].xxxx\n  2: END\n", o);
+  compile_one("residency feedback",
+              "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL SAMP[0]\nDCL SVIEW[0], 2D, FLOAT\nDCL SAMP[1]\nDCL SVIEW[1], 2D_ARRAY, FLOAT\nDCL TEMP[0..3]\n"
+              "IMM[0] FLT32 {1.000000000000, 0.000000000000, 0.000000000000, 0.000000000000}\n  0: SPARSE_BEGIN IMM[0].xxxx\n  1: TEX TEMP[0], IN[0], SAMP[0], 2D\n"
+              "  2: SPARSE_END TEMP[1].x\n  3: SPARSE_BEGIN\n  4: TXF TEMP[2], IN[0], SAMP[1], 2D_ARRAY\n  5: TG4 TEMP[3], IN[0], IMM[0].yyyy, SAMP[1], 2D_ARRAY\n"
+              "  6: SPARSE_END TEMP[1].y\n  7: SPARSE_BEGIN IMM[0].xxxx\n  8: TXL TEMP[3], IN[0], SAMP[1], 2D_ARRAY\n  9: SPARSE_END TEMP[1].zw\n 10: ADD TEMP[0], TEMP[0], TEMP[1]\n"
+              " 11: MOV OUT[0], TEMP[0]\n 12: END\n",
+              o);
+  compile_one("residency feedback unclosed", "FRAG\nDCL OUT[0], COLOR\nDCL TEMP[0]\n  0: SPARSE_END TEMP[0].x\n  1: END\n", o, false);
+  graphics::tgsi::CompileOptions ou;
+  ou.unnormalized_units = 1;
+  compile_one("coordinates in texels",
+              "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL SAMP[0]\nDCL SVIEW[0], 2D, FLOAT\nDCL TEMP[0..1]\nIMM[0] UINT32 {0, 0, 0, 0}\n  0: TEX TEMP[0], IN[0], SAMP[0], 2D\n"
+              "  1: TXL TEMP[1], IN[0], SAMP[0], 2D\n  2: TG4 TEMP[1], IN[0], IMM[0].xxxx, SAMP[0], 2D\n  3: ADD OUT[0], TEMP[0], TEMP[1]\n  4: END\n",
+              ou);
   compile_one("unknown opcode", "VERT\n  0: FROB TEMP[0], IN[0]\n  1: END\n", o, false);
   compile_one("no end", "VERT\nDCL TEMP[0]\n  0: MOV TEMP[0], TEMP[0]\n", o, false);
 }
