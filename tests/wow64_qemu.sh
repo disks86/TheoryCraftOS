@@ -42,16 +42,15 @@ i686-w64-mingw32-gcc -O1 -o "$work/seh32.exe" tests/windows/seh32.c
 i686-w64-mingw32-gcc -O1 -o "$work/gui32.exe" tests/windows/gui32.c -ladvapi32 -luser32 -lgdi32 -lshell32 -lole32 -lcomctl32 -luuid
 i686-w64-mingw32-gcc -O1 -fno-omit-frame-pointer -o "$work/lib32.exe" tests/windows/lib32.c -lws2_32 -lcomdlg32 -lwinmm -limm32 -ldbghelp -lbcrypt -luser32 -lntdll
 i686-w64-mingw32-gcc -O1 -mcrtdll=msvcrt-os -o "$work/old32.exe" tests/windows/old32.c
-# (the shaders dx32 draws with, as C arrays: the kernel's own fixtures, as tests/emulated_dx.sh makes them)
+# (the shaders dx32 and d3d11test draw with, as C arrays: every one of the kernel's own fixtures, dx_<name>_dxbc and dx_<name>_dxil, as tests/emulated_dx.sh and
+# tests/d3d12_qemu.sh make them, so a new fixture needs no list here)
 python3 - "$work/dxfixtures.h" <<'PY'
-import sys
+import glob, os, sys
 out = open(sys.argv[1], "w")
-for n in ("vs", "ps_iface", "ps_color", "ps_tex", "cs_fill", "vs_attrs6", "ps_tex4", "ps_mrt8", "ps_cbuf", "vs_packed", "ps_packed", "ps_planes", "vs_vol", "ps_texcube", "ps_texarray", "ps_tex3d", "gs_copy", "hs_tri_cb", "ds_shift", "cs_d3d11", "ps_sbuf", "ps_tex1d", "ps_tex1darray", "ps_int_load", "ps_int_write", "cs_uav_array", "cs_uav_load", "cs_uav_atomic", "ps_uav", "cs_uav_volume", "ps_gather_cmp_cubearray", "ps_texslice", "gs_layer", "cs_plane_uav", "ps_shadow", "ps_shadow_pcf", "ps_stencil", "ps_shadow_array", "ps_shadow_cube", "ps_pair", "ps_stencil_only", "cs_typed_buffer", "cs_append", "cs_append_u3", "vs_uav", "ps_uav_only", "ps_texarray_lod", "ps_texcubearray", "ps_texcubearray_lod", "ps_tex3d_lod", "ps_texelarray_level", "rootsig_lib", "cs_fmt_load", "cs_fmt_loadu", "cs_fmt_loadi", "cs_fmt_sample", "ps_fmt_out", "ps_fmt_outu", "ps_fmt_outi", "vs_fmt_quad", "ps_mrt", "ps_show", "gs_viewport", "vs_fmt", "vs_fmt_uint", "vs_fmt_sint", "ps_tiled", "ps_tiled_clamp", "ps_tiled_3d", "ps_tiled_array", "cs_smp_lod", "ps_call_switch", "ps_switch", "vs_call_switch", "ps_texcoord0", "vs_layout_sig", "ps_iface_dyn", "cs_tiled_loads", "cs_bits", "gs_loop", "cs_vol_typed"):
-    data = open("tests/data/dxbc/%s.dxbc" % n, "rb").read()
-    out.write("static const unsigned char dx_%s_dxbc[] = {%s};\n" % (n, ",".join(str(b) for b in data)))
-for n in ("dxil_vs_view", "dxil_ps_view", "dxil_ps_bary", "dxil_ps_attr", "dxil_ps_rate", "dxil_vs_rate"):      # (DXIL ones: dx_<name>_dxil)
-    data = open("tests/data/dxbc/%s.dxil" % n, "rb").read()
-    out.write("static const unsigned char dx_%s_dxil[] = {%s};\n" % (n, ",".join(str(b) for b in data)))
+for path in sorted(glob.glob("tests/data/dxbc/*.dxbc") + glob.glob("tests/data/dxbc/*.dxil")):
+    n = os.path.basename(path).replace(".", "_")
+    data = open(path, "rb").read()
+    out.write("static const unsigned char dx_%s[] = {%s};\n" % (n, ",".join(str(b) for b in data)))
 PY
 i686-w64-mingw32-gcc -O1 -I "$work" -o "$work/dx32.exe" tests/windows/dx32.c -ldxgi -ld3d12 -luuid -lgdi32
 i686-w64-mingw32-gcc -O1 -I "$work" -o "$work/d3d11test.exe" tests/windows/d3d11test.c -ld3d11 -ld3d12 -ldxgi -luuid -ldxguid -luser32
