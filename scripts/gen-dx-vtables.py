@@ -25,7 +25,7 @@ A method defined with `#define <prefix>_<Method> <function>` counts too (the IUn
 import re, os, sys
 
 INC = '/usr/x86_64-w64-mingw32/include/'
-HEADERS = ['d3d12.h', 'd3d12video.h', 'd3d12sdklayers.h', 'dxgi1_6.h', 'dxgi1_5.h', 'dxgi1_4.h', 'dxgi1_3.h', 'dxgi1_2.h', 'dxgi.h', 'd3dcommon.h', 'd3d11.h', 'd3d11_1.h', 'd3d11_2.h', 'd3d11_3.h', 'd3d11_4.h', 'd3d9.h']
+HEADERS = ['d3d12.h', 'd3d12video.h', 'd3d12sdklayers.h', 'dxgi1_6.h', 'dxgi1_5.h', 'dxgi1_4.h', 'dxgi1_3.h', 'dxgi1_2.h', 'dxgi.h', 'd3dcommon.h', 'd3d11.h', 'd3d11_1.h', 'd3d11_2.h', 'd3d11_3.h', 'd3d11_4.h', 'd3d9.h', 'd3d10.h', 'd3d10_1.h', 'd3d10effect.h', 'd3d10shader.h']
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src', 'Windows')
 
 # (interface, vtable variable, [prefixes in the order they are tried])
@@ -104,6 +104,54 @@ SPECS = {
         ('ID3D11VideoDecoderOutputView', 'dov_vtbl', ['dov', 'vview', 'child', 'obj']),
         ('ID3D11VideoProcessorInputView', 'piv_vtbl', ['piv', 'vview', 'child', 'obj']),
         ('ID3D11VideoProcessorOutputView', 'pov_vtbl', ['pov', 'vview', 'child', 'obj']),
+        # (Direct3D 10: the device's other face and the objects' ID3D10 interfaces, d3d10.inc)
+        ('ID3D10Device1', 'd10dev_vtbl', ['d10dev']),
+        ('ID3D10Buffer', 'd10buf_vtbl', ['d10buf', 'd10res', 'd10c']),
+        ('ID3D10Texture1D', 'd10tex1d_vtbl', ['d10tex1d', 'd10res', 'd10c']),
+        ('ID3D10Texture2D', 'd10tex_vtbl', ['d10tex', 'd10res', 'd10c']),
+        ('ID3D10Texture3D', 'd10tex3_vtbl', ['d10tex3', 'd10res', 'd10c']),
+        ('ID3D10RenderTargetView', 'd10rtv_vtbl', ['d10rtv', 'd10view', 'd10c']),
+        ('ID3D10DepthStencilView', 'd10dsv_vtbl', ['d10dsv', 'd10view', 'd10c']),
+        ('ID3D10ShaderResourceView1', 'd10srv_vtbl', ['d10srv', 'd10view', 'd10c']),
+        ('ID3D10VertexShader', 'd10vs_vtbl', ['d10c']),
+        ('ID3D10GeometryShader', 'd10gs_vtbl', ['d10c']),
+        ('ID3D10PixelShader', 'd10ps_vtbl', ['d10c']),
+        ('ID3D10InputLayout', 'd10layout_vtbl', ['d10c']),
+        ('ID3D10BlendState1', 'd10blend_vtbl', ['d10blend', 'd10c']),
+        ('ID3D10DepthStencilState', 'd10depth_vtbl', ['d10depth', 'd10c']),
+        ('ID3D10RasterizerState', 'd10raster_vtbl', ['d10raster', 'd10c']),
+        ('ID3D10SamplerState', 'd10sampler_vtbl', ['d10sampler', 'd10c']),
+        ('ID3D10Query', 'd10query_vtbl', ['d10query', 'd10c']),
+    ],
+    'd3d10': [
+        ('ID3D10Blob', 'blob_vtbl', ['blob', 'obj']),
+        ('ID3D10StateBlock', 'sb_vtbl', ['sb', 'obj']),
+        # (shader reflection: shader.inc)
+        ('ID3D10ShaderReflection', 'refl_vtbl', ['refl', 'obj']),
+        ('ID3D10ShaderReflectionConstantBuffer', 'reflcb_vtbl', ['reflcb']),
+        ('ID3D10ShaderReflectionVariable', 'reflvar_vtbl', ['reflvar']),
+        ('ID3D10ShaderReflectionType', 'refltype_vtbl', ['refltype']),
+        # (effects: effect.inc)
+        ('ID3D10Effect', 'fx_vtbl', ['fx']),
+        ('ID3D10Effect', 'fxpe_vtbl', ['fxpe', 'fx']),
+        ('ID3D10EffectPool', 'fxpool_vtbl', ['fxpool']),
+        ('ID3D10EffectTechnique', 'fxt_vtbl', ['fxt']),
+        ('ID3D10EffectPass', 'fxpass_vtbl', ['fxpass']),
+        ('ID3D10EffectType', 'fxtype_vtbl', ['fxtype']),
+        ('ID3D10EffectVariable', 'fxv_vtbl', ['fxv']),
+        ('ID3D10EffectConstantBuffer', 'fxcb_vtbl', ['fxcb', 'fxv']),
+        ('ID3D10EffectScalarVariable', 'fxs_vtbl', ['fxs', 'fxv']),
+        ('ID3D10EffectVectorVariable', 'fxvec_vtbl', ['fxvec', 'fxv']),
+        ('ID3D10EffectMatrixVariable', 'fxm_vtbl', ['fxm', 'fxv']),
+        ('ID3D10EffectStringVariable', 'fxstr_vtbl', ['fxstr', 'fxv']),
+        ('ID3D10EffectShaderResourceVariable', 'fxsrv_vtbl', ['fxsrv', 'fxv']),
+        ('ID3D10EffectRenderTargetViewVariable', 'fxrtv_vtbl', ['fxrtv', 'fxv']),
+        ('ID3D10EffectDepthStencilViewVariable', 'fxdsv_vtbl', ['fxdsv', 'fxv']),
+        ('ID3D10EffectShaderVariable', 'fxsh_vtbl', ['fxsh', 'fxv']),
+        ('ID3D10EffectBlendVariable', 'fxblend_vtbl', ['fxblend', 'fxv']),
+        ('ID3D10EffectDepthStencilVariable', 'fxds_vtbl', ['fxds', 'fxv']),
+        ('ID3D10EffectRasterizerVariable', 'fxrs_vtbl', ['fxrs', 'fxv']),
+        ('ID3D10EffectSamplerVariable', 'fxsamp_vtbl', ['fxsamp', 'fxv']),
     ],
     'd3d9': [
         ('IDirect3D9', 'd3d_vtbl', ['d3d', 'obj']),

@@ -19,9 +19,12 @@ list of failing tests is the to-do list for the implementation.
 ## State
 
 343 programs build (kernel32 33, comctl32 29, ntdll 28, user32 23, shell32 19, crypt32 15, gdi32 14, advapi32 12, gdiplus 12, ole32 11, shlwapi 11, winmm 10, ... 60 DLLs).
-26 tests are imported but do not link here, because they need something mingw-w64 lacks: the import libraries of `kernelbase`, `win32u`, `winspool.drv` and `d3d10_1`,
-the private entry points `__STRINGTOLD`, `GetDiskInfoA` and `D3D10CreateDevice1`, or GUIDs and helpers that Wine's build makes from IDL files of its own tree (msi, dsound,
+26 tests are imported but do not link here, because they need something mingw-w64 lacks: the import libraries of `kernelbase`, `win32u` and `winspool.drv`,
+the private entry points `__STRINGTOLD` and `GetDiskInfoA`, or GUIDs and helpers that Wine's build makes from IDL files of its own tree (msi, dsound,
 oleaut32 `tmarshal`, rpcrt4 `cstub`, ole32 `CLSID_ManualResetEvent`, ...). Wine tests of DLLs this OS has no file for (windowscodecs, jscript, vbscript, ...) are not imported.
+A DLL mingw-w64 has no import library of (`d3d10_1`) gets one made from this OS's own `src/Windows/<dll>/<dll>.def` (dlltool), and a DLL's `defines.txt` holds the
+EXTRADEFS of its Makefile.in (`d3d10`, `d3d10_1`: d3dcompiler_43's `reflection.c` built with `-DD3D_COMPILER_VERSION=0`, which tests `D3D10ReflectShader`). The Direct3D 10
+tests (`d3d10core`, `d3d10_1`, `d3d10`) were added later, from the same commit.
 
 ## Running them, and where the implementations stand
 

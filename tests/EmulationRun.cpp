@@ -66,6 +66,10 @@
 #include "Graphics/Graphics3D/LockedDevice.hpp"
 #include "Wayland/Dxg/WaylandDxgImage.hpp"
 #endif
+#ifdef TCOS_EMU_DXG
+#include <dirent.h>      // (System32's libraries in the file system: below)
+#include "FileSystem/SystemLayout.hpp"
+#endif
 #ifdef TCOS_EMU_AUDIO
 #include <cmath>
 #include <dirent.h>
@@ -343,8 +347,9 @@ int main(int argc, char** argv) {
         printf("linux files: cannot write %s\n", path.c_str());
     }
   }
-#ifdef TCOS_EMU_AUDIO
-  // the libraries in System32 as well, for what a program loads while it runs (ole32 loading dsound.dll or mmdevapi.dll for CoCreateInstance)
+#if defined(TCOS_EMU_AUDIO) || defined(TCOS_EMU_DXG)
+  // the libraries in System32 as well, for what a program loads while it runs (ole32 loading dsound.dll or mmdevapi.dll for CoCreateInstance, a Direct3D program
+  // d3d10_1.dll or d3dcompiler_47.dll)
   if (argc > 2)
     if (DIR* d = opendir(argv[2])) {
       while (dirent* e = readdir(d)) {

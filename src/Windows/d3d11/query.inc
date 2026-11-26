@@ -298,8 +298,8 @@ static HRESULT STDMETHODCALLTYPE ctx_GetData(Ctx *c, ID3D11Asynchronous *async, 
   Query *q = query_of(async);
   if (!q || (flags & ~(UINT)D3D11_ASYNC_GETDATA_DONOTFLUSH)) return E_INVALIDARG;
   const UINT need = query_data_size(q->desc.Query);
-  if (data && size != need && size != 0) return E_INVALIDARG;
-  if (q->begun && !q->ended) return S_FALSE;      /* (begun and not ended: not done) */
+  if ((data && size != need && size != 0) || (!data && size)) return E_INVALIDARG;
+  if (q->begun && !q->ended) return DXGI_ERROR_INVALID_CALL;      /* (begun and not ended: being built, nothing to ask yet - as Windows answers) */
   if (!q->ended) return DXGI_ERROR_INVALID_CALL;  /* (never issued) */
   if (!data || size == 0) return S_OK;
   const UINT stream = query_stream(q->desc.Query);
@@ -341,7 +341,7 @@ static void STDMETHODCALLTYPE ctx_SetPredication(Ctx *c, ID3D11Predicate *predic
   c->predicate_value = value;
 }
 static void STDMETHODCALLTYPE ctx_GetPredication(Ctx *c, ID3D11Predicate **predicate, BOOL *value) {
-  if (predicate) { *predicate = (ID3D11Predicate *)c->predicate; if (c->predicate) dx_AddRef(OBJ(c->predicate)); }
+  if (predicate) { *predicate = (ID3D11Predicate *)c->predicate; if (c->predicate) child_ref(c->predicate); }
   if (value) *value = c->predicate_value;
 }
 /* Whether the next predicated command of the immediate context is left out. */

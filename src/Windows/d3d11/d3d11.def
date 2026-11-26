@@ -52,3 +52,5 @@ D3DPerformance_BeginEvent @48
 D3DPerformance_EndEvent @49
 D3DPerformance_GetStatus @50
 D3DPerformance_SetMarker @51
+; (private: d3d10core.dll's D3D10CoreCreateDevice, src/Windows/d3d11/d3d10.inc)
+TcosD3D10CoreCreateDevice

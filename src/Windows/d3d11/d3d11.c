@@ -79,6 +79,8 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 
 #define OBJ(x) ((DxObj *)(x))
 #define TEXTURE_SLOTS 8u              /* s0 .. s7, and the shader resources of a draw whose shaders declare none above t7 (the narrow table) */
+#define SAMPLER_SLOTS 16u             /* s0 .. s15 a stage binds (D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT): kept and given back; the kernel's table has s0 .. s7, and a shader that
+                                       * declares one above s7 is not drawn (Shader.sampler_beyond) */
 #define SRV_SLOTS 128u                /* t0 .. t127 (D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT): the wide table, for shaders that declare one above t7 */
 #define CONSTANT_SLOTS 14u            /* b0 .. b13 a stage */
 #define CONSTANT_BLOCK 4096u          /* the bytes of constants a draw has in all (the kernel's limit) */
@@ -92,6 +94,7 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 #define DSV_SLOTS 256u
 #define PIPELINES 96u
 #define VERTEX_SLOTS 8u
+#define VB_BIND_SLOTS 32u             /* the vertex buffer slots a program binds (D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT): kept and given back; draws read the first VERTEX_SLOTS (a layout of an element past them is not drawn) */
 #define ACTIVE_QUERIES 32u            /* queries begun and not ended at once */
 #define MEASURES 2048u                /* the kernel's measurements one list holds (query.inc: one a run of draws for the same active queries) */
 #define UAV_SLOTS 64u                 /* u0 .. u63: of the compute shader, and of the graphics stages beside the render targets (D3D11_1_UAV_SLOT_COUNT; at feature level 11_0 u0 .. u7,
@@ -119,6 +122,9 @@ typedef struct Child {
   Dev *dev;
   UINT id;
   LONG internal;      /* the references of the runtime itself (bindings, views, recorded commands): not counted in what AddRef and Release answer, as in Windows */
+  const void *face10; /* the object as Direct3D 10 sees it (d3d10.inc): the table of its ID3D10 interface, set when first asked for (NULL: not yet, or none) */
+  LONG dev_held;      /* it has a reference to its device: while the program has one to it (an object only the runtime holds - bound, viewed - does not keep the device, as in
+                       * Windows, where a device whose program let go of everything is gone though its state still holds objects) */
 } Child;
 static LONG g_next_id;
 
@@ -154,6 +160,7 @@ struct Buf {
   struct TilePool *tile_pool;
   int tiled;
   struct Buf *mapped_pool;
+  IDXGIResource1 dxgi_res;     /* the same object, for DXGI (dxgi_resource.inc: set when first asked for) */
 };
 
 struct Tex {
@@ -201,6 +208,10 @@ struct Tex {
   /* CPU access to a texture of default usage (MapOnDefaultTextures, layout.inc): its D3D11_TEXTURE_LAYOUT. UNDEFINED is mapped with no pointer and reached with
    * WriteToSubresource / ReadFromSubresource; ROW_MAJOR is mapped as a staging texture is; 64K_STANDARD_SWIZZLE hands out its texels in Direct3D's standard swizzle. */
   UINT layout;
+  /* A GDI-compatible texture's device context while the program has it (IDXGISurface1::GetDC, dxgi_resource.inc): a memory DC with a DIB section of the texels. */
+  HDC gdi_dc;
+  HBITMAP gdi_bitmap, gdi_previous;
+  BYTE *gdi_bits;
 };
 
 /* A render target, depth-stencil, shader resource or unordered access view: the texture (or buffer), and the descriptor of the first two. A view of a buffer names
@@ -242,6 +253,7 @@ typedef struct Shader {
   UINT64 uav_mask;                        /* the u<n> it declares */
   BOOL rov;                               /* one of them is a rasterizer ordered view (the dcl_uav_* token's D3D11_SB_RASTERIZER_ORDERED_ACCESS) */
   BOOL uav_beyond;                        /* it declares one past u63 */
+  BOOL sampler_beyond;                    /* it declares a sampler above s7, which the kernel's table has not */
   UINT group[3];                          /* a compute shader's threads in a group (dcl_thread_group) */
   UINT gs_instances;                      /* a geometry shader's instances (dcl_gs_instance_count; 0: one) */
   UINT program_type;                      /* the shader's stage by its version token (D3D10_SB_TOKENIZED_PROGRAM_TYPE: 0 pixel, 1 vertex, 2 geometry, 3 hull, 4 domain, 5 compute) */
@@ -321,22 +333,22 @@ typedef struct Ctx {
   /* ---- the bound objects (references) */
   Shader *vs, *ps;
   Layout *layout;
-  Buf *vb[VERTEX_SLOTS];
+  Buf *vb[VB_BIND_SLOTS];
   Buf *ib;
   Buf *vs_cb[CONSTANT_SLOTS], *ps_cb[CONSTANT_SLOTS];
   View *srv[SRV_SLOTS];
-  Sampler *sampler[TEXTURE_SLOTS];
+  Sampler *sampler[SAMPLER_SLOTS];
   /* The geometry, hull and domain stages (STAGE_GS ...), and the textures and samplers of the stages but the pixel shader's (STAGE_VS ..., which share the table:
    * a slot the pixel shader has nothing bound to takes the first of the others that has). */
   Shader *gs, *hs, *ds;
   Buf *stage_cb[3][CONSTANT_SLOTS];
   View *stage_srv[4][SRV_SLOTS];
-  Sampler *stage_sampler[4][TEXTURE_SLOTS];
+  Sampler *stage_sampler[4][SAMPLER_SLOTS];
   /* the compute stage, and the unordered access views of the pixel shader (OMSetRenderTargetsAndUnorderedAccessViews: u<n> for n from the first after the targets) */
   Shader *cs;
   Buf *cs_cb[CONSTANT_SLOTS];
   View *cs_srv[SRV_SLOTS];
-  Sampler *cs_sampler[TEXTURE_SLOTS];
+  Sampler *cs_sampler[SAMPLER_SLOTS];
   View *cs_uav[UAV_SLOTS];
   View *ps_uav[UAV_SLOTS];
   View *rtv[8];
@@ -347,7 +359,7 @@ typedef struct Ctx {
   struct ClassInst *instances[6][D3D11_SHADER_MAX_INTERFACES];  /* the class instances bound with each stage's shader (vs, ps, gs, hs, ds, cs), by interface slot */
   struct Query *predicate;            /* SetPredication: the predicate, and the value that leaves the commands out */
   /* ---- the plain values */
-  UINT vb_stride[VERTEX_SLOTS], vb_offset[VERTEX_SLOTS];
+  UINT vb_stride[VB_BIND_SLOTS], vb_offset[VB_BIND_SLOTS];
   DXGI_FORMAT ib_format;
   UINT ib_offset;
   D3D11_PRIMITIVE_TOPOLOGY topology;
@@ -392,6 +404,11 @@ struct Dev {
   IDXGIDevice1 dxgi;                       /* the same object, for dxgi's interfaces */
   ITcosPresenter presenter;                /* ... and for dxgi.dll's swap chains */
   ID3D11On12Device1 on12;                  /* ... and, made by D3D11On12CreateDevice on the program's Direct3D 12 device, ID3D11On12Device1 (interop.inc; NULL table: not one) */
+  ID3D10Device1 d10;                       /* ... and, made by Direct3D 10 (d3d10core.dll, d3d10.dll, d3d10_1.dll), ID3D10Device1 (d3d10.inc; NULL table: a Direct3D 11 device) */
+  ID3D10Multithread d10mt;                 /* ... and ID3D10Multithread (every device: the immediate context's lock) */
+  UINT d10_flags;                          /* a Direct3D 10 device: its D3D10_CREATE_DEVICE flags (what GetCreationFlags answers) */
+  UINT d10_exceptions;                     /* ... SetExceptionMode's D3D10_RAISE_FLAG */
+  UINT d10_text_filter[2];                 /* ... SetTextFilterSize */
   CRITICAL_SECTION lock;
   IDXGIAdapter *adapter;
   IDXGIFactory1 *factory;                  /* the factory the adapter was taken from, when the program gave none */
@@ -481,19 +498,32 @@ static void *child_new(SIZE_T size, Dev *dev, const void *vtbl, const GUID *cons
   dx_init(&c->o, vtbl, iids, destroy);
   c->dev = dev;
   c->id = (UINT)InterlockedIncrement(&g_next_id);
+  c->dev_held = 1;
   dx_AddRef(OBJ(dev));
   return c;
 }
-static void child_destroy(DxObj *o) { dx_Release(OBJ(((Child *)o)->dev)); }
+static void child_destroy(DxObj *o) { if (InterlockedExchange(&((Child *)o)->dev_held, 0)) dx_Release(OBJ(((Child *)o)->dev)); }
 /* A reference of the runtime's own to a child (hold) and its end (unhold): the object lives while either kind is there; AddRef and Release answer the program's. */
 static void hold(void *object) { if (object) { InterlockedIncrement(&((Child *)object)->internal); dx_AddRef(OBJ(object)); } }
 static void unhold(void *object) { if (object) { InterlockedDecrement(&((Child *)object)->internal); dx_Release(OBJ(object)); } }
-static ULONG STDMETHODCALLTYPE child_AddRef(Child *c) { return (ULONG)(InterlockedIncrement(&c->o.ref) - c->internal); }
+/* The program's references: the first again takes the device's (child.dev_held); the last, while the runtime still holds the object, gives it back - after the object's own,
+ * as the device's last may take the runtime's (its state) and with them the object. */
+static ULONG STDMETHODCALLTYPE child_AddRef(Child *c) {
+  const LONG n = InterlockedIncrement(&c->o.ref) - c->internal;
+  if (n == 1 && !InterlockedExchange(&c->dev_held, 1)) dx_AddRef(OBJ(c->dev));
+  return (ULONG)n;
+}
 static ULONG STDMETHODCALLTYPE child_Release(Child *c) {
   const LONG internal = c->internal;
+  Dev *d = c->dev;
+  const BOOL last = internal > 0 && c->o.ref - internal == 1;
   const LONG n = (LONG)dx_Release(OBJ(c));
+  if (last && InterlockedExchange(&c->dev_held, 0)) dx_Release(OBJ(d));
   return n > internal ? (ULONG)(n - internal) : 0;
 }
+/* A reference handed to the program (a getter's, GetResource's): AddRef's. */
+static void child_ref(void *object) { if (object) child_AddRef((Child *)object); }
+static HRESULT STDMETHODCALLTYPE child_QueryInterface(Child *c, REFIID riid, void **out);      /* (d3d10.inc: the object's Direct3D 10 interface, then its others) */
 static void STDMETHODCALLTYPE child_GetDevice(Child *c, ID3D11Device **out) {
   if (!out) return;
   dx_AddRef(OBJ(c->dev));
@@ -533,6 +563,7 @@ extern const ID3D11DepthStencilStateVtbl depth_vtbl;
 extern const ID3D11RasterizerState2Vtbl raster_vtbl;
 extern const ID3D11SamplerStateVtbl sampler_vtbl;
 extern const ID3D11Query1Vtbl query_vtbl;
+static const ID3D10MultithreadVtbl g_d10mt_vtbl;      /* (d3d10.inc) */
 extern const ID3D11VideoDevice2Vtbl vdev_vtbl;      /* (video.inc) */
 static void video_shutdown(Dev *d);
 extern const ID3D11VideoContext3Vtbl vctx_vtbl;
@@ -752,7 +783,7 @@ static HRESULT buf_gpu_read(Dev *d, Buf *b, UINT64 offset, UINT64 bytes, void *o
 static BOOL buffer_desc_valid(const D3D11_BUFFER_DESC *desc, const D3D11_SUBRESOURCE_DATA *initial) {
   const UINT bind = desc->BindFlags, misc = desc->MiscFlags;
   const UINT known_bind = D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER | D3D11_BIND_CONSTANT_BUFFER | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_STREAM_OUTPUT |
-                          D3D11_BIND_UNORDERED_ACCESS;
+                          D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_RENDER_TARGET;      /* (a buffer may be a render target: the view of one is refused, docs/Direct3D11.md) */
   if (desc->ByteWidth == 0 || desc->ByteWidth > (256u << 20) || (bind & ~known_bind)) return FALSE;
   /* (tiled buffers and tile pools - TiledResourcesTier 1: of default usage without CPU access, not shared; a tile pool is bound to nothing, a whole number of 64 KiB tiles; a
    * tiled buffer is not a constant buffer - its constants could not be read here, where constant buffers are the CPU's memory - and has no initial data) */
@@ -779,6 +810,7 @@ static BOOL buffer_desc_valid(const D3D11_BUFFER_DESC *desc, const D3D11_SUBRESO
   if (structured && (desc->StructureByteStride == 0 || desc->StructureByteStride % 4 || desc->StructureByteStride > 2048 || desc->ByteWidth % desc->StructureByteStride)) return FALSE;
   if ((structured || raw) && (bind & (D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER | D3D11_BIND_STREAM_OUTPUT | D3D11_BIND_CONSTANT_BUFFER))) return FALSE;
   if (raw && desc->ByteWidth % 4) return FALSE;
+  if (raw && (!(bind & (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS)) || (bind & D3D11_BIND_RENDER_TARGET))) return FALSE;      /* (raw views are of those two) */
   if ((misc & D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS) && structured) return FALSE;
   return TRUE;
 }
@@ -790,6 +822,7 @@ static HRESULT STDMETHODCALLTYPE dev_CreateBuffer(Dev *d, const D3D11_BUFFER_DES
   Buf *b = child_new(sizeof *b, d, &buf_vtbl, g_buf_iids, buf_destroy);
   if (!b) return E_OUTOFMEMORY;
   b->desc = *desc;
+  if (!(desc->MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED)) b->desc.StructureByteStride = 0;      /* (kept only for a structured buffer, as Windows) */
   b->version = 1;
   if (desc->MiscFlags & (D3D11_RESOURCE_MISC_TILED | D3D11_RESOURCE_MISC_TILE_POOL)) {
     EnterCriticalSection(&d->lock);
@@ -1252,6 +1285,7 @@ static HRESULT tex_read_rows(Dev *d, Tex *t, UINT sub, UINT z, BYTE *rows, BOOL 
 
 static void tex_destroy(DxObj *o) {
   Tex *t = (Tex *)o;
+  if (t->gdi_dc) { SelectObject(t->gdi_dc, t->gdi_previous); DeleteObject(t->gdi_bitmap); DeleteDC(t->gdi_dc); }      /* (a DC never given back) */
   settle(t->c.dev, t->used);
   if (t->shadow) for (UINT i = 0; i < tex_subresources(t); ++i) mem_free(t->shadow[i]);
   mem_free(t->shadow);
@@ -1621,7 +1655,7 @@ static Tex *tex_of_resource(ID3D11Resource *resource) {
 static void STDMETHODCALLTYPE view_GetResource(View *v, ID3D11Resource **out) {
   if (!out) return;
   DxObj *r = v->tex ? OBJ(v->tex) : OBJ(v->buf);
-  dx_AddRef(r);
+  child_ref(r);
   *out = (ID3D11Resource *)r;
 }
 /* The list that last used what a view is of. */
@@ -1886,10 +1920,70 @@ static HRESULT rtv_create(Dev *d, ID3D11Resource *resource, const D3D11_RENDER_T
 static HRESULT STDMETHODCALLTYPE dev_CreateRenderTargetView(Dev *d, ID3D11Resource *resource, const D3D11_RENDER_TARGET_VIEW_DESC *desc, ID3D11RenderTargetView **out) {
   return rtv_create(d, resource, desc, -1, out);
 }
-static HRESULT STDMETHODCALLTYPE dev_CreateDepthStencilView(Dev *d, ID3D11Resource *resource, const D3D11_DEPTH_STENCIL_VIEW_DESC *desc, ID3D11DepthStencilView **out) {
+static BOOL format_is_typeless(DXGI_FORMAT f);      /* (device.inc) */
+/* The depth format a typeless depth texture is viewed with (DXGI_FORMAT_UNKNOWN: none of that family). */
+static DXGI_FORMAT dsv_depth_of(DXGI_FORMAT typeless) {
+  switch (typeless) {
+    case DXGI_FORMAT_R24G8_TYPELESS: return DXGI_FORMAT_D24_UNORM_S8_UINT;
+    case DXGI_FORMAT_R32_TYPELESS: return DXGI_FORMAT_D32_FLOAT;
+    case DXGI_FORMAT_R16_TYPELESS: return DXGI_FORMAT_D16_UNORM;
+    case DXGI_FORMAT_R32G8X24_TYPELESS: return DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    default: return DXGI_FORMAT_UNKNOWN;
+  }
+}
+/* A depth-stencil view's description as Windows checks and keeps it: the texture's format for UNKNOWN (a typeless texture needs the depth format of its family), a dimension
+ * of the texture's kind (a one-dimensional texture's or a two-dimensional one's: of a 2D texture the multisampled dimensions too, which Windows takes of a texture of one
+ * sample), a level it has, slices it has - ArraySize ~0 being all from the first on. Without a description: all of the texture, of its kind. E_INVALIDARG for the rest. */
+static HRESULT dsv_normalize(const Tex *t, const D3D11_DEPTH_STENCIL_VIEW_DESC *in, D3D11_DEPTH_STENCIL_VIEW_DESC *out) {
+  const UINT layers = t->desc.ArraySize, levels = t->desc.MipLevels;
+  memset(out, 0, sizeof *out);
+  if (!in) {
+    if (format_is_typeless(t->desc.Format)) return E_INVALIDARG;
+    out->Format = t->desc.Format;
+    if (t->one_d) out->ViewDimension = layers > 1 ? D3D11_DSV_DIMENSION_TEXTURE1DARRAY : D3D11_DSV_DIMENSION_TEXTURE1D;
+    else if (t->desc.SampleDesc.Count > 1) out->ViewDimension = layers > 1 ? D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY : D3D11_DSV_DIMENSION_TEXTURE2DMS;
+    else out->ViewDimension = layers > 1 ? D3D11_DSV_DIMENSION_TEXTURE2DARRAY : D3D11_DSV_DIMENSION_TEXTURE2D;
+    if (out->ViewDimension == D3D11_DSV_DIMENSION_TEXTURE1DARRAY) out->Texture1DArray.ArraySize = layers;
+    if (out->ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2DARRAY) out->Texture2DArray.ArraySize = layers;
+    if (out->ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY) out->Texture2DMSArray.ArraySize = layers;
+    return S_OK;
+  }
+  *out = *in;
+  if (in->Format == DXGI_FORMAT_UNKNOWN) {
+    if (format_is_typeless(t->desc.Format)) return E_INVALIDARG;
+    out->Format = t->desc.Format;
+  } else if (in->Format != t->desc.Format && in->Format != dsv_depth_of(t->desc.Format)) {
+    return E_INVALIDARG;
+  }
+  UINT *first = NULL, *size = NULL, mip = 0;
+  switch (in->ViewDimension) {
+    case D3D11_DSV_DIMENSION_TEXTURE1D: if (!t->one_d) return E_INVALIDARG; mip = in->Texture1D.MipSlice; break;
+    case D3D11_DSV_DIMENSION_TEXTURE1DARRAY: if (!t->one_d) return E_INVALIDARG; mip = in->Texture1DArray.MipSlice; first = &out->Texture1DArray.FirstArraySlice;
+      size = &out->Texture1DArray.ArraySize; break;
+    case D3D11_DSV_DIMENSION_TEXTURE2D: if (t->one_d) return E_INVALIDARG; mip = in->Texture2D.MipSlice; break;
+    case D3D11_DSV_DIMENSION_TEXTURE2DARRAY: if (t->one_d) return E_INVALIDARG; mip = in->Texture2DArray.MipSlice; first = &out->Texture2DArray.FirstArraySlice;
+      size = &out->Texture2DArray.ArraySize; break;
+    case D3D11_DSV_DIMENSION_TEXTURE2DMS: if (t->one_d) return E_INVALIDARG; break;
+    case D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY: if (t->one_d) return E_INVALIDARG; first = &out->Texture2DMSArray.FirstArraySlice; size = &out->Texture2DMSArray.ArraySize; break;
+    default: return E_INVALIDARG;
+  }
+  if (mip >= levels) return E_INVALIDARG;
+  if (first) {
+    if (*first >= layers) return E_INVALIDARG;
+    if (*size == ~0u) *size = layers - *first;
+    if (!*size || *size > layers - *first) return E_INVALIDARG;
+  }
+  return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE dev_CreateDepthStencilView(Dev *d, ID3D11Resource *resource, const D3D11_DEPTH_STENCIL_VIEW_DESC *given, ID3D11DepthStencilView **out) {
   if (out) *out = NULL;
   Tex *t = tex_of_resource(resource);
   if (!t || !t->depth) return E_INVALIDARG;
+  D3D11_DEPTH_STENCIL_VIEW_DESC normal;
+  const HRESULT checked = dsv_normalize(t, given, &normal);
+  if (FAILED(checked)) return checked;
+  const D3D11_DEPTH_STENCIL_VIEW_DESC *desc = &normal;
+  if (!out) return S_FALSE;
   EnterCriticalSection(&d->lock);
   if (d->dsv_free_count == 0) { LeaveCriticalSection(&d->lock); return E_OUTOFMEMORY; }
   View *v = child_new(sizeof *v, d, &dsv_vtbl, g_dsv_iids, dsv_destroy);
@@ -1898,8 +1992,7 @@ static HRESULT STDMETHODCALLTYPE dev_CreateDepthStencilView(Dev *d, ID3D11Resour
   LeaveCriticalSection(&d->lock);
   hold(t);      /* (a view's reference to its resource is the runtime's) */
   v->tex = t;
-  if (desc) { v->desc.dsv = *desc; if (v->desc.dsv.Format == DXGI_FORMAT_UNKNOWN) v->desc.dsv.Format = t->desc.Format; }
-  else { v->desc.dsv.Format = t->desc.Format; v->desc.dsv.ViewDimension = t->one_d ? D3D11_DSV_DIMENSION_TEXTURE1D : D3D11_DSV_DIMENSION_TEXTURE2D; }
+  v->desc.dsv = normal;
   v->handle = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(d->dsv_heap);
   v->handle.ptr += (SIZE_T)v->slot * ID3D12Device_GetDescriptorHandleIncrementSize(d->d12, D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
   if (t->desc.SampleDesc.Count > 1 && t->kind != 0) {
@@ -1932,6 +2025,8 @@ static HRESULT STDMETHODCALLTYPE dev_CreateDepthStencilView(Dev *d, ID3D11Resour
     if (desc && desc->ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2DARRAY) x.Texture2DArray.FirstArraySlice = desc->Texture2DArray.FirstArraySlice, x.Texture2DArray.ArraySize = desc->Texture2DArray.ArraySize;
     if (desc && desc->ViewDimension == D3D11_DSV_DIMENSION_TEXTURE1DARRAY) x.Texture2DArray.FirstArraySlice = desc->Texture1DArray.FirstArraySlice, x.Texture2DArray.ArraySize = desc->Texture1DArray.ArraySize;
     if (desc && (desc->ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2D || desc->ViewDimension == D3D11_DSV_DIMENSION_TEXTURE1D)) x.Texture2DArray.ArraySize = 1;
+    if (desc->ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY) x.Texture2DArray.FirstArraySlice = desc->Texture2DMSArray.FirstArraySlice, x.Texture2DArray.ArraySize = desc->Texture2DMSArray.ArraySize;
+    if (desc->ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2DMS) x.Texture2DArray.ArraySize = 1;
     if (!desc) { v->desc.dsv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DARRAY; v->desc.dsv.Texture2DArray.ArraySize = t->desc.ArraySize; }
     ID3D12Device_CreateDepthStencilView(d->d12, t->res, &x, v->handle);
     return give(v, (void **)out);
@@ -2035,8 +2130,12 @@ static BOOL srv_range(const Tex *t, const D3D11_SHADER_RESOURCE_VIEW_DESC *desc,
       if (t->one_d || t->kind == 1 || t->desc.SampleDesc.Count > 1) return FALSE;
       l0 = desc->Texture2DArray.MostDetailedMip, n = desc->Texture2DArray.MipLevels, f = desc->Texture2DArray.FirstArraySlice, c = desc->Texture2DArray.ArraySize;
       break;
-    case D3D11_SRV_DIMENSION_TEXTURE2DMS: if (t->desc.SampleDesc.Count < 2) return FALSE; n = 1; break;
-    case D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY: if (t->desc.SampleDesc.Count < 2) return FALSE; n = 1, f = desc->Texture2DMSArray.FirstArraySlice, c = desc->Texture2DMSArray.ArraySize; break;
+    /* (the multisampled dimensions: of any 2D texture - Windows takes them of a texture of one sample too) */
+    case D3D11_SRV_DIMENSION_TEXTURE2DMS: if (t->one_d || t->kind == 1) return FALSE; l0 = 0, n = t->desc.MipLevels; break;
+    case D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY:
+      if (t->one_d || t->kind == 1) return FALSE;
+      l0 = 0, n = t->desc.MipLevels, f = desc->Texture2DMSArray.FirstArraySlice, c = desc->Texture2DMSArray.ArraySize;
+      break;
     case D3D11_SRV_DIMENSION_TEXTURE3D: if (t->kind != 1) return FALSE; l0 = desc->Texture3D.MostDetailedMip, n = desc->Texture3D.MipLevels; break;
     case D3D11_SRV_DIMENSION_TEXTURECUBE: if (!cube) return FALSE; l0 = desc->TextureCube.MostDetailedMip, n = desc->TextureCube.MipLevels, c = 6; break;
     case D3D11_SRV_DIMENSION_TEXTURECUBEARRAY:
@@ -2078,6 +2177,9 @@ static HRESULT srv_create(Dev *d, ID3D11Resource *resource, const D3D11_SHADER_R
   if ((t->fmt->flags & FMT_YUV) && (!desc || !yuv_view_ok(t->desc.Format, desc->Format, FALSE))) return E_INVALIDARG;      /* (packed YUV: a view of its pixels' format) */
   if (t->depth && (!desc || !depth_view_format(t->desc.Format, desc->Format, NULL, NULL) || !depth_view_dimension(t, desc))) return E_INVALIDARG;      /* (a depth texture: a view of a plane) */
   if (desc && !t->planar && !srv_view_ok(t, desc)) return E_INVALIDARG;      /* (levels and layers the texture has, of a dimension it can be seen as) */
+  /* (a typeless texture is seen through a format of its family: there is none to take for UNKNOWN or no description; and a view's format is not typeless) */
+  if (format_is_typeless(t->desc.Format) && (!desc || desc->Format == DXGI_FORMAT_UNKNOWN)) return E_INVALIDARG;
+  if (desc && !t->depth && format_is_typeless(desc->Format)) return E_INVALIDARG;
   if (!out) return S_FALSE;
   View *v = child_new(sizeof *v, d, &srv_vtbl, g_srv_iids, srv_destroy);
   if (!v) return E_OUTOFMEMORY;
@@ -2091,8 +2193,23 @@ static HRESULT srv_create(Dev *d, ID3D11Resource *resource, const D3D11_SHADER_R
     if (desc->ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY)
       v->array_size = desc->Texture2DArray.ArraySize == (UINT)-1 ? t->desc.ArraySize - slice : desc->Texture2DArray.ArraySize;
   }
-  if (desc) v->desc.srv = *desc;
-  else {
+  if (desc) {
+    /* (the description as Windows keeps it: the texture's format for UNKNOWN, the levels and slices that -1 stands for) */
+    v->desc.srv = *desc;
+    if (v->desc.srv.Format == DXGI_FORMAT_UNKNOWN) v->desc.srv.Format = t->desc.Format;
+    UINT l0, n, f, c;
+    if (!t->planar && srv_range(t, desc, &l0, &n, &f, &c)) switch (desc->ViewDimension) {
+      case D3D11_SRV_DIMENSION_TEXTURE1D: v->desc.srv.Texture1D.MipLevels = n; break;
+      case D3D11_SRV_DIMENSION_TEXTURE1DARRAY: v->desc.srv.Texture1DArray.MipLevels = n; v->desc.srv.Texture1DArray.ArraySize = c; break;
+      case D3D11_SRV_DIMENSION_TEXTURE2D: v->desc.srv.Texture2D.MipLevels = n; break;
+      case D3D11_SRV_DIMENSION_TEXTURE2DARRAY: v->desc.srv.Texture2DArray.MipLevels = n; v->desc.srv.Texture2DArray.ArraySize = c; break;
+      case D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY: v->desc.srv.Texture2DMSArray.ArraySize = c; break;
+      case D3D11_SRV_DIMENSION_TEXTURE3D: v->desc.srv.Texture3D.MipLevels = n; break;
+      case D3D11_SRV_DIMENSION_TEXTURECUBE: v->desc.srv.TextureCube.MipLevels = n; break;
+      case D3D11_SRV_DIMENSION_TEXTURECUBEARRAY: v->desc.srv.TextureCubeArray.MipLevels = n; v->desc.srv.TextureCubeArray.NumCubes = c / 6; break;
+      default: break;
+    }
+  } else {
     /* (the whole texture, as what it is) */
     v->desc.srv.Format = t->desc.Format;
     if (t->one_d) {
@@ -2258,6 +2375,12 @@ static void shader_constants(Shader *s) {
             if (slot >= TEXTURE_SLOTS) s->wide = TRUE;
           }
         }
+      }
+      if (op == 90 /* dcl_sampler: the operand, then its register */ && length >= 3) {
+        UINT operand, slot;
+        memcpy(&operand, code + 4 * (w + 1), 4);
+        const UINT k = w + ((operand >> 31) ? 3 : 2);
+        if (k < w + length && ((operand >> 20) & 3) == 1) { memcpy(&slot, code + 4 * k, 4); if (slot >= TEXTURE_SLOTS) s->sampler_beyond = TRUE; }
       }
       if (op == 155 /* dcl_thread_group x, y, z */ && length >= 4) for (UINT k = 0; k < 3; ++k) memcpy(&s->group[k], code + 4 * (w + 1 + k), 4);
       if (op == 206 /* dcl_gs_instance_count n */ && length >= 2) memcpy(&s->gs_instances, code + 4 * (w + 1), 4);
@@ -2531,7 +2654,10 @@ static StateObj *state_obj_find(Dev *d, UINT kind, SIZE_T offset, const void *ke
     LONG n = s->c.o.ref;
     while (n > 0) {      /* (a reference only while it still has one: its last may be going on another thread) */
       const LONG seen = InterlockedCompareExchange(&s->c.o.ref, n + 1, n);
-      if (seen == n) return s;
+      if (seen == n) {
+        if (n + 1 - s->c.internal == 1 && !InterlockedExchange(&s->c.dev_held, 1)) dx_AddRef(OBJ(d));      /* (it was only bound: the program's again) */
+        return s;
+      }
       n = seen;
     }
   }
@@ -2713,8 +2839,9 @@ static BOOL filter_valid(D3D11_FILTER f) {
 static HRESULT STDMETHODCALLTYPE dev_CreateSamplerState(Dev *d, const D3D11_SAMPLER_DESC *desc, ID3D11SamplerState **out) {
   if (out) *out = NULL;
   if (!desc) return E_INVALIDARG;
+  /* (MinLOD above MaxLOD: Direct3D 11 refuses it, Direct3D 10 takes it - the level is clamped to MaxLOD) */
   if (!filter_valid(desc->Filter) || !address_valid(desc->AddressU) || !address_valid(desc->AddressV) || !address_valid(desc->AddressW) ||
-      desc->MaxAnisotropy > D3D11_MAX_MAXANISOTROPY || desc->MinLOD > desc->MaxLOD || desc->MinLOD != desc->MinLOD || desc->MaxLOD != desc->MaxLOD)
+      desc->MaxAnisotropy > D3D11_MAX_MAXANISOTROPY || (desc->MinLOD > desc->MaxLOD && !d->d10.lpVtbl) || desc->MinLOD != desc->MinLOD || desc->MaxLOD != desc->MaxLOD)
     return E_INVALIDARG;
   if (((UINT)desc->Filter >> 7 & 3u) == 1 && !comparison_valid(desc->ComparisonFunc)) return E_INVALIDARG;      /* (a comparison filter needs a comparison) */
   /* (the MINIMUM_ / MAXIMUM_ filters: where the device has them - MinMaxFiltering, D3D11_FEATURE_D3D11_OPTIONS1, the kernel's kFeature2SamplerReductions) */
@@ -2726,6 +2853,9 @@ static HRESULT STDMETHODCALLTYPE dev_CreateSamplerState(Dev *d, const D3D11_SAMP
   D3D11_SAMPLER_DESC key = *desc;
   if (((UINT)desc->Filter & 0x7Fu) != 0x55) key.MaxAnisotropy = 0;
   if (((UINT)desc->Filter >> 7 & 3u) != 1) key.ComparisonFunc = D3D11_COMPARISON_NEVER;
+  /* (the border colour of a sampler that does not address the border is none, as Windows keeps it) */
+  if (desc->AddressU != D3D11_TEXTURE_ADDRESS_BORDER && desc->AddressV != D3D11_TEXTURE_ADDRESS_BORDER && desc->AddressW != D3D11_TEXTURE_ADDRESS_BORDER)
+    memset(key.BorderColor, 0, sizeof key.BorderColor);
   if (!out) return S_FALSE;
   extern const ID3D11SamplerStateVtbl sampler_vtbl;
   EnterCriticalSection(&d->lock);
@@ -2793,4 +2923,5 @@ static const ID3D11On12Device1Vtbl g_on12_vtbl;
 #include "dxgi_resource.inc"
 #include "device5.inc"
 #include "video.inc"
+#include "d3d10.inc"
 #include "vtbl.inc"

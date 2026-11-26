@@ -224,7 +224,7 @@ static void name_out(const char *name, LPSTR buffer, SIZE_T *length) {
   }
   *length = n + 1;
 }
-static void STDMETHODCALLTYPE inst_GetClassLinkage(ClassInst *i, ID3D11ClassLinkage **out) { if (!out) return; dx_AddRef(OBJ(i->linkage)); *out = (ID3D11ClassLinkage *)i->linkage; }
+static void STDMETHODCALLTYPE inst_GetClassLinkage(ClassInst *i, ID3D11ClassLinkage **out) { if (!out) return; child_ref(i->linkage); *out = (ID3D11ClassLinkage *)i->linkage; }
 static void STDMETHODCALLTYPE inst_GetDesc(ClassInst *i, D3D11_CLASS_INSTANCE_DESC *desc) { if (desc) *desc = i->desc; }
 static void STDMETHODCALLTYPE inst_GetInstanceName(ClassInst *i, LPSTR name, SIZE_T *length) { name_out(i->instance_name, name, length); }
 static void STDMETHODCALLTYPE inst_GetTypeName(ClassInst *i, LPSTR name, SIZE_T *length) { name_out(i->type_name, name, length); }

@@ -51,9 +51,12 @@ constexpr Ext kQuarterPi = constant(0xC90FDAA22168C235ull, -1);
 constexpr Ext kLn2 = constant(0xB17217F7D1CF79ACull, -1);
 constexpr Ext kLog2e = constant(0xB8AA3B295C17F0BCull, 0);
 constexpr Ext kTwoOverPi = constant(0xA2F9836E4E441529ull, -1);      // 2 / pi
-// pi/2 as the sum of six pieces of 32 significant bits each, so that a 32-bit multiple of each is exact in the 64-bit significand.
-constexpr Ext kHalfPiPieces[6] = {constant(0x921FB54400000000ull, 0), constant(0x42D1846900000000ull, -32), constant(0x898CC51700000000ull, -64),
-                              constant(0x01B839A200000000ull, -96), constant(0x52049C1100000000ull, -128), constant(0x14CF98E800000000ull, -160)};
+// pi/2 as the x87 reduces with it: the processor's pi has 66 significant bits (0xC90FDAA22168C234C, rounded), and fsin, fcos, fsincos and fptan of a large
+// argument differ from the exact sine by what that pi is off - programs see those values, so they are the ones given here. It is held as three pieces of at
+// most 32 significant bits (word i worth w * 2^(-31 - 32 i)), so that a 32-bit multiple of each is exact in the 64-bit significand. Each piece is normalized
+// (the integer bit set, the exponent lowered by the word's leading zeros): an extended value without its integer bit is an unnormal, which the arithmetic
+// refuses. (The pieces were once the digits after a "1." that the format does not have, unnormalized: sin(1) was a NaN.)
+constexpr Ext kHalfPiPieces[3] = {constant(0xC90FDAA200000000ull, 0), constant(0x85A308D000000000ull, -34), constant(0xC000000000000000ull, -64)};
 
 bool is_zero(const Ext& x) { return classify(x) == Class::Zero; }
 
@@ -265,7 +268,7 @@ bool reduce(Quiet& q, Ext x, Ext* r, uint32_t* quadrant) {
     if (n == 0) break;
     // x -= n * (pi/2), piece by piece: n has at most 32 significant bits, so each product is exact
     const Ext nh = scale_by_power_of_two(from_integer(n), shift);
-    for (int i = 0; i < 6; ++i) x = q.sub(x, q.mul(nh, kHalfPiPieces[i]));
+    for (const Ext& piece : kHalfPiPieces) x = q.sub(x, q.mul(nh, piece));
     if (shift == 0) total += static_cast<uint64_t>(n) & 3;
     else if (shift == 1) total += (static_cast<uint64_t>(n) << 1) & 3;
   }

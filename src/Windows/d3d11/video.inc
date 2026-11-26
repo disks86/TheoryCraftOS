@@ -392,7 +392,7 @@ static void vview_destroy(DxObj *o) {
 }
 static void STDMETHODCALLTYPE vview_GetResource(VideoView *v, ID3D11Resource **out) {
   if (!out) return;
-  dx_AddRef(OBJ(v->tex));
+  child_ref(v->tex);
   *out = (ID3D11Resource *)v->tex;
 }
 static void STDMETHODCALLTYPE dov_GetDesc(VideoView *v, D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC *desc) { if (desc) *desc = v->desc.dov; }

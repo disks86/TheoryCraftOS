@@ -3,6 +3,7 @@
 `d3d11.dll` (src/Windows/d3d11) is Direct3D 11 as a layer on this system's Direct3D 12 - what Windows calls "11 on 12". `d3d12.dll` is the
 user-mode half of the kernel's Direct3D driver ([Direct3DKernelMode.md](Direct3DKernelMode.md)); `d3d11.dll` uses its public interfaces and
 one private call. The same source is built for 64-bit and for 32-bit programs ([Wow64.md](Wow64.md)).
+Direct3D 10 and 10.1 are this device too, with a second face on it and on its objects ([Direct3D10.md](Direct3D10.md), `d3d10.inc`).
 
 ## How it works
 

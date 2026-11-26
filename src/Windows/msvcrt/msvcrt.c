@@ -662,38 +662,7 @@ API double frexp(double x, int *e) {
   return x < 0 ? -(double)m : (double)m;
 }
 API double modf(double x, double *ip) { double t = trunc(x); *ip = t; return x - t; }
-/* exp and pow take 2^t apart as 2^n * 2^f, n = round(t), f = t - n: "fsubr %st(0), %st(1)" is that subtraction (the GNU assembler swaps fsub and fsubr in this
- * form: written as fsub, it gave n - t, and exp(1) was 1.47). */
-API double exp(double x) {
-  long double r = x;
-  __asm__("fldl2e\n fmulp\n fld %%st(0)\n frndint\n fsubr %%st(0), %%st(1)\n fxch\n f2xm1\n fld1\n faddp\n fscale\n fstp %%st(1)" : "+t"(r));
-  return (double)r;
-}
-API double log(double x) { if (x < 0) return 0.0 / 0.0; if (x == 0) return -1.0 / 0.0; long double r = x; __asm__("fldln2\n fxch\n fyl2x" : "+t"(r)); return (double)r; }
-API double log10(double x) { if (x < 0) return 0.0 / 0.0; if (x == 0) return -1.0 / 0.0; long double r = x; __asm__("fldlg2\n fxch\n fyl2x" : "+t"(r)); return (double)r; }
-API double log2(double x) { if (x < 0) return 0.0 / 0.0; if (x == 0) return -1.0 / 0.0; long double r = x; __asm__("fld1\n fxch\n fyl2x" : "+t"(r)); return (double)r; }
-API double pow(double x, double y) {
-  if (y == 0) return 1.0;
-  if (ld_isnan(x) || ld_isnan(y)) return 0.0 / 0.0;
-  if (x == 0) return y > 0 ? 0.0 : 1.0 / 0.0;
-  const int y_is_integer = y == floor(y) && fabs(y) < 9e15;
-  if (x < 0 && !y_is_integer) return 0.0 / 0.0;
-  /* fyl2x is ST(1) * log2(ST(0)): the base goes in ST(0) and the exponent in ST(1) (the other way round, pow(2, 10) was 2 * log2(10) a power of two) */
-  long double r = x < 0 ? -(long double)x : x, exponent = y;
-  __asm__("fyl2x\n fld %%st(0)\n frndint\n fsubr %%st(0), %%st(1)\n fxch\n f2xm1\n fld1\n faddp\n fscale\n fstp %%st(1)" : "+t"(r) : "u"(exponent) : "st(1)");
-  if (x < 0 && y_is_integer && ((long long)y & 1)) r = -r;
-  return (double)r;
-}
-API double sin(double x) { long double r = x; __asm__("fsin" : "+t"(r)); return (double)r; }
-API double cos(double x) { long double r = x; __asm__("fcos" : "+t"(r)); return (double)r; }
-API double tan(double x) { long double r = x, one; __asm__("fptan\n fstp %0" : "+t"(r), "=u"(one)); return (double)r; }
-API double atan(double x) { long double r = x; __asm__("fld1\n fpatan" : "+t"(r) : : "st(1)"); return (double)r; }
-API double atan2(double y, double x) { long double a = y, b = x; __asm__("fpatan" : "+t"(b) : "u"(a) : "st(1)"); return (double)b; }
-API double asin(double x) { return atan2(x, sqrt((1 - x) * (1 + x))); }
-API double acos(double x) { return atan2(sqrt((1 - x) * (1 + x)), x); }
-API double sinh(double x) { return (exp(x) - exp(-x)) / 2; }
-API double cosh(double x) { return (exp(x) + exp(-x)) / 2; }
-API double tanh(double x) { double a = exp(x), b = exp(-x); return (a - b) / (a + b); }
+#include "math.inc"
 API double cbrt(double x) { return x < 0 ? -pow(-x, 1.0 / 3) : pow(x, 1.0 / 3); }
 API double hypot(double a, double b) { return sqrt(a * a + b * b); }
 API double copysign(double x, double y) { return (y < 0 || (y == 0 && 1 / y < 0)) ? -fabs(x) : fabs(x); }
