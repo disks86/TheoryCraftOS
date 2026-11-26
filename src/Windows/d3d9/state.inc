@@ -265,7 +265,7 @@ static void state_transfer(Dev *d, State *to, const State *from, const StateMask
       if (l) lights_copy(to, from, l);
     }
   if (m->fvf) to->fvf = from->fvf;
-  if (m->decl) bind(&to->decl, from->decl);
+  if (m->decl && (from->decl || !to_device)) bind(&to->decl, from->decl);      /* (a block that has no declaration leaves the device's as it is when applied, as Windows does: test_vertex_declaration_stateblock) */
   if (m->vs) bind(&to->vs, from->vs);
   if (m->ps) bind(&to->ps, from->ps);
   if (m->indices) bind(&to->indices, from->indices);
@@ -462,8 +462,10 @@ static HRESULT STDMETHODCALLTYPE dev_GetLightEnable(Dev *d, DWORD index, BOOL *e
   *enable = l->enabled ? 128 : FALSE;      /* (Direct3D 9 answers 128 for a light that shines) */
   return D3D_OK;
 }
+/* (a plane past the last one there is is the last one, as Windows has it: test_clip_planes_limits) */
 static HRESULT STDMETHODCALLTYPE dev_SetClipPlane(Dev *d, DWORD index, const float *plane) {
-  if (!plane || index >= CLIP_PLANES) return D3DERR_INVALIDCALL;
+  if (!plane) return D3DERR_INVALIDCALL;
+  if (index >= CLIP_PLANES) index = CLIP_PLANES - 1;
   StateMask *m;
   State *s = state_for_set(d, &m);
   memcpy(s->clip_plane[index], plane, sizeof s->clip_plane[index]);
@@ -471,7 +473,8 @@ static HRESULT STDMETHODCALLTYPE dev_SetClipPlane(Dev *d, DWORD index, const flo
   return D3D_OK;
 }
 static HRESULT STDMETHODCALLTYPE dev_GetClipPlane(Dev *d, DWORD index, float *plane) {
-  if (!plane || index >= CLIP_PLANES) return D3DERR_INVALIDCALL;
+  if (!plane) return D3DERR_INVALIDCALL;
+  if (index >= CLIP_PLANES) index = CLIP_PLANES - 1;
   memcpy(plane, d->state.clip_plane[index], sizeof d->state.clip_plane[index]);
   return D3D_OK;
 }
