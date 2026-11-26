@@ -65,7 +65,7 @@ static void device_destroy(Device8 *d) {
 
 /* ---- the device's own methods ----------------------------------------------------------------------------------------------------------------------- */
 
-static HRESULT STDMETHODCALLTYPE dev_TestCooperativeLevel(Device8 *d) { return CALL9(D9(d), TestCooperativeLevel); }
+static HRESULT STDMETHODCALLTYPE dev_TestCooperativeLevel(Device8 *d) { return d->not_reset ? D3DERR_DEVICENOTRESET : CALL9(D9(d), TestCooperativeLevel); }
 static UINT STDMETHODCALLTYPE dev_GetAvailableTextureMem(Device8 *d) { return CALL9(D9(d), GetAvailableTextureMem); }
 /* (Direct3D 8 evicts all managed resources whatever the number of bytes: Direct3D 9's EvictManagedResources) */
 static HRESULT STDMETHODCALLTYPE dev_ResourceManagerDiscardBytes(Device8 *d, DWORD bytes) { (void)bytes; return CALL9(D9(d), EvictManagedResources); }
@@ -108,7 +108,7 @@ static HRESULT STDMETHODCALLTYPE dev_CreateAdditionalSwapChain(Device8 *d, D3DPR
   IDirect3DSwapChain9 *c9 = NULL;
   hr = CALL9(D9(d), CreateAdditionalSwapChain, &p9, &c9);
   if (FAILED(hr)) return hr;
-  if (!parameters->BackBufferCount) parameters->BackBufferCount = 1;      /* (the one thing Direct3D 8 writes back of an additional swap chain's parameters) */
+  present_from9(&p9, parameters);
   SwapChain8 *c = resource_new(sizeof *c, &sc_vtbl, KIND_SWAP_CHAIN, d, (IUnknown *)c9);
   if (!c) { CALL9(c9, Release); return E_OUTOFMEMORY; }
   *out = (IDirect3DSwapChain8 *)c;
@@ -120,8 +120,23 @@ static HRESULT STDMETHODCALLTYPE dev_Reset(Device8 *d, D3DPRESENT_PARAMETERS *pa
   HRESULT hr = present_to9(parameters, &p9, TRUE);
   if (FAILED(hr)) return hr;
   EnterCriticalSection(&d->lock);
+  /* Direct3D 9 resets only when the program holds none of the swap chain's buffers: the implicit surfaces the program holds no reference of
+   * let theirs go (and take the new ones after); one the program holds keeps the Reset from happening, as in Direct3D 8. */
+  for (UINT i = 0; i < 4; ++i) {
+    Surface8 *s = i < 3 ? d->back[i] : d->auto_depth;
+    if (s && s->o.ref == 0) implicit_repoint(d, s, NULL);
+  }
   hr = CALL9(D9(d), Reset, &p9);
+  if (FAILED(hr)) {
+    /* (Direct3D 9 refuses with D3DERR_INVALIDCALL what the program still holds or binds of the default pool; Direct3D 8 answers that
+     * D3DERR_DEVICELOST, and the device stays lost - TestCooperativeLevel says D3DERR_DEVICENOTRESET - until a Reset succeeds) */
+    implicit_refresh(d);
+    d->not_reset = TRUE;
+    if (hr == D3DERR_INVALIDCALL) hr = D3DERR_DEVICELOST;
+  }
   if (SUCCEEDED(hr)) {
+    d->not_reset = FALSE;
+    defaults8_apply(d);
     present_from9(&p9, parameters);
     d->present = *parameters;
     /* Direct3D 9 gave its device the state of a new device: so does Direct3D 8 with its own (a recording state block ends unmade). */
@@ -134,11 +149,11 @@ static HRESULT STDMETHODCALLTYPE dev_Reset(Device8 *d, D3DPRESENT_PARAMETERS *pa
   return hr;
 }
 static HRESULT STDMETHODCALLTYPE dev_Present(Device8 *d, const RECT *source, const RECT *dest, HWND window, const RGNDATA *dirty) {
+  if (d->not_reset) return D3DERR_DEVICELOST;
   return CALL9(D9(d), Present, source, dest, window, dirty);
 }
 static HRESULT STDMETHODCALLTYPE dev_GetBackBuffer(Device8 *d, UINT index, D3DBACKBUFFER_TYPE type, IDirect3DSurface8 **out) {
   if (!out) return D3DERR_INVALIDCALL;
-  *out = NULL;
   if (index >= 3) return D3DERR_INVALIDCALL;
   IDirect3DSurface9 *s9 = NULL;
   const HRESULT hr = CALL9(D9(d), GetBackBuffer, 0, index, type, &s9);
@@ -270,23 +285,26 @@ static HRESULT copy_by_lock(IDirect3DSurface9 *src, const RECT *rect, IDirect3DS
   CALL9(src, UnlockRect);
   return D3D_OK;
 }
-/* One rectangle by what Direct3D 9 has for the two pools - UpdateSurface from memory into the device, StretchRect of one size between surfaces of
- * the device, GetRenderTargetData of a whole target into memory - and by locking both where that is not the case or Direct3D 9 takes it not. */
+/* One rectangle, by what Direct3D 9 has for the two pools: UpdateSurface from memory into the device, StretchRect of one size between surfaces of
+ * the device, GetRenderTargetData of a target into memory (of all of it into a surface of its size first when only a part is wanted, or the
+ * sizes differ), and locking both where neither is in the device (Direct3D 9 has no copy between surfaces in memory). */
 static HRESULT copy_rect(Device8 *d, IDirect3DSurface9 *src, const D3DSURFACE_DESC9 *sd, const RECT *rect, IDirect3DSurface9 *dst, const D3DSURFACE_DESC9 *dd,
                          const POINT *point) {
   const LONG w = rect->right - rect->left, h = rect->bottom - rect->top;
   const RECT to = {point->x, point->y, point->x + w, point->y + h};
-  HRESULT hr = E_FAIL;
-  if (sd->Pool != D3DPOOL_DEFAULT && dd->Pool == D3DPOOL_DEFAULT) {
-    hr = CALL9(D9(d), UpdateSurface, src, rect, dst, point);
-  } else if (sd->Pool == D3DPOOL_DEFAULT && dd->Pool == D3DPOOL_DEFAULT) {
-    hr = CALL9(D9(d), StretchRect, src, rect, dst, &to, D3DTEXF_NONE);
-  } else if (sd->Pool == D3DPOOL_DEFAULT && (sd->Usage & D3DUSAGE_RENDERTARGET) && dd->Pool == D3DPOOL_SYSTEMMEM && !rect->left && !rect->top && !point->x && !point->y &&
-             (UINT)w == sd->Width && (UINT)h == sd->Height && sd->Width == dd->Width && sd->Height == dd->Height) {
-    hr = CALL9(D9(d), GetRenderTargetData, src, dst);
-  }
-  if (SUCCEEDED(hr)) return hr;
-  return copy_by_lock(src, rect, dst, point, sd->Format);
+  if (sd->Pool != D3DPOOL_DEFAULT && dd->Pool == D3DPOOL_DEFAULT) return CALL9(D9(d), UpdateSurface, src, rect, dst, point);
+  if (sd->Pool == D3DPOOL_DEFAULT && dd->Pool == D3DPOOL_DEFAULT) return CALL9(D9(d), StretchRect, src, rect, dst, &to, D3DTEXF_NONE);
+  if (sd->Pool != D3DPOOL_DEFAULT) return copy_by_lock(src, rect, dst, point, sd->Format);
+  /* out of the device into memory: a target's pixels through GetRenderTargetData */
+  if (!(sd->Usage & D3DUSAGE_RENDERTARGET) || dd->Pool != D3DPOOL_SYSTEMMEM) return D3DERR_INVALIDCALL;
+  if (!rect->left && !rect->top && !point->x && !point->y && (UINT)w == sd->Width && (UINT)h == sd->Height && sd->Width == dd->Width && sd->Height == dd->Height)
+    return CALL9(D9(d), GetRenderTargetData, src, dst);
+  IDirect3DSurface9 *whole = NULL;
+  HRESULT hr = CALL9(D9(d), CreateOffscreenPlainSurface, sd->Width, sd->Height, sd->Format, D3DPOOL_SYSTEMMEM, &whole, NULL);
+  if (SUCCEEDED(hr)) hr = CALL9(D9(d), GetRenderTargetData, src, whole);
+  if (SUCCEEDED(hr)) hr = copy_by_lock(whole, rect, dst, point, sd->Format);
+  if (whole) CALL9(whole, Release);
+  return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE dev_CopyRects(Device8 *d, IDirect3DSurface8 *src8, const RECT *rects, UINT count, IDirect3DSurface8 *dst8, const POINT *points) {

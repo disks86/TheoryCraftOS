@@ -182,7 +182,8 @@ struct Device8 {
   D3DPRESENT_PARAMETERS present; /* as the program gave them (with what was chosen for it) */
   DWORD behaviour;
   D3DCAPS9 caps9;
-  UINT vs_constants;             /* the vertex shader constants Direct3D 8 lets a program set (the caps' MaxVertexShaderConst) */
+  UINT vs_constants;
+  BOOL not_reset;                /* a Reset failed: the device is lost until one succeeds */             /* the vertex shader constants Direct3D 8 lets a program set (the caps' MaxVertexShaderConst) */
 };
 
 extern const IDirect3D8Vtbl d3d_vtbl;

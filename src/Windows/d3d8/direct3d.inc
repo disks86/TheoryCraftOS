@@ -54,6 +54,9 @@ static HRESULT STDMETHODCALLTYPE d3d_GetAdapterDisplayMode(Direct3D8 *o, UINT ad
 /* (Direct3D 8 has no back buffer of the display's format by D3DFMT_UNKNOWN, which Direct3D 9 takes for a window) */
 static HRESULT STDMETHODCALLTYPE d3d_CheckDeviceType(Direct3D8 *o, UINT adapter, D3DDEVTYPE type, D3DFORMAT display, D3DFORMAT back, BOOL windowed) {
   if (back == D3DFMT_UNKNOWN) return D3DERR_INVALIDCALL;
+  /* (and Direct3D 8 converts no format when it presents: the back buffer is the display's format, or that format with alpha) */
+  const BOOL same = back == display || (display == D3DFMT_X8R8G8B8 && back == D3DFMT_A8R8G8B8) || (display == D3DFMT_X1R5G5B5 && back == D3DFMT_A1R5G5B5);
+  if (!same) return D3DERR_NOTAVAILABLE;
   return CALL9(D3D8(o), CheckDeviceType, adapter, type, display, back, windowed);
 }
 static HRESULT STDMETHODCALLTYPE d3d_CheckDeviceFormat(Direct3D8 *o, UINT adapter, D3DDEVTYPE type, D3DFORMAT display, DWORD usage, D3DRESOURCETYPE resource, D3DFORMAT format) {
@@ -115,6 +118,7 @@ static HRESULT STDMETHODCALLTYPE d3d_CreateDevice(Direct3D8 *o, UINT adapter, D3
   caps_from9(&d->caps9, &c8);
   d->vs_constants = (behaviour & D3DCREATE_SOFTWARE_VERTEXPROCESSING) ? D8_CONSTANTS : c8.MaxVertexShaderConst;
   state8_defaults(d);
+  defaults8_apply(d);
   if (d->state.extra[EXTRA_SOFTWAREVERTEXPROCESSING]) CALL9(d9, SetSoftwareVertexProcessing, TRUE);
   present_from9(&p9, parameters);
   d->present = *parameters;

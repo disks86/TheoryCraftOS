@@ -130,11 +130,8 @@ static HRESULT present_to9(const D3DPRESENT_PARAMETERS *p8, D3DPRESENT_PARAMETER
   else p9->PresentationInterval = p8->FullScreen_PresentationInterval;
   return D3D_OK;
 }
-/* What Direct3D 9 chose (the size and format of a window's back buffer, the count) back into the program's parameters. */
+/* What Direct3D 8 writes back into the program's parameters: the count of back buffers only (a window's size of 0 stays 0, unlike Direct3D 9). */
 static void present_from9(const D3DPRESENT_PARAMETERS9 *p9, D3DPRESENT_PARAMETERS *p8) {
-  p8->BackBufferWidth = p9->BackBufferWidth;
-  p8->BackBufferHeight = p9->BackBufferHeight;
-  p8->BackBufferFormat = p9->BackBufferFormat;
   p8->BackBufferCount = p9->BackBufferCount ? p9->BackBufferCount : 1;
 }
 

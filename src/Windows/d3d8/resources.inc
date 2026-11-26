@@ -240,7 +240,7 @@ static Surface8 *implicit_new(Device8 *d, IDirect3DSurface9 *s9) {
 }
 /* An implicit surface takes another Direct3D 9 surface (Reset made new back buffers): the program's pointer stays the same. */
 static void implicit_repoint(Device8 *d, Surface8 *s, IDirect3DSurface9 *s9) {
-  if (s->o.inner == (IUnknown *)s9) { CALL9(s9, Release); return; }
+  if (s->o.inner == (IUnknown *)s9) { if (s9) CALL9(s9, Release); return; }
   table_remove(d, &s->o);
   unknown_release(s->o.inner);
   s->o.inner = (IUnknown *)s9;
@@ -264,7 +264,6 @@ static HRESULT STDMETHODCALLTYPE sc_Present(SwapChain8 *c, const RECT *source, c
 }
 static HRESULT STDMETHODCALLTYPE sc_GetBackBuffer(SwapChain8 *c, UINT index, D3DBACKBUFFER_TYPE type, IDirect3DSurface8 **out) {
   if (!out) return D3DERR_INVALIDCALL;
-  *out = NULL;
   if (index >= 3) return D3DERR_INVALIDCALL;
   IDirect3DSurface9 *s9 = NULL;
   const HRESULT hr = CALL9(INNER_SWAP_CHAIN(c), GetBackBuffer, index, type, &s9);

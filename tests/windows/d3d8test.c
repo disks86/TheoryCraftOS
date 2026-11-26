@@ -111,6 +111,7 @@ static void present_parameters(D3DPRESENT_PARAMETERS *pp, UINT size) {
   pp->hDeviceWindow = g_window;
   pp->Windowed = TRUE;
   pp->EnableAutoDepthStencil = TRUE;
+  pp->Flags = D3DPRESENTFLAG_LOCKABLE_BACKBUFFER;      /* (read_back locks the back buffer) */
   pp->AutoDepthStencilFormat = D3DFMT_D24S8;
 }
 static int make_device(void) {
@@ -547,8 +548,7 @@ static void test_render_target(void) {
   IDirect3DDevice8_GetBackBuffer(g_device, 0, D3DBACKBUFFER_TYPE_MONO, &back);
   IDirect3DDevice8_GetDepthStencilSurface(g_device, &depth);
   if (!level || !back || !depth) { check(0, "a texture to draw into"); goto done; }
-  /* (no depth buffer: Direct3D 9 here draws nothing into a target smaller than the depth buffer set - docs/Direct3D8.md) */
-  check(IDirect3DDevice8_SetRenderTarget(g_device, level, NULL) == D3D_OK && SUCCEEDED(IDirect3DDevice8_GetRenderTarget(g_device, &got)) && got == level,
+  check(IDirect3DDevice8_SetRenderTarget(g_device, level, depth) == D3D_OK && SUCCEEDED(IDirect3DDevice8_GetRenderTarget(g_device, &got)) && got == level,
         "SetRenderTarget of a texture's level; GetRenderTarget gives the level");
   if (got) { IDirect3DSurface8_Release(got); got = NULL; }
   IDirect3DDevice8_Clear(g_device, 0, NULL, D3DCLEAR_TARGET, 0xFF0000FF, 1.0f, 0);
@@ -587,10 +587,14 @@ static void test_present_and_reset(void) {
   IDirect3DDevice8_CreateVertexShader(g_device, declaration, g_vs_colour, &vs, 0);
   IDirect3DDevice8_SetVertexShader(g_device, vs);
   IDirect3DDevice8_GetBackBuffer(g_device, 0, D3DBACKBUFFER_TYPE_MONO, &before);
-  if (before) IDirect3DSurface8_Release(before);
   D3DPRESENT_PARAMETERS pp;
   present_parameters(&pp, 32);
-  check(IDirect3DDevice8_Reset(g_device, &pp) == D3D_OK, "Reset to 32 x 32");
+  /* A back buffer the program holds keeps Reset from happening: the device is lost until a Reset succeeds. */
+  check(IDirect3DDevice8_Reset(g_device, &pp) == D3DERR_DEVICELOST && IDirect3DDevice8_TestCooperativeLevel(g_device) == D3DERR_DEVICENOTRESET &&
+        IDirect3DDevice8_Present(g_device, NULL, NULL, NULL, NULL) == D3DERR_DEVICELOST, "Reset while the program holds the back buffer: D3DERR_DEVICELOST");
+  if (before) IDirect3DSurface8_Release(before);
+  check(IDirect3DDevice8_Reset(g_device, &pp) == D3D_OK && IDirect3DDevice8_TestCooperativeLevel(g_device) == D3D_OK && pp.BackBufferWidth == 32,
+        "Reset to 32 x 32, and the device is back");
   IDirect3DDevice8_GetBackBuffer(g_device, 0, D3DBACKBUFFER_TYPE_MONO, &after);
   check(after && after == before && SUCCEEDED(IDirect3DSurface8_GetDesc(after, &desc)) && desc.Width == 32 && desc.Height == 32, "the back buffer is the same object, of the new size");
   if (after) IDirect3DSurface8_Release(after);
