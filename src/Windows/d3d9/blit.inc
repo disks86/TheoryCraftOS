@@ -521,10 +521,33 @@ static HRESULT STDMETHODCALLTYPE dev_UpdateSurface(Dev *d, IDirect3DSurface9 *fr
 /* UpdateTexture: what changed of a texture in system memory (its dirty region, then all of its lower levels) into one of the default pool of the same kind and
  * format; the destination may have fewer levels, which are the source's smaller ones (its top level the size of one of the source's). A destination that makes
  * its levels (D3DUSAGE_AUTOGENMIPMAP) gets the top level and makes the others. */
+/* UpdateTexture of volume textures, which Windows checks less than the others (Wine's test_update_volumetexture holds what it does): levels counts, sizes and formats
+ * may differ. Each level of the destination gets the source's level of the same size, if there is one, as it is - formats of the same bytes a pixel (A8R8G8B8 into
+ * X8R8G8B8); the destination's other levels stay as they are. Formats of other sizes are refused. */
+static HRESULT update_volume(Dev *d, Tex *st, Tex *dt) {
+  if (format_bytes(st->format) != format_bytes(dt->format) || !format_bytes(st->format)) return D3DERR_INVALIDCALL;
+  HRESULT hr = D3D_OK;
+  EnterCriticalSection(&d->lock);
+  for (UINT level = 0; level < dt->levels && SUCCEEDED(hr); ++level) {
+    const UINT w = level_size(dt->width, level), h = level_size(dt->height, level), depth = level_size(dt->slices, level);
+    for (UINT from = 0; from < st->levels; ++from) {
+      if (level_size(st->width, from) != w || level_size(st->height, from) != h || level_size(st->slices, from) != depth) continue;
+      BYTE *source = tex_shadow(st, from), *dest = tex_shadow(dt, level);
+      if (!source || !dest) { hr = E_OUTOFMEMORY; break; }
+      memcpy(dest, source, tex_sub_bytes(dt, level));      /* (the same size and bytes a pixel: the same bytes) */
+      hr = tex_upload(d, dt, level);
+      break;
+    }
+  }
+  st->dirty[0] = 0;
+  LeaveCriticalSection(&d->lock);
+  return hr;
+}
 static HRESULT STDMETHODCALLTYPE dev_UpdateTexture(Dev *d, IDirect3DBaseTexture9 *from, IDirect3DBaseTexture9 *to) {
   Tex *st = texture_of(from), *dt = texture_of(to);
-  if (!st || !dt || st->c.dev != d || dt->c.dev != d || st->kind != dt->kind || st->format != dt->format) return D3DERR_INVALIDCALL;
+  if (!st || !dt || st->c.dev != d || dt->c.dev != d || st->kind != dt->kind || (st->format != dt->format && st->kind != 1)) return D3DERR_INVALIDCALL;
   if (st->pool != D3DPOOL_SYSTEMMEM || dt->pool != D3DPOOL_DEFAULT) return D3DERR_INVALIDCALL;
+  if (st->kind == 1) return update_volume(d, st, dt);
   /* (the source level the destination's top level is: of the same size) */
   UINT skip = 0;
   while (skip < st->levels && (level_size(st->width, skip) > dt->width || level_size(st->height, skip) > dt->height)) ++skip;
