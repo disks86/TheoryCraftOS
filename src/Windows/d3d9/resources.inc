@@ -219,12 +219,17 @@ static BYTE *tex_shadow(Tex *t, UINT sub) {
   for (UINT i = 0; i < MAX_SUBS && none; ++i) none = t->shadow[i] == NULL;
   const UINT subs = tex_subresources(t);
   if (none && subs <= MAX_SUBS) {
+    /* (a cube's faces each begin on 16 bytes from the start, as on Windows) */
     SIZE_T total = 0;
-    for (UINT i = 0; i < subs; ++i) total += tex_sub_bytes(t, i);
+    for (UINT i = 0; i < subs; ++i) {
+      if (t->kind == 3 && i && sub_level(t, i) == 0) total = (total + 15) & ~(SIZE_T)15;
+      total += tex_sub_bytes(t, i);
+    }
     t->shadow_block = mem_alloc(total);
     if (!t->shadow_block) return NULL;
     SIZE_T at = 0;
     for (UINT i = 0; i < subs; ++i) {
+      if (t->kind == 3 && i && sub_level(t, i) == 0) at = (at + 15) & ~(SIZE_T)15;
       t->shadow[i] = t->shadow_block + at;
       at += tex_sub_bytes(t, i);
     }
@@ -983,7 +988,7 @@ static HRESULT STDMETHODCALLTYPE surf_GetDC(Surface *s, HDC *out) {
   memset(&info, 0, sizeof info);
   info.header.biSize = sizeof(BITMAPINFOHEADER);
   info.header.biWidth = (LONG)w;
-  info.header.biHeight = -(LONG)h;      /* (top-down, as the surface's rows are) */
+  info.header.biHeight = (LONG)h;      /* (bottom-up, as Windows makes it - test_getdc: the rows are turned over going in and out) */
   info.header.biPlanes = 1;
   info.header.biBitCount = (WORD)bits;
   info.header.biCompression = bits == 16 ? BI_BITFIELDS : BI_RGB;
@@ -1002,7 +1007,7 @@ static HRESULT STDMETHODCALLTYPE surf_GetDC(Surface *s, HDC *out) {
   LeaveCriticalSection(&d->lock);
   if (FAILED(hr)) { DeleteObject(bitmap); DeleteDC(dc); return hr; }
   const UINT pitch = format_pitch(t->format, w), dib_pitch = ((w * bits + 31) / 32) * 4;
-  for (UINT row = 0; row < h; ++row) memcpy((BYTE *)dib + (SIZE_T)row * dib_pitch, t->shadow[s->sub] + (SIZE_T)row * pitch, pitch);
+  for (UINT row = 0; row < h; ++row) memcpy((BYTE *)dib + (SIZE_T)(h - 1 - row) * dib_pitch, t->shadow[s->sub] + (SIZE_T)row * pitch, pitch);
   s->old_bitmap = SelectObject(dc, bitmap);
   s->dc = dc;
   s->bitmap = bitmap;
@@ -1018,7 +1023,7 @@ static void surface_release_dc(Surface *s) {
   GdiFlush();
   const UINT w = sub_width(t, s->sub), h = sub_height(t, s->sub), bits = format_bytes(t->format) * 8;
   const UINT pitch = format_pitch(t->format, w), dib_pitch = ((w * bits + 31) / 32) * 4;
-  if (t->shadow[s->sub]) for (UINT row = 0; row < h; ++row) memcpy(t->shadow[s->sub] + (SIZE_T)row * pitch, s->dib + (SIZE_T)row * dib_pitch, pitch);
+  if (t->shadow[s->sub]) for (UINT row = 0; row < h; ++row) memcpy(t->shadow[s->sub] + (SIZE_T)row * pitch, s->dib + (SIZE_T)(h - 1 - row) * dib_pitch, pitch);
   SelectObject(s->dc, s->old_bitmap);
   DeleteObject(s->bitmap);
   DeleteDC(s->dc);
