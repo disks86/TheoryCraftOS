@@ -161,10 +161,12 @@ void fill_rect_pattern(Painter& p, const Rect& dev, const PatternSource& src, ui
     const Rect q = rect_and(Rect{sat_add(r.left, p.ox()), sat_add(r.top, p.oy()), sat_add(r.right, p.ox()), sat_add(r.bottom, p.oy())}, cr);
     if (rect_empty(q)) continue;
     Surface& s = p.surface();
+    const bool bits = dc_rop_on_bits(p.dc(), s);      // (a 32 bpp DIB: the ROP on the whole pixel, as Windows)
     for (int32_t y = q.top; y < q.bottom; ++y) {
       for (int32_t x = q.left; x < q.right; ++x) {
         bool transparent = false;
         const ColorRef pat = solid ? src.solid : src.at(x - p.ox(), y - p.oy(), &transparent);
+        if (bits) { if (!(copy && transparent)) s.put_raw32(x, y, rop3_apply_bits(rop, colorref_bits32(pat), 0, s.get_raw32(x, y))); continue; }
         if (copy) { if (!transparent) s.put(x, y, pat); }
         else s.put(x, y, rop3_apply(rop, pat, 0, s.get(x, y)));
       }

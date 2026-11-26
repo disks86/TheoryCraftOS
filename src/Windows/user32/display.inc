@@ -18,8 +18,8 @@
 
 /* Monitors and display settings of user32.dll (included by window.inc after the scrolling): win32k knows the desktop's monitors (one, the screen, unless the kernel's desktop
  * set more). GetMonitorInfo and the MonitorFrom functions answer for them (a point or window off every monitor is handled by the flags: nothing, the primary monitor or the
- * nearest), EnumDisplayMonitors calls back for each (for a device context: the primary only), and the display settings come from the window manager (the W forms only; the
- * DEVMODEA forms stay unimplemented). */
+ * nearest), EnumDisplayMonitors calls back for each (for a device context: the primary only), and the display settings come from the window manager (the A forms convert
+ * DEVMODEA and DISPLAY_DEVICEA to and from the W structures; the names of devices are ASCII). */
 
 #define MONITOR_DEFAULTTONULL_ 0
 #define ERROR_INVALID_MONITOR_HANDLE_ 1461
@@ -115,12 +115,118 @@ EXPORT LONG WINAPI QueryDisplayConfig(UINT flags, UINT *path_count, void *paths,
 EXPORT LONG WINAPI DisplayConfigGetDeviceInfo(void *packet) {
   return (LONG)RtlNtStatusToDosError((LONG)NtUserDisplayConfigGetDeviceInfo((ULONG_PTR)packet));
 }
+static HANDLE *list_windows(HANDLE parent, BOOL recursive, DWORD thread, ULONG *count);
+EXPORT LONG_PTR WINAPI SendMessageTimeoutW(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam, UINT flags, UINT timeout, ULONG_PTR *result);
+/* The current mode as width, height and bits (0s: none). */
+static void display_mode_now(DWORD *w, DWORD *h, DWORD *bpp) {
+  BYTE dm[220];
+  for (UINT i = 0; i < sizeof dm; ++i) dm[i] = 0;
+  *(WORD *)(dm + 68) = 220;
+  *w = *h = *bpp = 0;
+  if (!EnumDisplaySettingsExW(NULL, (DWORD)-1 /* ENUM_CURRENT_SETTINGS */, dm, 0)) return;
+  *bpp = *(DWORD *)(dm + 168);
+  *w = *(DWORD *)(dm + 172);
+  *h = *(DWORD *)(dm + 176);
+}
 EXPORT LONG WINAPI ChangeDisplaySettingsExW(LPCWSTR device, void *devmode, HANDLE hwnd, DWORD flags, void *lparam) {
   UNICODE_STRING us;
   if (device) us_name(&us, device);
-  return (LONG)NtUserChangeDisplaySettings(device ? (ULONG_PTR)&us : 0, (ULONG_PTR)devmode, (ULONG_PTR)hwnd, flags, (ULONG_PTR)lparam);
+  DWORD w0, h0, b0;
+  display_mode_now(&w0, &h0, &b0);
+  const LONG r = (LONG)NtUserChangeDisplaySettings(device ? (ULONG_PTR)&us : 0, (ULONG_PTR)devmode, (ULONG_PTR)hwnd, flags, (ULONG_PTR)lparam);
+  if (r == 0 /* DISP_CHANGE_SUCCESSFUL */ && !(flags & 2 /* CDS_TEST */)) {
+    /* (a mode that changed is told to every top-level window: WM_DISPLAYCHANGE with the depth and the size, as Windows sends it) */
+    DWORD w1, h1, b1;
+    display_mode_now(&w1, &h1, &b1);
+    if (w1 != w0 || h1 != h0 || b1 != b0) {
+      ULONG n = 0;
+      HANDLE *list = list_windows(NULL, FALSE, 0, &n);
+      for (ULONG i = 0; list && i < n; ++i) {
+        ULONG_PTR result = 0;
+        SendMessageTimeoutW(list[i], 0x007E /* WM_DISPLAYCHANGE */, b1, (LONG_PTR)(((h1 & 0xFFFF) << 16) | (w1 & 0xFFFF)), 0x0002 /* SMTO_ABORTIFHUNG */, 2000, &result);
+      }
+      u32_free(list);
+    }
+  }
+  return r;
 }
 EXPORT LONG WINAPI ChangeDisplaySettingsW(void *devmode, DWORD flags) { return ChangeDisplaySettingsExW(NULL, devmode, NULL, flags, NULL); }
+
+/* DEVMODEA <-> DEVMODEW: the 32 characters of the device name, then dmSpecVersion .. dmCollate (38 bytes), the 32 characters of the form name, then
+ * dmLogPixels .. the end (54 bytes); DEVMODEA is 156 bytes (dmSize at 36), DEVMODEW 220 (dmSize at 68). Older, shorter DEVMODEAs keep what they have. */
+#define DEVMODEA_SIZE_ 156u
+#define DEVMODEW_SIZE_ 220u
+static void devmode_a_to_w(const BYTE *a, BYTE *w) {
+  for (UINT i = 0; i < DEVMODEW_SIZE_; ++i) w[i] = 0;
+  UINT size = *(const WORD *)(a + 36);
+  if (size > DEVMODEA_SIZE_) size = DEVMODEA_SIZE_;
+  for (UINT i = 0; i < 32; ++i) ((WCHAR *)w)[i] = (BYTE)a[i];
+  for (UINT i = 0; i < 38 && 32 + i < size; ++i) w[64 + i] = a[32 + i];
+  for (UINT i = 0; i < 32 && 70 + i < size; ++i) ((WCHAR *)(w + 102))[i] = (BYTE)a[70 + i];
+  for (UINT i = 0; i < 54 && 102 + i < size; ++i) w[166 + i] = a[102 + i];
+  *(WORD *)(w + 68) = (WORD)DEVMODEW_SIZE_;
+  *(WORD *)(w + 70) = 0;      /* (dmDriverExtra: none is passed on) */
+}
+static void devmode_w_to_a(const BYTE *w, BYTE *a, UINT size) {
+  BYTE full[DEVMODEA_SIZE_];
+  for (UINT i = 0; i < DEVMODEA_SIZE_; ++i) full[i] = 0;
+  for (UINT i = 0; i < 32; ++i) { const WCHAR c = ((const WCHAR *)w)[i]; full[i] = (BYTE)(c < 0x80 ? c : '?'); }
+  for (UINT i = 0; i < 38; ++i) full[32 + i] = w[64 + i];
+  for (UINT i = 0; i < 32; ++i) { const WCHAR c = ((const WCHAR *)(w + 102))[i]; full[70 + i] = (BYTE)(c < 0x80 ? c : '?'); }
+  for (UINT i = 0; i < 54; ++i) full[102 + i] = w[166 + i];
+  if (size > DEVMODEA_SIZE_) size = DEVMODEA_SIZE_;
+  *(WORD *)(full + 36) = (WORD)size;
+  *(WORD *)(full + 38) = 0;
+  for (UINT i = 0; i < size; ++i) a[i] = full[i];
+}
+/* A device name of the A forms as a wide string (NULL stays NULL). */
+static const WCHAR *device_name_wide(const char *name, WCHAR *out, UINT capacity) {
+  if (!name) return NULL;
+  UINT i = 0;
+  for (; name[i] && i + 1 < capacity; ++i) out[i] = (BYTE)name[i];
+  out[i] = 0;
+  return out;
+}
+EXPORT BOOL WINAPI EnumDisplaySettingsExA(LPCSTR device, DWORD mode, void *devmode, DWORD flags) {
+  if (!devmode) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+  WCHAR name[64];
+  BYTE w[DEVMODEW_SIZE_];
+  for (UINT i = 0; i < DEVMODEW_SIZE_; ++i) w[i] = 0;
+  *(WORD *)(w + 68) = (WORD)DEVMODEW_SIZE_;
+  if (!EnumDisplaySettingsExW(device_name_wide(device, name, 64), mode, w, flags)) return FALSE;
+  UINT size = *(WORD *)((BYTE *)devmode + 36);
+  if (size < 124 || size > DEVMODEA_SIZE_) size = DEVMODEA_SIZE_;      /* (the whole DEVMODEA unless dmSize names an older, shorter one) */
+  devmode_w_to_a(w, devmode, size);
+  return TRUE;
+}
+EXPORT BOOL WINAPI EnumDisplaySettingsA(LPCSTR device, DWORD mode, void *devmode) { return EnumDisplaySettingsExA(device, mode, devmode, 0); }
+EXPORT LONG WINAPI ChangeDisplaySettingsExA(LPCSTR device, void *devmode, HANDLE hwnd, DWORD flags, void *lparam) {
+  WCHAR name[64];
+  BYTE w[DEVMODEW_SIZE_];
+  if (devmode) devmode_a_to_w(devmode, w);
+  return ChangeDisplaySettingsExW(device_name_wide(device, name, 64), devmode ? w : NULL, hwnd, flags, lparam);
+}
+EXPORT LONG WINAPI ChangeDisplaySettingsA(void *devmode, DWORD flags) { return ChangeDisplaySettingsExA(NULL, devmode, NULL, flags, NULL); }
+/* DISPLAY_DEVICEA: cb, DeviceName[32], DeviceString[128], StateFlags, DeviceID[128], DeviceKey[128] (424 bytes); the W form is 840. */
+EXPORT BOOL WINAPI EnumDisplayDevicesA(LPCSTR device, DWORD index, void *info, DWORD flags) {
+  if (!info) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+  const DWORD cb = *(DWORD *)info;
+  if (cb < 168 || cb > 424) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }      /* (at least through StateFlags) */
+  WCHAR name[64];
+  BYTE w[840];
+  for (UINT i = 0; i < sizeof w; ++i) w[i] = 0;
+  *(DWORD *)w = 840;
+  if (!EnumDisplayDevicesW(device_name_wide(device, name, 64), index, w, flags)) return FALSE;
+  BYTE a[424];
+  for (UINT i = 0; i < sizeof a; ++i) a[i] = 0;
+  static const struct { UINT a, w, chars; } strings[] = {{4, 4, 32}, {36, 68, 128}, {168, 328, 128}, {296, 584, 128}};
+  for (UINT k = 0; k < 4; ++k)
+    for (UINT i = 0; i < strings[k].chars; ++i) { const WCHAR c = ((WCHAR *)(w + strings[k].w))[i]; a[strings[k].a + i] = (BYTE)(c < 0x80 ? c : '?'); }
+  *(DWORD *)(a + 164) = *(DWORD *)(w + 324);
+  *(DWORD *)a = cb;
+  for (UINT i = 0; i < cb; ++i) ((BYTE *)info)[i] = a[i];
+  return TRUE;
+}
 
 /* ---- DPI awareness ---------------------------------------------------------------------------------------------------------------------------------------------------
  * win32k keeps the awareness of the process and of each thread as Wine's ntuser contexts: the awareness in the low nibble, the version of the model above it, the dpi in bits

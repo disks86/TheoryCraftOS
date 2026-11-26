@@ -148,10 +148,21 @@ void activation_changes(Queue& q, Window* new_top, bool click, Notes& notes) {
 }
 
 // Makes the queue the foreground one: the queue that was loses its activation and focus.
+// WM_ACTIVATEAPP to every top-level window of a thread: wParam whether its thread is the one that is activated, lParam the other thread.
+static void activate_app_notes(uint64_t thread, bool active, uint64_t other, Notes& notes) {
+  if (thread == 0) return;
+  for (Window& w : S().windows.items()) {
+    if (w.thread != thread || w.destroying || !w.parent || w.parent->parent || w.desktop == nullptr || &w == w.desktop->message_root) continue;
+    notes.add(w.handle, wn::WM_ACTIVATEAPP, active ? 1 : 0, other);
+  }
+}
+
 static void foreground_changes(Queue* new_queue, Notes& notes) {
   State& s = S();
   Queue* old = s.foreground_thread ? find_queue(s.foreground_thread) : nullptr;
   if (old == new_queue) return;
+  // (the application that goes to the background hears it first, the one that comes to the foreground before its activation messages)
+  activate_app_notes(old ? old->thread : 0, false, new_queue ? new_queue->thread : 0, notes);
   if (old) {
     InputState& in = *old->input_state;
     if (in.focus) { notes.add(in.focus->handle, wn::WM_KILLFOCUS, 0, 0); in.focus = nullptr; }
@@ -162,12 +173,14 @@ static void foreground_changes(Queue* new_queue, Notes& notes) {
       in.active = nullptr;
     }
   }
+  activate_app_notes(new_queue ? new_queue->thread : 0, true, old ? old->thread : 0, notes);
   s.foreground_thread = new_queue ? new_queue->thread : 0;
 }
 
 bool set_foreground_internal(Window* w) {
   Window* top = top_level_of(w);
-  if (!top || !top->parent || !is_visible(top) || (top->style & wn::WS_DISABLED)) return false;
+  // (a hidden top-level can be the foreground window, as in Windows: DirectDraw's exclusive windows and programs that show after activating)
+  if (!top || !top->parent || (top->style & wn::WS_DISABLED)) return false;
   Queue* q = find_queue(top->thread);
   if (!q) return false;
   Notes notes(S().alloc);
@@ -318,7 +331,7 @@ uint64_t nt_set_foreground_window(Call& call) {
   Window* w = window_arg(call, 0);
   if (!w) return 0;
   Window* top = top_level_of(w);
-  if (!top || !top->parent || !is_visible(top)) return call.fail(kErrorInvalidParameter);
+  if (!top || !top->parent) return call.fail(kErrorInvalidParameter);      // (hidden ones too, as Windows)
   Queue* q = find_queue(top->thread);
   if (!q) return call.fail(kErrorInvalidThreadId);
   Op* op = op_begin(call, notes_step);

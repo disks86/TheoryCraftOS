@@ -57,6 +57,8 @@ bool blit_surface(Dc& dst, const Rect& drect, const Surface& src, const Rect& sr
   }
   const bool mono_src = s2.bpp == 1 && s2.colors.size() >= 2;
   Surface& d = p.surface();
+  const bool raw_dst = use_rop && dc_rop_on_bits(dst, d);
+  const bool raw_src = s2.valid() && s2.bpp == 32 && s2.masks[0] == 0 && s2.masks[1] == 0 && s2.masks[2] == 0;
   for (const Rect& cr : p.clip().view()) {
     const Rect q = rect_and(Rect{sat_add(nd.left, p.ox()), sat_add(nd.top, p.oy()), sat_add(nd.right, p.ox()), sat_add(nd.bottom, p.oy())}, cr);
     if (rect_empty(q)) continue;
@@ -98,6 +100,12 @@ bool blit_surface(Dc& dst, const Rect& drect, const Surface& src, const Rect& sr
           }
           bool transparent = false;
           const ColorRef pc = !pattern_used ? 0 : pat_solid ? pat.solid : pat.at(x - p.ox(), y - p.oy(), &transparent);
+          if (raw_dst) {      // (32 bpp BI_RGB: the ROP on the whole pixel, as Windows)
+            uint32_t sb = 0;
+            if (needs_src) sb = raw_src && !mono_src ? s2.get_raw32(int32_t(ns.left + map_index(dx, dw, sw, flip_x)), int32_t(sy)) : colorref_bits32(s);
+            d.put_raw32(x, y, rop3_apply_bits(rop, colorref_bits32(transparent ? pat.back : pc), sb, d.get_raw32(x, y)));
+            continue;
+          }
           out = rop3_apply(rop, transparent ? pat.back : pc, s, dcol);
         }
         d.put(x, y, out);

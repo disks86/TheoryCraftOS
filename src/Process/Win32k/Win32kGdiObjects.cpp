@@ -110,6 +110,10 @@ uint64_t NtGdiSelectBrush(Call& c) { return select_generic(c, kObjBrush); }
 uint64_t NtGdiSelectPen(Call& c) { return select_generic(c, kObjPen); }
 uint64_t NtGdiSelectFont(Call& c) { return select_generic(c, kObjFont); }
 
+// NtUserSelectPalette(hdc, hpal, bForceBackground): selects a logical palette into a DC, the previous one returned (NULL with the DC or the
+// palette not valid). Background or foreground only matters for realizing it into the system palette, which a true-colour display has not.
+uint64_t NtUserSelectPalette(Call& c) { return select_generic(c, kObjPalette); }
+
 uint64_t NtGdiCreateSolidBrush(Call& c) {
   Brush* b = make_object<Brush>(kObjBrush, c.pid());
   if (!b) return c.fail(kErrorNotEnoughMemory);
@@ -512,8 +516,8 @@ uint64_t NtGdiExtGetObjectW(Call& c) {
       put_u16(out + 16, b.planes); put_u16(out + 18, b.bpp);
       if (b.dib) {
         for (int i = 0; i < 8; ++i) out[24 + i] = uint8_t(b.user_address >> (8 * i));
-        put_u32(out + 32, 40); put_u32(out + 36, uint32_t(b.width)); put_u32(out + 40, uint32_t(b.bottom_up ? b.height : -b.height));
-        put_u16(out + 44, b.planes); put_u16(out + 46, b.bpp); put_u32(out + 48, b.compression); put_u32(out + 52, b.stride * uint32_t(b.height));
+        put_u32(out + 32, 40); put_u32(out + 36, uint32_t(b.width)); put_u32(out + 40, uint32_t(b.bottom_up || b.from_memory ? b.height : -b.height));
+        put_u16(out + 44, b.planes); put_u16(out + 46, b.bpp); put_u32(out + 48, b.compression); put_u32(out + 52, b.from_memory ? 0 : b.stride * uint32_t(b.height));
         put_u32(out + 56, b.x_ppm); put_u32(out + 60, b.y_ppm); put_u32(out + 64, b.bpp <= 8 ? uint32_t(b.colors.count()) : 0); put_u32(out + 68, b.clr_important);
         if (b.compression == 3) for (int i = 0; i < 3; ++i) put_u32(out + 72 + 4 * i, b.masks[i]);
         for (int i = 0; i < 8; ++i) out[88 + i] = uint8_t(b.section_handle >> (8 * i));
@@ -593,6 +597,7 @@ void register_object_services() {
   GDI_REGISTER(SelectBrush, NtGdiSelectBrush);
   GDI_REGISTER(SelectPen, NtGdiSelectPen);
   GDI_REGISTER(SelectFont, NtGdiSelectFont);
+  ::process::win32k::register_handler(WindowsSyscallNumber::NtUserSelectPalette, NtUserSelectPalette);
   GDI_REGISTER(CreateSolidBrush, NtGdiCreateSolidBrush);
   GDI_REGISTER(CreateHatchBrushInternal, NtGdiCreateHatchBrushInternal);
   GDI_REGISTER(CreatePatternBrushInternal, NtGdiCreatePatternBrushInternal);

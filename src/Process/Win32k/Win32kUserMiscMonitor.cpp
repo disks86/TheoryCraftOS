@@ -41,6 +41,10 @@ struct MonitorState {
   Rect work;
   bool work_set = false;
   uint32_t registry_width = 0, registry_height = 0;
+  // The colour depth of the display mode (8, 16, 24 or 32 bits a pixel). The screen is always scanned out at 32 bits: a mode of fewer is the depth
+  // programs are told (EnumDisplaySettings), and DirectDraw, which draws the primary surface of such a mode, converts its pixels when it shows them
+  // (docs/DirectDraw.md), as Windows 8 and later emulate the low-colour modes.
+  uint32_t bpp = 32, registry_bpp = 32;
   Rect rects[kMaxMonitors], works[kMaxMonitors];
   uint32_t scales[kMaxMonitors] = {};      // each monitor's scale (percent; 0: the system's): monitors at different scales
   uint32_t count = 0;
@@ -105,14 +109,18 @@ uint32_t mode_list(Mode* out) {
   return n;
 }
 
-void write_devmode(uint8_t* out, uint32_t width, uint32_t height) {
+// The depths every size is listed at (the order of EnumDisplaySettings' indices: all sizes at 32 bits, then at 16, then at 8).
+constexpr uint32_t kDepths[] = {32, 16, 8};
+bool depth_valid(uint32_t bpp) { return bpp == 8 || bpp == 16 || bpp == 24 || bpp == 32; }
+
+void write_devmode(uint8_t* out, uint32_t width, uint32_t height, uint32_t bpp) {
   for (uint32_t i = 0; i < kDevModeSize; ++i) out[i] = 0;
   put_text(out, 0, 32, kAdapterName);
   put16(out, 64, 0x0401);      // dmSpecVersion
   put16(out, 66, 0x0401);      // dmDriverVersion
   put16(out, 68, kDevModeSize);
   put32(out, 72, kDmPosition | kDmDisplayOrientation | kDmBitsPerPel | kDmPelsWidth | kDmPelsHeight | kDmDisplayFlags | kDmDisplayFrequency);
-  put32(out, 168, 32);
+  put32(out, 168, bpp);
   put32(out, 172, width);
   put32(out, 176, height);
   put32(out, 184, 60);
@@ -122,18 +130,22 @@ uint64_t svc_enum_display_settings(Call& c) {
   bool given = false;
   if (!device_is_ours(c, c.arg(0), &given)) return c.fail(c.arg(0) ? kErrorNoAccess : kErrorInvalidParameter);
   const uint32_t mode = c.arg32(1);
-  uint32_t width = 0, height = 0;
-  if (mode == kEnumCurrent) { width = gdi::screen_width(); height = gdi::screen_height(); }
-  else if (mode == kEnumRegistry) { width = g_monitor.registry_width ? g_monitor.registry_width : gdi::screen_width(); height = g_monitor.registry_height ? g_monitor.registry_height : gdi::screen_height(); }
-  else {
+  uint32_t width = 0, height = 0, bpp = 32;
+  if (mode == kEnumCurrent) { width = gdi::screen_width(); height = gdi::screen_height(); bpp = g_monitor.bpp; }
+  else if (mode == kEnumRegistry) {
+    width = g_monitor.registry_width ? g_monitor.registry_width : gdi::screen_width();
+    height = g_monitor.registry_height ? g_monitor.registry_height : gdi::screen_height();
+    bpp = g_monitor.registry_bpp;
+  } else {
     Mode modes[kMaxModes];
     const uint32_t n = mode_list(modes);
-    if (mode >= n) return 0;
-    width = modes[mode].width;
-    height = modes[mode].height;
+    if (mode >= n * (sizeof(kDepths) / sizeof(kDepths[0]))) return 0;
+    width = modes[mode % n].width;
+    height = modes[mode % n].height;
+    bpp = kDepths[mode / n];
   }
   uint8_t out[kDevModeSize];
-  write_devmode(out, width, height);
+  write_devmode(out, width, height, bpp);
   return c.write(c.arg(2), ConstByteView(out, kDevModeSize)) ? 1 : c.fail(kErrorNoAccess);
 }
 
@@ -143,7 +155,7 @@ uint64_t svc_change_display_settings(Call& c) {
   bool given = false;
   if (!device_is_ours(c, c.arg(0), &given)) return uint32_t(kDispChangeBadParam);
   if (g_monitor.registry_width == 0) { g_monitor.registry_width = gdi::screen_width(); g_monitor.registry_height = gdi::screen_height(); }
-  uint32_t width = g_monitor.registry_width, height = g_monitor.registry_height;
+  uint32_t width = g_monitor.registry_width, height = g_monitor.registry_height, bpp = g_monitor.registry_bpp;
   if (c.arg(1) != 0) {
     uint8_t in[kDevModeSize] = {};
     uint16_t size = 0;
@@ -152,9 +164,11 @@ uint64_t svc_change_display_settings(Call& c) {
     const uint32_t fields = get32(in, 72);
     width = gdi::screen_width();
     height = gdi::screen_height();
+    bpp = g_monitor.bpp;
     if ((fields & kDmPelsWidth) && size >= 176) width = get32(in, 172);
     if ((fields & kDmPelsHeight) && size >= 180) height = get32(in, 176);
-    if ((fields & kDmBitsPerPel) && size >= 172 && get32(in, 168) != 32) return uint32_t(kDispChangeBadMode);
+    if ((fields & kDmBitsPerPel) && size >= 172) bpp = get32(in, 168);
+    if (!depth_valid(bpp)) return uint32_t(kDispChangeBadMode);
     if (width < 16 || height < 16 || width > 16384 || height > 16384) return uint32_t(kDispChangeBadMode);
   }
   if (flags & kCdsTest) return uint32_t(kDispChangeSuccessful);
@@ -162,7 +176,8 @@ uint64_t svc_change_display_settings(Call& c) {
     if (!gdi::set_screen_size(width, height)) return uint32_t(kDispChangeFailed);
     g_monitor.work_set = false;
   }
-  if ((flags & kCdsUpdateRegistry) && c.arg(1) != 0) { g_monitor.registry_width = width; g_monitor.registry_height = height; }
+  g_monitor.bpp = bpp;
+  if ((flags & kCdsUpdateRegistry) && c.arg(1) != 0) { g_monitor.registry_width = width; g_monitor.registry_height = height; g_monitor.registry_bpp = bpp; }
   return uint32_t(kDispChangeSuccessful);
 }
 

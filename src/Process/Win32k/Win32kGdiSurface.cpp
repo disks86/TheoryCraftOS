@@ -198,4 +198,20 @@ uint32_t rop3_apply(uint32_t rop, ColorRef pat, ColorRef src, ColorRef dst) {
   return r & 0xFFFFFF;
 }
 
+bool dc_rop_on_bits(const Dc& dc, const Surface& s) {
+  if (!dc.memory || dc.screen || s.bpp != 32 || s.masks[0] || s.masks[1] || s.masks[2]) return false;
+  const Bitmap* b = find_bitmap(dc.bitmap);
+  return b && b->dib && !b->is_screen && !b->window_surface && !b->shadow_scale;
+}
+
+uint32_t rop3_apply_bits(uint32_t rop, uint32_t pat, uint32_t src, uint32_t dst) {
+  const uint32_t table = (rop >> 16) & 0xFF;
+  uint32_t r = 0;
+  for (uint32_t idx = 0; idx < 8; ++idx) {
+    if (((table >> idx) & 1) == 0) continue;
+    r |= ((idx & 4) ? pat : ~pat) & ((idx & 2) ? src : ~src) & ((idx & 1) ? dst : ~dst);
+  }
+  return r;
+}
+
 }  // namespace process::win32k::gdi

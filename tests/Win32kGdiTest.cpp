@@ -158,6 +158,12 @@ static void test_objects() {
   CHECK(prev == white && f.u(N(DeleteObjectApp), b2) == 0);
   f.u(N(SelectBrush), dc, prev);
   CHECK(f.u(N(DeleteObjectApp), b2) == 1);
+  // SelectPalette (NtUserSelectPalette): a new DC has DEFAULT_PALETTE; the previous palette comes back; not a palette or not a DC: NULL
+  const uint32_t default_palette = gdi::stock_object(15);
+  CHECK(f.u(WN::NtUserSelectPalette, dc, pal, 0) == default_palette);
+  CHECK(f.u(WN::NtUserSelectPalette, dc, default_palette, 0) == pal);
+  CHECK(f.u(WN::NtUserSelectPalette, dc, white, 0) == 0 && f.u(WN::NtUserSelectPalette, 0x12345, pal, 0) == 0);
+  CHECK(f.u(WN::NtUserSelectPalette, dc, default_palette, 1) == default_palette);
   CHECK(f.u(N(DeleteObjectApp), dc) == 1);
   // handles of another process are not usable
   Program other(22);
@@ -1217,6 +1223,41 @@ static void test_window_surfaces() {
   gdi::set_window_surface_sink(nullptr);
 }
 
+// D3DKMTCreateDCFromMemory (what DirectDraw's and Direct3D's GetDC give out): a DIB on the program's own top-down memory.
+static void test_dc_from_memory() {
+  Fixture f(31);
+  constexpr uint64_t kBits = kBig, kTable = kBig + 0x400;
+  for (uint64_t i = 0; i < 64; ++i) f.prog.memory.put8(kBits + i, 0xAA);
+  auto make = [&](uint32_t format, uint32_t pitch, uint64_t table) {
+    for (uint64_t i = 0; i < 56; ++i) f.prog.memory.put8(kIn + i, 0);
+    f.prog.memory.put64(kIn, kBits); f.prog.memory.put32(kIn + 8, format); f.prog.memory.put32(kIn + 12, 4); f.prog.memory.put32(kIn + 16, 4);
+    f.prog.memory.put32(kIn + 20, pitch); f.prog.memory.put64(kIn + 32, table);
+    return f.u(N(DdDDICreateDCFromMemory), kIn);
+  };
+  CHECK(make(22, 16, 0) == 0);
+  const uint32_t dc = uint32_t(f.prog.memory.get64(kIn + 40)), bm = uint32_t(f.prog.memory.get64(kIn + 48));
+  CHECK(dc && bm && px(f, dc, 0, 0) == 0xAAAAAA);
+  // GetObject: positive height and no image size (as Windows), the bits are the program's
+  CHECK(f.u(N(ExtGetObjectW), bm, 104, kOut) == 104 && f.prog.memory.get64(kOut + 24) == kBits && int32_t(f.prog.memory.get32(kOut + 40)) == 4 &&
+        f.prog.memory.get32(kOut + 52) == 0);
+  // ROPs on a 32 bpp BI_RGB DIB work on the whole pixel: WHITENESS sets the fourth byte, BLACKNESS clears it
+  CHECK(f.u(N(PatBlt), dc, 0, 0, 2, 4, kWhiteness) == 1 && f.u(N(PatBlt), dc, 2, 0, 2, 4, kBlackness) == 1);
+  CHECK(f.prog.memory.get32(kBits) == 0xFFFFFFFFu && f.prog.memory.get32(kBits + 12) == 0 && f.prog.memory.get32(kBits + 16 * 3 + 4) == 0xFFFFFFFFu);
+  for (uint64_t i = 0; i < 16; ++i) f.prog.memory.put8(kOut + i, 0);
+  f.prog.memory.put64(kOut, dc); f.prog.memory.put64(kOut + 8, bm);
+  CHECK(f.u(N(DdDDIDestroyDCFromMemory), kOut) == 0);
+  // 8 bpp: the PALETTEENTRYs (peRed, peGreen, peBlue) become the colour table
+  for (uint64_t i = 0; i < 1024; ++i) f.prog.memory.put8(kTable + i, 0);
+  f.prog.memory.put8(kTable + 4, 0x01); f.prog.memory.put8(kTable + 8 + 1, 0x02); f.prog.memory.put8(kTable + 12 + 2, 0x03);
+  CHECK(make(41, 4, 0) != 0);      // no colour table: STATUS_INVALID_PARAMETER
+  CHECK(make(41, 4, kTable) == 0);
+  const uint32_t dc8 = uint32_t(f.prog.memory.get64(kIn + 40));
+  CHECK(f.u(N(DoPalette), dc8, 1, 3, kOut, 4, 0) == 3 && f.prog.memory.get32(kOut) == 0x00010000 && f.prog.memory.get32(kOut + 4) == 0x00000200 &&
+        f.prog.memory.get32(kOut + 8) == 0x00000003);      // RGBQUADs: B, G, R
+  f.prog.memory.put8(kBits, 1);
+  CHECK(px(f, dc8, 0, 0) == 0x000001);
+}
+
 int main() {
   test_registration();
   test_objects();
@@ -1227,6 +1268,7 @@ int main() {
   test_clipping();
   test_paths();
   test_dib();
+  test_dc_from_memory();
   test_bitmap_bits();
   test_text();
   test_font_provider();

@@ -434,9 +434,95 @@ uint64_t NtGdiCreateDIBBrush(Call& c) {
   return b->handle;
 }
 
+// D3DKMTCreateDCFromMemory: a memory DC whose bitmap is a DIB on the program's own memory (what Direct3D and DirectDraw give out from GetDC: GDI draws
+// straight into the surface). D3DKMT_CREATEDCFROMMEMORY, the x64 layout (gdi32 converts a 32-bit program's): pMemory @0, Format @8, Width @12,
+// Height @16, Pitch @20, hDeviceDc @24, pColorTable @32 (PALETTEENTRY[256] of a P8 DIB), hDc @40 (out), hBitmap @48 (out). The rows are top-down,
+// `Pitch` bytes apart. NTSTATUS.
+constexpr uint64_t kStatusOk = 0, kStatusBadParameter = 0xC000000Du, kStatusNoMemory = 0xC0000017u;
+uint64_t le64_at(const uint8_t* p) { return uint64_t(le32(p)) | uint64_t(le32(p + 4)) << 32; }
+
+uint64_t NtGdiDdDDICreateDCFromMemory(Call& c) {
+  uint8_t p[56] = {};
+  if (c.arg(0) == 0 || !c.read(c.arg(0), ByteView(p, sizeof p))) return kStatusBadParameter;
+  const uint64_t memory = le64_at(p), colours = le64_at(p + 32);
+  const uint32_t format = le32(p + 8), width = le32(p + 12), height = le32(p + 16), pitch = le32(p + 20);
+  // (the D3DDDIFORMATs GDI can draw: R8G8B8 20, A8R8G8B8 21, X8R8G8B8 22, R5G6B5 23, X1R5G5B5 24, A1R5G5B5 25, A4R4G4B4 26, X4R4G4B4 30,
+  // A2R10G10B10 35, P8 41)
+  uint32_t bpp = 0, masks[3] = {0, 0, 0};
+  switch (format) {
+    case 20: bpp = 24; break;
+    case 21: case 22: bpp = 32; break;
+    case 23: bpp = 16; masks[0] = 0xF800; masks[1] = 0x07E0; masks[2] = 0x001F; break;
+    case 24: case 25: bpp = 16; masks[0] = 0x7C00; masks[1] = 0x03E0; masks[2] = 0x001F; break;
+    case 26: case 30: bpp = 16; masks[0] = 0x0F00; masks[1] = 0x00F0; masks[2] = 0x000F; break;
+    case 35: bpp = 32; masks[0] = 0x3FF00000u; masks[1] = 0x000FFC00u; masks[2] = 0x000003FFu; break;      // (A2R10G10B10)
+    case 41: bpp = 8; break;
+    default: return kStatusBadParameter;
+  }
+  if (memory == 0 || width == 0 || height == 0 || width > 16384 || height > 16384) return kStatusBadParameter;
+  if (uint64_t(pitch) < (uint64_t(width) * bpp + 7) / 8) return kStatusBadParameter;
+  if (bpp == 8 && colours == 0) return kStatusBadParameter;
+  const uint64_t bytes = uint64_t(pitch) * height;
+  if (bytes > kMaxDibBytes) return kStatusBadParameter;
+  uint32_t table[256] = {};
+  if (bpp == 8) {
+    uint8_t entries[256 * 4];
+    if (!c.read(colours, ByteView(entries, sizeof entries))) return kStatusBadParameter;
+    for (uint32_t i = 0; i < 256; ++i) table[i] = make_rgb(entries[4 * i], entries[4 * i + 1], entries[4 * i + 2]);      // (peRed, peGreen, peBlue -> a COLORREF, as every colour table here)
+  }
+  Bitmap* b = make_object<Bitmap>(kObjBitmap, c.pid());
+  if (!b) return kStatusNoMemory;
+  b->width = int32_t(width);
+  b->height = int32_t(height);
+  b->bpp = bpp;
+  b->dib = true;
+  b->bottom_up = false;
+  b->from_memory = true;
+  b->compression = masks[0] ? 3 : 0;
+  b->stride = pitch;
+  b->dib_usage = 0;
+  for (int i = 0; i < 3; ++i) b->masks[i] = masks[i];
+  if (bpp == 8) for (uint32_t col : table) if (!b->colors.push_back(col)) { destroy_object(b->handle); return kStatusNoMemory; }
+  if (!b->data.put_zeros(bytes)) { destroy_object(b->handle); return kStatusNoMemory; }
+  // (the bits are the program's memory: not mapped here, so never unmapped with the bitmap)
+  b->proc = &c.process();
+  b->user_address = memory;
+  b->user_mapped = false;
+  dib_sync_in(*b);
+  Dc* dc = new_dc(c.pid());
+  if (!dc) { destroy_object(b->handle); return kStatusNoMemory; }
+  dc->memory = true;
+  dc->bitmap = default_bitmap_handle();
+  if (Object* o = find_object(dc->bitmap)) ++o->selected;
+  uint32_t previous = 0;
+  if (!dc_select_object(*dc, b, &previous)) { destroy_object(dc->handle); destroy_object(b->handle); return kStatusBadParameter; }
+  if (!c.write_u64(c.arg(0) + 40, dc->handle) || !c.write_u64(c.arg(0) + 48, b->handle)) {
+    destroy_object(dc->handle);
+    destroy_object(b->handle);
+    return kStatusBadParameter;
+  }
+  return kStatusOk;
+}
+
+// D3DKMTDestroyDCFromMemory: D3DKMT_DESTROYDCFROMMEMORY { hDc @0, hBitmap @8 }: the DC and its bitmap go (the program's memory stays).
+uint64_t NtGdiDdDDIDestroyDCFromMemory(Call& c) {
+  uint8_t p[16] = {};
+  if (c.arg(0) == 0 || !c.read(c.arg(0), ByteView(p, sizeof p))) return kStatusBadParameter;
+  const uint32_t dc = uint32_t(le64_at(p)), bitmap = uint32_t(le64_at(p + 8));
+  Object* d = find_object(dc);
+  Object* b = find_object(bitmap);
+  if (!d || d->type != kObjDc || d->pid != c.pid() || !b || b->type != kObjBitmap || b->pid != c.pid()) return kStatusBadParameter;
+  if (Bitmap* bm = find_bitmap(bitmap)) dib_sync_in(*bm);
+  destroy_object(dc);
+  destroy_object(bitmap);
+  return kStatusOk;
+}
+
 }  // namespace
 
 void register_dib_services() {
+  ::process::win32k::register_handler(WindowsSyscallNumber::NtGdiDdDDICreateDCFromMemory, NtGdiDdDDICreateDCFromMemory);
+  ::process::win32k::register_handler(WindowsSyscallNumber::NtGdiDdDDIDestroyDCFromMemory, NtGdiDdDDIDestroyDCFromMemory);
   GDI_REGISTER(CreateDIBSection, NtGdiCreateDIBSection);
   GDI_REGISTER(CreateDIBitmapInternal, NtGdiCreateDIBitmapInternal);
   GDI_REGISTER(GetDIBitsInternal, NtGdiGetDIBitsInternal);

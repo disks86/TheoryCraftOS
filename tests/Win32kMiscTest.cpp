@@ -900,12 +900,14 @@ void test_monitors() {
   CHECK(p.memory.get16(kD + 68) == 220 && p.memory.get32(kD + 168) == 32 && p.memory.get32(kD + 172) == 1024 && p.memory.get32(kD + 176) == 768 && p.memory.get32(kD + 184) == 60);
   CHECK(p.memory.get_wide_z(kD) == "\\\\.\\DISPLAY1" && (p.memory.get32(kD + 72) & 0x180000) == 0x180000);
   CHECK(p.call(N::NtUserEnumDisplaySettings, 0, 0, kD, 0) == 1 && p.memory.get32(kD + 172) == 640 && p.memory.get32(kD + 176) == 480);
-  uint32_t modes = 0, prev_w = 0;
-  for (; p.call(N::NtUserEnumDisplaySettings, 0, modes, kD, 0) == 1 && modes < 100; ++modes) {
+  uint32_t modes = 0, prev_w = 0, prev_bpp = 32, depths = 1;
+  for (; p.call(N::NtUserEnumDisplaySettings, 0, modes, kD, 0) == 1 && modes < 200; ++modes) {
+    const uint32_t bpp = p.memory.get32(kD + 168);
+    if (bpp != prev_bpp) { CHECK(bpp < prev_bpp); prev_bpp = bpp; prev_w = 0; ++depths; }      // (every size at 32 bits, then at 16, then at 8)
     CHECK(p.memory.get32(kD + 172) >= prev_w);
     prev_w = p.memory.get32(kD + 172);
   }
-  CHECK(modes >= 10 && modes < 100);
+  CHECK(modes >= 30 && modes < 200 && depths == 3 && prev_bpp == 8);
   p.memory.put_unicode_string(kE, kE + 0x40, "\\\\.\\DISPLAY1");
   CHECK(p.call(N::NtUserEnumDisplaySettings, kE, 0xFFFFFFFFu, kD, 0) == 1);
   p.memory.put_unicode_string(kE, kE + 0x40, "\\\\.\\DISPLAY9");
@@ -917,7 +919,9 @@ void test_monitors() {
   CHECK(p.call32(N::NtUserChangeDisplaySettings, 0, kD, 0, 2, 0) == 0 && gdi::screen_width() == 1024);      // CDS_TEST: nothing changes
   CHECK(p.call32(N::NtUserChangeDisplaySettings, 0, kD, 0, 0, 0) == 0 && gdi::screen_width() == 800 && gdi::screen_height() == 600);
   CHECK(user_misc::system_metrics(0, 96) == 800 && user_misc::monitor_rect(mon, false).bottom == 600 && user_misc::monitor_rect(mon, true).bottom == 600);
-  put_devmode(p.memory, kD, 0x80000 | 0x100000 | 0x40000, 800, 600, 16);
+  put_devmode(p.memory, kD, 0x80000 | 0x100000 | 0x40000, 800, 600, 16);      // (a depth of fewer bits: the mode programs are told; the screen stays 32-bit)
+  CHECK(p.call32(N::NtUserChangeDisplaySettings, 0, kD, 0, 0, 0) == 0 && p.call(N::NtUserEnumDisplaySettings, 0, 0xFFFFFFFFu, kD, 0) == 1 && p.memory.get32(kD + 168) == 16);
+  put_devmode(p.memory, kD, 0x80000 | 0x100000 | 0x40000, 800, 600, 15);
   CHECK(p.call32(N::NtUserChangeDisplaySettings, 0, kD, 0, 0, 0) == 0xFFFFFFFEu);      // DISP_CHANGE_BADMODE
   put_devmode(p.memory, kD, 0x80000 | 0x100000, 4, 4, 0);
   CHECK(p.call32(N::NtUserChangeDisplaySettings, 0, kD, 0, 0, 0) == 0xFFFFFFFEu);
@@ -926,6 +930,7 @@ void test_monitors() {
   CHECK(p.call32(N::NtUserChangeDisplaySettings, kE, 0, 0, 0, 0) == 0xFFFFFFFBu);      // DISP_CHANGE_BADPARAM
   CHECK(p.call32(N::NtUserChangeDisplaySettings, 0, 0x10, 0, 0, 0) == 0xFFFFFFFBu);
   CHECK(p.call32(N::NtUserChangeDisplaySettings, 0, 0, 0, 0, 0) == 0 && gdi::screen_width() == 1024 && gdi::screen_height() == 768);      // back to the registry mode
+  CHECK(p.call(N::NtUserEnumDisplaySettings, 0, 0xFFFFFFFFu, kD, 0) == 1 && p.memory.get32(kD + 168) == 32);      // (and its depth)
   put_devmode(p.memory, kD, 0x80000 | 0x100000, 1280, 720, 0);
   CHECK(p.call32(N::NtUserChangeDisplaySettings, 0, kD, 0, 1, 0) == 0 && p.call(N::NtUserEnumDisplaySettings, 0, 0xFFFFFFFEu, kD, 0) == 1 && p.memory.get32(kD + 172) == 1280);
   CHECK(p.call32(N::NtUserChangeDisplaySettings, 0, 0, 0, 0, 0) == 0 && gdi::screen_width() == 1280);      // (the registry mode is the one just stored)

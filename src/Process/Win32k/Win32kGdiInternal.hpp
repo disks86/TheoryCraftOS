@@ -153,6 +153,7 @@ struct Bitmap : Object {
   uint32_t dib_usage = 0;
   uint32_t clr_important = 0;
   uint32_t x_ppm = 0, y_ppm = 0;
+  bool from_memory = false;    // D3DKMTCreateDCFromMemory's DIB (top-down on the program's memory): GetObject tells a positive height and no image size, as Windows
 };
 
 // A view of pixels in some format, as the drawing code sees every surface. Coordinates outside it are ignored by put and read as 0 by get.
@@ -345,6 +346,14 @@ class Painter {
 constexpr ColorRef kClrInvalid = 0xFFFFFFFFu;
 ColorRef rop2_apply(int32_t rop2, ColorRef dst, ColorRef src);
 uint32_t rop3_apply(uint32_t rop, ColorRef pat, ColorRef src, ColorRef dst);      // rop: the 32-bit ROP code (index in bits 16..23)
+// The same on whole pixel values (all 32 bits): what a 32 bpp BI_RGB destination takes, so that the fourth byte follows the ROP as in Windows
+// (WHITENESS sets it, BLACKNESS and brush colours clear it, SRCCOPY from another 32 bpp surface copies it).
+uint32_t rop3_apply_bits(uint32_t rop, uint32_t pat, uint32_t src, uint32_t dst);
+// Whether ROPs on this DC's surface take whole pixels (rop3_apply_bits): a 32 bpp BI_RGB DIB of the program's, not the screen or a window surface,
+// which keep their own fourth byte.
+bool dc_rop_on_bits(const Dc& dc, const Surface& s);
+// A COLORREF as the bits of a 32 bpp BI_RGB pixel (fourth byte 0).
+inline uint32_t colorref_bits32(ColorRef v) { return (v & 0xFFu) << 16 | (v & 0xFF00u) | (v >> 16 & 0xFFu); }
 // The pattern (brush) source of a DC.
 struct PatternSource {
   const Brush* brush = nullptr;
