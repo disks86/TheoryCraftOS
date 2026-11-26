@@ -128,7 +128,7 @@ static void test_functions() {
   CHECK(ffl_pow(0.5f, 1e30f) == 0.0f && ffl_pow(NAN, 2.0f) == 0.0f && ffl_pow(0.5f, NAN) == 1.0f && ffl_pow(1e-42f, 1.0f) == 0.0f);
   CHECK(near_value(ffl_pow(0.999999f, 1e6f), pow(0.999999f, 1e6), 1e-4));
 
-  // the matrix for normals: a scaling's is the scaling by the inverses, a rotation's the rotation itself, and none for a flat matrix
+  // the matrix for normals: a scaling's is the scaling by the inverses, a rotation's the rotation itself, a flat matrix's its own transpose
   float m[4][4] = {{2, 0, 0, 0}, {0, 4, 0, 0}, {0, 0, 0.5f, 0}, {7, 8, 9, 1}}, n[3][3];
   ffl_normal_matrix(m, n);
   CHECK(near_value(n[0][0], 0.5) && near_value(n[1][1], 0.25) && near_value(n[2][2], 2.0) && n[0][1] == 0.0f && n[2][0] == 0.0f);
@@ -138,9 +138,10 @@ static void test_functions() {
   for (int i = 0; i < 3; ++i)
     for (int j = 0; j < 3; ++j) CHECK(near_value(n[i][j], r[i][j]));
   float flat[4][4] = {{1, 0, 0, 0}, {2, 0, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}};
-  ffl_normal_matrix(flat, n);
+  ffl_normal_matrix(flat, n);      // (no inverse: the matrix itself, transposed, as Windows)
+  CHECK(ffl_singular(flat) && !ffl_singular(m));
   for (int i = 0; i < 3; ++i)
-    for (int j = 0; j < 3; ++j) CHECK(n[i][j] == 0.0f);
+    for (int j = 0; j < 3; ++j) CHECK(n[i][j] == flat[j][i]);
 }
 
 static void test_lights() {

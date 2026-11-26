@@ -160,7 +160,7 @@ typedef struct D3dRes {
   BOOL target_texture;           /* a texture that is drawn into (DDSCAPS_3DDEVICE): its levels go through `sys` */
   BOOL keyed;                    /* the texture was sent with the colour key as alpha 0 */
   DWORD key_low, key_high;
-  BOOL has_alpha;                /* the texture's alpha means something (the format's alpha, or the colour key) */
+  BOOL has_alpha;                /* the texture's alpha means something (the format's alpha; a colour key is not) */
   BOOL fresh;                    /* just made: everything must be sent */
   DWORD lod;
 } D3dRes;
@@ -911,7 +911,9 @@ static D3dRes *texture_res(D3dDD *d, Surface *root, BOOL want_key) {
   r->keyed = keyed;
   r->key_low = key_low;
   r->key_high = key_high;
-  r->has_alpha = format == D3DFMT_A8R8G8B8 && (keyed || format_has_alpha(root->fmt) || dd_format_is_blocks(root->fmt));
+  /* (a colour key is not alpha: MODULATE of a keyed 5-6-5 texture takes the vertex's alpha - the key works by itself, TCOS_TSS_KEY_KILL; Wine's
+   * test_texturemapblend) */
+  r->has_alpha = format == D3DFMT_A8R8G8B8 && (format_has_alpha(root->fmt) || dd_format_is_blocks(root->fmt));
   const UINT faces = cube ? 6 : 1;
   for (UINT face = 0; face < faces; ++face)
     for (UINT level = 0; level < levels; ++level) {

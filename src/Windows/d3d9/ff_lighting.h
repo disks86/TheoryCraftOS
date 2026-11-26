@@ -140,8 +140,15 @@ static float ffl_normalize(float v[3]) {
 }
 static float ffl_clamp(float x) { return x > 1.0f ? 1.0f : x > 0.0f ? x : 0.0f; }      /* (not a number: 0) */
 
+/* Whether the 3 x 3 of a matrix for positions has no inverse (its determinant is 0, or as good as). */
+static int ffl_singular(const float m[4][4]) {
+  const float determinant = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+                            m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+  return !(determinant > 1e-30f || determinant < -1e-30f);
+}
 /* The matrix for normals out of the one for positions: the inverse of its 3 x 3, transposed - which is its cofactors over its determinant.
- * All zero for a matrix that has no inverse. */
+ * A matrix that has no inverse is used as it is in the inverse's place (its 3 x 3 transposed): Windows does so - Wine's test_lighting of
+ * ddraw 1-7 and d3d9 light a quad under a singular world matrix (and wined3d does the same). */
 static void ffl_normal_matrix(const float m[4][4], float out[3][3]) {
   float cofactor[3][3];
   for (int i = 0; i < 3; ++i) {
@@ -153,7 +160,7 @@ static void ffl_normal_matrix(const float m[4][4], float out[3][3]) {
   const float determinant = m[0][0] * cofactor[0][0] + m[0][1] * cofactor[0][1] + m[0][2] * cofactor[0][2];
   const int usable = determinant > 1e-30f || determinant < -1e-30f;
   for (int i = 0; i < 3; ++i)
-    for (int j = 0; j < 3; ++j) out[i][j] = usable ? cofactor[i][j] / determinant : 0.0f;
+    for (int j = 0; j < 3; ++j) out[i][j] = usable ? cofactor[i][j] / determinant : m[j][i];
 }
 
 /* Lights one vertex. `position` and `normal` are the vertex's own (object space); `vertex_diffuse` and `vertex_specular` its two colours, or

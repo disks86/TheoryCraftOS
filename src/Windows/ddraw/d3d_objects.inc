@@ -841,6 +841,9 @@ static HRESULT vb_process(D3dVertexBuffer *dst, DWORD op, DWORD dst_index, DWORD
   if (!cv) return DDERR_OUTOFMEMORY;
   DlTransform t;
   d3_transform(dev, &t);
+  /* (Direct3D 7's ProcessVertices lights no normal under a singular world matrix, where its draws use the matrix itself: Wine's test_lighting
+   * of ddraw7 holds both of Windows' answers) */
+  if (dev->version >= 7 && ffl_singular(t.world.m)) dl_zero(t.normal_matrix, sizeof t.normal_matrix);
   DlLighting l;
   d3_lighting(dev, &l);
   DlProcessResult result;

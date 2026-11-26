@@ -399,11 +399,7 @@ static void test_palettes_and_formats(void) {
   memset(&d, 0, sizeof d);
   d.dwSize = sizeof d;
   if (m) IDirectDrawSurface7_GetSurfaceDesc(m, &d);
-  #ifdef _WIN64
-  check(hr == DD_OK && d.dwMipMapCount == 4, "a mipmap of IDirectDraw4 gets levels until one side is 1");
-#else
   check(hr == DD_OK && d.dwMipMapCount == 6, "a mipmap of IDirectDraw7 gets levels until both sides are 1");
-#endif
   if (m) {
     DDSCAPS2 caps = {DDSCAPS_TEXTURE | DDSCAPS_MIPMAP, 0, 0, {0}};
     IDirectDrawSurface7 *level = NULL;
@@ -413,11 +409,7 @@ static void test_palettes_and_formats(void) {
     if (level) IDirectDrawSurface7_GetSurfaceDesc(level, &d);
     check(hr == DD_OK && d.dwWidth == 16 && d.dwHeight == 4 && (d.ddsCaps.dwCaps2 & DDSCAPS2_MIPMAPSUBLEVEL), "the next level is half the size");
     DDCOLORKEY k = {0, 0};
-#ifndef _WIN64
     if (level) check(IDirectDrawSurface7_SetColorKey(level, DDCKEY_SRCBLT, &k) == DDERR_NOTONMIPMAPSUBLEVEL, "no colour key on a sublevel (version 7)");
-#else
-    (void)k;
-#endif
     check(IDirectDrawSurface7_Release(m) == 0, "the mipmap goes with its root's last reference");
     if (level) {
       check(get_pixel(level, 0, 0) != 0xDEADBEEF, "a level the program still holds stays usable after its root went");
