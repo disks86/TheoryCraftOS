@@ -19,6 +19,8 @@
 /* kernel32.dll for TheoryCraftOS: the Win32 API a console program needs, written over ntdll.dll's NT services. Single-threaded (CreateThread fails), the code page is UTF-8,
  * the only drive is C:. Built freestanding with the OS's mingw compiler. */
 #include "../tcos_win.h"
+#include "../tcos_dll_layering.h"
+NTSTATUS NTAPI LdrAddRefDll(ULONG flags, PVOID base);
 
 __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 
@@ -810,6 +812,7 @@ static LDR_DATA_TABLE_ENTRY *module_by_name(LPCWSTR name) {
   LIST_ENTRY *head = &ldr->InLoadOrderModuleList;
   for (LIST_ENTRY *e = head->Flink; e != head; e = e->Flink) {
     LDR_DATA_TABLE_ENTRY *m = (LDR_DATA_TABLE_ENTRY *)e;
+    if (m->Flags & TCOS_LDRP_PRIVATE_LAYER) continue;      /* (an internal layer of a System32 library is not there on Windows: not found by its name) */
     const size_t_ base_length = m->BaseDllName.Length / 2;
     const WCHAR *base = m->BaseDllName.Buffer;
     size_t_ compare = base_length;
@@ -852,15 +855,19 @@ static const WCHAR *module_spelling(PVOID base) {
   for (int i = 0; i < MODULE_SPELLINGS; ++i) if (g_module_spellings[i].base == base) return g_module_spellings[i].path;
   return NULL;
 }
+static BOOL wow_system_file(WCHAR *path);
 static BOOL has_tilde_name(const WCHAR *name) { for (; *name; ++name) if (*name == '~') return TRUE; return FALSE; }
 EXPORT HMODULE WINAPI GetModuleHandleW(LPCWSTR name) {
   if (!name) return NtCurrentPeb()->ImageBaseAddress;
-  LDR_DATA_TABLE_ENTRY *m = module_by_name(name);
+  /* A name with a folder is a file: the library loaded from it, under whatever name - not another file's library of that name. A bare name is the first library
+     loaded with that name. */
+  LDR_DATA_TABLE_ENTRY *m = has_separator(name) ? NULL : module_by_name(name);
   if (!m && (equals_ignore_case(name, (const WCHAR *)L"kernelbase.dll") || equals_ignore_case(name, (const WCHAR *)L"kernelbase"))) m = module_by_name((const WCHAR *)L"kernel32.dll");      /* (kernelbase's functions are kernel32's) */
-  if (!m && has_separator(name)) {      /* a file: the library loaded from it, under whatever name */
+  if (!m && has_separator(name)) {
     WCHAR full[PATH_CHARS];
     PVOID base;
     if (full_path_w(name, full, PATH_CHARS) && (base = TcosFindModuleByFile(full)) != NULL) return base;
+    if (full_path_w(name, full, PATH_CHARS) && wow_system_file(full) && (base = TcosFindModuleByFile(full)) != NULL) return base;      /* (a 32-bit program's System32 is SysWOW64) */
     if (has_tilde_name(name) && full_path_w(name, full, PATH_CHARS)) {
       WCHAR expanded[PATH_CHARS];
       const DWORD n = GetLongPathNameW(full, expanded, PATH_CHARS);
@@ -899,13 +906,17 @@ static DWORD dos_error_of_load(NTSTATUS status) {
 EXPORT BOOL WINAPI GetModuleHandleExW(DWORD flags, LPCWSTR name, HMODULE *module) {
   if (module) *module = NULL;
   if (!module || (flags & ~7u) || (flags & 3) == 3 || ((flags & 4) && !name)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
-  LDR_DATA_TABLE_ENTRY *m = (flags & 4) ? module_containing((PVOID)name) : (name ? module_by_name(name) : module_by_base(NtCurrentPeb()->ImageBaseAddress));
+  LDR_DATA_TABLE_ENTRY *m = NULL;
+  if (flags & 4) m = module_containing((PVOID)name);
+  else if (!name) m = module_by_base(NtCurrentPeb()->ImageBaseAddress);
+  else {
+    HMODULE found = GetModuleHandleW(name);      /* (a bare name or a file, as GetModuleHandle takes them) */
+    m = found ? module_by_base(found) : NULL;
+  }
   if (!m) { set_error(ERROR_MOD_NOT_FOUND); return FALSE; }
-  if (!(flags & 2) || (flags & 1)) {      /* another use (a pin is a use that is never given back) */
-    UNICODE_STRING base_name = m->BaseDllName;
-    PVOID handle = NULL;
+  if (!(flags & 2) || (flags & 1)) {      /* another use of that library (a pin is a use that is never given back) */
     if (m->LoadCount != 0xFFFF) {
-      const NTSTATUS status = LdrLoadDll(NULL, NULL, &base_name, &handle);
+      const NTSTATUS status = LdrAddRefDll((flags & 1) ? 1 : 0, m->DllBase);
       if (!NT_SUCCESS(status)) { set_error(dos_error_of_load(status)); return FALSE; }
     }
   }
@@ -954,6 +965,45 @@ EXPORT DWORD WINAPI GetModuleFileNameA(HMODULE module, LPSTR buffer, DWORD capac
 typedef struct { ULONG Characteristics, TimeDateStamp; USHORT MajorVersion, MinorVersion; ULONG Name, Base, NumberOfFunctions, NumberOfNames, AddressOfFunctions, AddressOfNames, AddressOfNameOrdinals; } ExportDirectory;
 
 HMODULE WINAPI LoadLibraryW(const WCHAR *name);
+/* Is a forwarder of the library at `module` to the library `forward` (its first `length` characters, no extension) one of this OS's internal layers
+ * (tcos_dll_layering.h: d3d10core.dll's OpenAdapter10 = d3d11.OpenAdapter10, d3d10_1.dll's functions of d3d10.dll)? Only for the copy of System32 (or
+ * SysWOW64); `out` (MAX_PATH) then gets the System32 file of the library named, as the loader binds the imports of such a pair. */
+static BOOL internal_layer_file(HMODULE module, const char *forward, size_t_ length, WCHAR *out) {
+  static const WCHAR kSystem32[] = {'c', ':', '\\', 'w', 'i', 'n', 'd', 'o', 'w', 's', '\\', 's', 'y', 's', 't', 'e', 'm', '3', '2', '\\', 0};
+  static const WCHAR kSysWow64[] = {'c', ':', '\\', 'w', 'i', 'n', 'd', 'o', 'w', 's', '\\', 's', 'y', 's', 'w', 'o', 'w', '6', '4', '\\', 0};
+  const LDR_DATA_TABLE_ENTRY *m = module_by_base(module);
+  if (!m || length > 50) return FALSE;
+  const size_t_ full_length = m->FullDllName.Length / 2, base_length = m->BaseDllName.Length / 2;
+  if (base_length >= 60 || full_length != 20 + base_length) return FALSE;      /* (directly in the system folder: its name is 20 characters) */
+  BOOL system = FALSE;
+  for (int which = 0; which < 2 && !system; ++which) {
+    const WCHAR *folder = which ? kSysWow64 : kSystem32;
+    size_t_ i = 0;
+    while (i < 20) {
+      WCHAR c = m->FullDllName.Buffer[i];
+      if (c == '/') c = '\\';
+      if (c >= 'A' && c <= 'Z') c = (WCHAR)(c + 32);
+      if (c != folder[i]) break;
+      ++i;
+    }
+    system = i == 20;
+  }
+  if (!system) return FALSE;
+  char importer[64], imported[64];
+  for (size_t_ i = 0; i < base_length; ++i) importer[i] = m->BaseDllName.Buffer[i] < 128 ? (char)m->BaseDllName.Buffer[i] : '?';
+  for (size_t_ i = 0; i < length; ++i) imported[i] = forward[i];
+  memcpy(imported + length, ".dll", 4);
+  if (!tcos_is_internal_layer(importer, (unsigned long)base_length, imported, (unsigned long)(length + 4))) return FALSE;
+#ifdef __i386__
+  static const WCHAR kSystem[] = {'C', ':', '\\', 'W', 'i', 'n', 'd', 'o', 'w', 's', '\\', 'S', 'y', 's', 'W', 'O', 'W', '6', '4', '\\', 0};      /* (a 32-bit program's) */
+#else
+  static const WCHAR kSystem[] = {'C', ':', '\\', 'W', 'i', 'n', 'd', 'o', 'w', 's', '\\', 'S', 'y', 's', 't', 'e', 'm', '3', '2', '\\', 0};
+#endif
+  memcpy(out, kSystem, 20 * 2);
+  for (size_t_ i = 0; i < length + 4; ++i) out[20 + i] = (WCHAR)(BYTE)tcos_layering_lower(imported[i]);
+  out[20 + length + 4] = 0;
+  return TRUE;
+}
 /* The address of an exported function of the image at `base`, by name or (name == NULL) ordinal; follows forwarders ("NTDLL.RtlFoo"). */
 static FARPROC export_of(HMODULE module, LPCSTR name, DWORD ordinal, int depth) {
   const BYTE *base = module;
@@ -985,9 +1035,15 @@ static FARPROC export_of(HMODULE module, LPCSTR name, DWORD ordinal, int depth) 
     while (forward[n] && forward[n] != '.' && n < 60) { library[n] = (WCHAR)(BYTE)forward[n]; ++n; }
     if (forward[n] != '.') return NULL;
     library[n] = 0;
-    LDR_DATA_TABLE_ENTRY *target = module_by_name(library);
+    WCHAR layer_file[MAX_PATH];
+    const BOOL layer = n <= 50 && internal_layer_file((HMODULE)module, forward, n, layer_file);      /* (this OS's own layering: the System32 file, tcos_dll_layering.h) */
+    LDR_DATA_TABLE_ENTRY *target = layer ? NULL : module_by_name(library);
     HMODULE target_base = target ? (HMODULE)target->DllBase : NULL;
-    if (!target && n <= 50) {      /* (a forwarder loads the library it names; the loader's list shows only some of the libraries, so the handle is used) */
+    if (layer) {
+      target_base = (HMODULE)TcosFindModuleByFile(layer_file);
+      if (!target_base) target_base = LoadLibraryW(layer_file);
+      target = target_base ? module_by_base(target_base) : NULL;
+    } else if (!target && n <= 50) {      /* (a forwarder loads the library it names; the loader's list shows only some of the libraries, so the handle is used) */
       library[n] = '.'; library[n + 1] = 'd'; library[n + 2] = 'l'; library[n + 3] = 'l'; library[n + 4] = 0;
       target_base = LoadLibraryW(library);
       target = target_base ? module_by_base(target_base) : NULL;
@@ -1127,9 +1183,27 @@ static HMODULE load_library_ex(LPCWSTR name, HANDLE file, DWORD flags) {
     /* An assembly the manifest names whose file is not there (Common Controls 6 is the comctl32.dll of System32 here): the usual search finds the library. */
     if (status != (NTSTATUS)0xC0000135 && status != (NTSTATUS)0xC0000034 && status != (NTSTATUS)0xC000003A) { set_error(dos_error_of_load(status)); return NULL; }
   }
+  static const WCHAR dll[] = {'.', 'd', 'l', 'l', 0};
+  /* A bare name: a library loaded with that base name is the answer before any folder is looked in (Windows' order; a d3d9.dll of the program's folder is not loaded
+     beside one of System32 that the program loaded by its path). A name without an extension is a ".dll". */
+  if (!(flags & 0x62) && !has_separator(name)) {
+    WCHAR named[PATH_CHARS];
+    const size_t_ n = wcslen(name);
+    BOOL extension = FALSE;
+    for (size_t_ i = 0; i < n; i++) if (name[i] == '.') extension = TRUE;
+    if (n + 5 < PATH_CHARS) {
+      memcpy(named, name, (n + 1) * 2);
+      if (!extension && name[n - 1] != '.') memcpy(named + n, dll, 5 * 2);
+      LDR_DATA_TABLE_ENTRY *loaded = module_by_name(named);
+      if (loaded) {
+        const NTSTATUS status = loaded->LoadCount == 0xFFFF ? STATUS_SUCCESS : LdrAddRefDll(0, loaded->DllBase);
+        if (!NT_SUCCESS(status)) { set_error(dos_error_of_load(status)); return NULL; }
+        return (HMODULE)loaded->DllBase;
+      }
+    }
+  }
   /* The file, if there is one; otherwise the bare name (a library the process has already may be known by an alias, "api-ms-win-crt-runtime-l1-1-0.dll"): the kernel knows
      which libraries are loaded, and decides under the loader lock. */
-  static const WCHAR dll[] = {'.', 'd', 'l', 'l', 0};
   path[0] = 0;
   DWORD search = flags & 0x1F00;      /* LOAD_LIBRARY_SEARCH_*: only the folders named are looked in */
   if (search && (flags & 8)) { set_error(ERROR_INVALID_PARAMETER); return NULL; }      /* (LOAD_WITH_ALTERED_SEARCH_PATH excludes them) */

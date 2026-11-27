@@ -72,6 +72,8 @@ struct ThreadStart {
 struct LoadedModule {
   uint64_t base = 0, size = 0, entry = 0;      // entry: DllMain (0 if none)
   char name[40] = {};                           // canonical ("msvcrt.dll"), NUL-terminated
+  bool private_layer = false;                   // loaded only as an internal layer of a System32 library (Windows/tcos_dll_layering.h)
+  char directory[300] = {};                     // the Windows folder of its file ("C:\\Games\\X\\", UTF-8, NUL-terminated); empty: C:\\Windows\\System32
 };
 // What loads and unloads libraries in a Windows process after it has started (the user-program layer implements it; the process does not know how libraries are found).
 // Where diagnostics of the process layer go (the kernel points it at the debug console; host tests leave it unset).
@@ -83,9 +85,14 @@ class IModuleHost {
   // Loads the library in `file` under `canonical_name` and the libraries it imports that are missing, and says in `out` (at most `capacity`) which libraries are new, in the
   // order their entry points must run. Returns an NTSTATUS; nothing stays loaded on failure.
   // With `bind` false only the library itself is mapped: its imports are not loaded or resolved and it gets no thread-local data (LOAD_LIBRARY DONT_RESOLVE_DLL_REFERENCES).
-  virtual uint32_t load_module(ConstByteView file, StringView canonical_name, LoadedModule* out, uint32_t capacity, uint32_t* count, bool bind = true) = 0;
-  // LoadLibrary of a library that is loaded already (by this canonical name): one more use. False if there is none.
+  // `os_path` is where the file is in the OS file system: the library is known by it, so that another file of the same name is another library.
+  virtual uint32_t load_module(ConstByteView file, StringView canonical_name, StringView os_path, LoadedModule* out, uint32_t capacity, uint32_t* count, bool bind = true) = 0;
+  // LoadLibrary of a library that is loaded already: one more use. By its canonical name (a load by bare name: the first library of that name), or by its file (a load
+  // by path; the OS path, any case). False if there is none.
   virtual bool reference_module(StringView canonical_name, uint64_t* base) = 0;
+  virtual bool reference_module_file(StringView os_path, uint64_t* base) { (void)os_path; (void)base; return false; }
+  // One more use of the library whose image starts at `base` (LdrAddRefDll). False if there is none.
+  virtual bool reference_module_base(uint64_t base) { (void)base; return false; }
   // The canonical name of the library whose image holds `address`; false if there is none.
   virtual bool module_name_at(uint64_t address, char (&name)[40]) const { (void)address; (void)name; return false; }
   // Did the program bring this C runtime itself ("msvcr100.dll", lower case), so that the name is that file here and not msvcrt.dll (ModuleSet::library_name())?

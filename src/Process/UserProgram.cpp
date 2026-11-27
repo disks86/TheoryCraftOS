@@ -47,23 +47,34 @@ namespace {
 // The library file LoadLibrary found (under its name), then the usual places.
 class SingleFileProvider final : public ILibraryProvider {
  public:
-  SingleFileProvider(StringView name, ConstByteView file, ILibraryProvider* fallback) : name_(name), file_(file), fallback_(fallback) {}
+  // `path`: where `file` is in the OS file system. The library LoadLibrary asked for is that file; what it imports comes from `fallback`. (A 32-bit program's
+  // LoadLibrary: the file it found is the library, and what that imports are 32-bit libraries.)
+  SingleFileProvider(StringView name, ConstByteView file, StringView path, ILibraryProvider* fallback) : name_(name), file_(file), path_(path), fallback_(fallback) {}
   bool find(StringView canonical_name, ConstByteView* image) override {
-    if (canonical_name.equals(name_)) { *image = file_; return true; }
+    if (canonical_name.equals(name_) && !used_) { *image = file_; return true; }
     return fallback_ && fallback_->find(canonical_name, image);
   }
-  // (a 32-bit program's LoadLibrary: the file it found is the library, and what that imports are 32-bit libraries)
   bool find_32bit(StringView canonical_name, ConstByteView* image) override {
-    if (canonical_name.equals(name_)) { *image = file_; return true; }
+    if (canonical_name.equals(name_) && !used_) { *image = file_; return true; }
     return fallback_ && fallback_->find_32bit(canonical_name, image);
   }
-  bool directory_of(StringView canonical_name, String* windows_directory) override { return !canonical_name.equals(name_) && fallback_ && fallback_->directory_of(canonical_name, windows_directory); }
+  // (only the first time: the library itself is located first, and an import of its own name by a library it brings is looked for as any other)
+  bool locate(StringView canonical_name, bool wow, LibrarySearch where, ConstByteView* image, String* os_path) override {
+    if (canonical_name.equals(name_) && !used_ && where == LibrarySearch::Normal) {
+      used_ = true;
+      *image = file_;
+      return os_path->assign(path_);
+    }
+    return fallback_ && fallback_->locate(canonical_name, wow, where, image, os_path);
+  }
   bool has_own_copy(StringView file_name, bool wow) override { return fallback_ && fallback_->has_own_copy(file_name, wow); }
 
  private:
   StringView name_;
   ConstByteView file_;
+  StringView path_;
   ILibraryProvider* fallback_;
+  bool used_ = false;
 };
 }  // namespace
 
@@ -156,13 +167,13 @@ void take_tls(AddressSpace& space, Process& process, const Module& module) {
 
 }  // namespace
 
-uint32_t UserProgram::load_module(ConstByteView file, StringView canonical_name, LoadedModule* out, uint32_t capacity, uint32_t* count, bool bind) {
+uint32_t UserProgram::load_module(ConstByteView file, StringView canonical_name, StringView os_path, LoadedModule* out, uint32_t capacity, uint32_t* count, bool bind) {
   constexpr uint32_t kNoMemory = 0xC0000017u, kDllNotFound = 0xC0000135u, kBadImage = 0xC000007Bu, kNotSupported = 0xC00000BBu, kBufferTooSmall = 0xC0000023u, kInvalidParameter = 0xC000000Du;
   *count = 0;
   if (!modules_ || !process_) return kNotSupported;
-  if (modules_->find(canonical_name)) return kInvalidParameter;      // (the caller looks first)
+  if (modules_->find_file(os_path)) return kInvalidParameter;      // (the caller looks first: that file is a library already)
   const uint64_t first = modules_->count(), init_first = modules_->init_count();
-  SingleFileProvider provider(canonical_name, file, libraries_);
+  SingleFileProvider provider(canonical_name, file, os_path, libraries_);
   String detail(allocator_);
   switch (load_additional_library(space_, allocator_, provider, modules_.get(), canonical_name, &detail, bind)) {
     case LoadStatus::Ok: break;
@@ -193,6 +204,8 @@ uint32_t UserProgram::load_module(ConstByteView file, StringView canonical_name,
     o.size = m.size;
     o.entry = m.entry == m.base ? 0 : m.entry;
     for (uint64_t k = 0; k + 1 < sizeof(o.name) && k < m.name.size(); ++k) o.name[k] = m.name.view()[k];
+    o.private_layer = m.private_layer;
+    if (m.directory.size() < sizeof(o.directory)) for (uint64_t k = 0; k < m.directory.size(); ++k) o.directory[k] = m.directory.view()[k];      // (a longer one is left out: System32 is said)
   }
   *count = static_cast<uint32_t>(fresh);
   return 0;
@@ -232,6 +245,8 @@ bool UserProgram::module_name_at(uint64_t address, char (&name)[40]) const {
 }
 
 bool UserProgram::reference_module(StringView canonical_name, uint64_t* base) { return modules_ && reference_library(modules_.get(), canonical_name, base); }
+bool UserProgram::reference_module_file(StringView os_path, uint64_t* base) { return modules_ && reference_library_file(modules_.get(), os_path, base); }
+bool UserProgram::reference_module_base(uint64_t base) { return modules_ && reference_library_base(modules_.get(), base); }
 
 uint32_t UserProgram::release_module(uint64_t base, LoadedModule* out, uint32_t capacity, uint32_t* count) {
   *count = 0;
@@ -390,6 +405,7 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
         const Module& m = modules->at(i);
         WindowsModule entry{m.main ? program_file : m.name.view(), m.base, m.size, m.entry, m.main, true};
         entry.directory = m.directory.view();
+        entry.private_layer = m.private_layer;
         (m.main ? &pe : m.pe)->directory(9, &entry.tls_rva, &entry.tls_size);      // IMAGE_DIRECTORY_ENTRY_TLS (the program's headers are the caller's)
         if (!listed.push_back(entry)) return LoadStatus::OutOfMemory;
       }

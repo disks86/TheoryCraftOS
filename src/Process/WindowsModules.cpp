@@ -24,12 +24,30 @@
 #include "Process/ImageFileCache.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/ByteBuffer.hpp"
+#include "Utility/Utf16.hpp"
 
 namespace process::windowsabi {
 
 namespace {
 constexpr uint32_t kSuccess = 0, kAccessViolation = 0xC0000005u, kInvalidParameter = 0xC000000Du, kNotImplemented = 0xC0000002u, kDllNotFound = 0xC0000135u;
-constexpr uint32_t kRecordBytes = 64, kMaxRecords = 256;      // (the records are on the heap: kernel stacks are small)
+// A record (ntdll's LoadRecord): base, size, entry (8 bytes each), the canonical name (40), flags (4: 1 = a private layer), 4 reserved, the Windows folder of the
+// file as UTF-16 (260 units, NUL-terminated; empty: System32).
+constexpr uint32_t kRecordBytes = 592, kMaxRecords = 256;      // (the records are on the heap: kernel stacks are small)
+constexpr uint32_t kRecordFlags = 64, kRecordDirectory = 72, kDirectoryUnits = 260;
+
+// Writes `m` as a record into `out` (kRecordBytes, zeroed).
+[[nodiscard]] bool write_record(ByteView out, const LoadedModule& m, allocators::IAllocator& allocator) {
+  if (out.size() < kRecordBytes) return false;
+  const uint64_t values[3] = {m.base, m.size, m.entry};
+  for (uint32_t v = 0; v < 3; ++v) for (uint32_t b = 0; b < 8; ++b) out[v * 8 + b] = uint8_t(values[v] >> (8 * b));
+  for (uint32_t k = 0; k < sizeof(m.name); ++k) out[24 + k] = uint8_t(m.name[k]);
+  out[kRecordFlags] = m.private_layer ? 1 : 0;
+  ByteBuffer directory(allocator);
+  uint64_t length = 0;
+  while (length < sizeof(m.directory) && m.directory[length]) ++length;
+  if (!util::append_utf16le(&directory, StringView(m.directory, length)) || directory.size() >= 2u * kDirectoryUnits) return true;      // (System32 is said for one that cannot be)
+  return out.subview(kRecordDirectory, directory.size()).copy_from(directory.view());
+}
 }  // namespace
 
 namespace {
@@ -73,9 +91,21 @@ uint32_t nt_load_module(Process& p, const SyscallRequest& r) {
   if (!host || !p.files().attached()) return kNotImplemented;
   const uint32_t capacity = uint32_t(r.args[3]);
   if (capacity == 0 || capacity > kMaxRecords || r.args[1] == 0 || r.args[2] == 0) return kInvalidParameter;
+  const uint8_t none[4] = {};
+  if ((flags & 8) != 0) {      // (ours) one more use of the library whose image is at the address in *args[1] (LdrAddRefDll, GetModuleHandleEx): whatever its name or file
+    uint64_t at = 0;
+    if (!p.read_user_u64(r.args[1], &at)) return kAccessViolation;
+    if (!host->reference_module_base(at)) return kDllNotFound;
+    return count_at == 0 || p.write_user(count_at, ConstByteView(none, 4)) ? kSuccess : kAccessViolation;
+  }
   String path(p.files().allocator());
   uint32_t status = read_unicode_string_argument(p, r.args[0], &path);
   if (status != kSuccess) return status;
+  // A library named by its file name alone is the first loaded library of that name, if there is one (Windows matches loaded libraries by base name before it
+  // searches); one named by a path is the library loaded from that file, if there is one, else that file is loaded as a library of its own - even when another
+  // library of the same name is loaded (a program's own d3d9.dll that loads the one of System32 by its path gets that one, as on Windows).
+  bool bare = true;
+  for (char c : path.view()) if (c == '\\' || c == '/' || c == ':') bare = false;
   const uint64_t slash = path.view().rfind('\\');
   String canonical(p.files().allocator());
   if (!canonical_library_name(slash == StringView::npos ? path.view() : path.view().without_prefix(slash + 1), &canonical)) return kInvalidParameter;
@@ -92,10 +122,10 @@ uint32_t nt_load_module(Process& p, const SyscallRequest& r) {
     for (int shift = 28; shift >= 0; shift -= 4) if (!canonical.push_back("0123456789abcdef"[(hash >> shift) & 15])) return kInvalidParameter;
   }
   uint64_t existing = 0;
-  if (host->reference_module(canonical.view(), &existing)) {      // loaded already: one more use
-    const uint8_t none[4] = {};
+  auto answer_existing = [&]() {      // loaded already: one more use
     return p.write_user_u64(r.args[1], existing) && (count_at == 0 || p.write_user(count_at, ConstByteView(none, 4))) ? kSuccess : kAccessViolation;
-  }
+  };
+  if ((bare || (flags & 4) != 0) && host->reference_module(canonical.view(), &existing)) return answer_existing();      // (an activation context's copy: its name says its file)
   // A name that stands for another library (an API set such as api-ms-win-core-winrt-l1-1-0.dll, kernelbase.dll, a C runtime) is that library, from System32, wherever
   // the caller looked for it: no file of the alias's name exists.
   String alias_path(p.files().allocator());
@@ -122,6 +152,14 @@ uint32_t nt_load_module(Process& p, const SyscallRequest& r) {
       from = redirected.view();
     }
   }
+  // The file in the OS file system ("/Windows/Windows/System32/d3d9.dll", as the library provider names the files it reads): what the library is known by.
+  String os_path(p.files().allocator());
+  {
+    String virtual_path(p.files().allocator());
+    const bool known = p.files().resolve(from, &virtual_path) == PathResult::Ok && p.files().host_path_of(virtual_path.view(), &os_path);
+    if (!known && !os_path.assign(from)) return 0xC0000017u;      // (a name the process cannot resolve: the read below says why it fails)
+  }
+  if (host->reference_module_file(os_path.view(), &existing)) return answer_existing();
   SharedPointer<ByteBuffer> file;
   if (!library_file(p, from, &file, &status)) {
 #ifdef TCOS_TRACE_SERVICE_FAILURES
@@ -141,20 +179,18 @@ uint32_t nt_load_module(Process& p, const SyscallRequest& r) {
   for (uint32_t i = 0; i < capacity; ++i) loaded_list.push_back(LoadedModule());
   LoadedModule* loaded = &loaded_list[0];
   uint32_t count = 0;
-  status = host->load_module(file->view(), canonical.view(), loaded, capacity, &count, (flags & 1) == 0);
+  status = host->load_module(file->view(), canonical.view(), os_path.view(), loaded, capacity, &count, (flags & 1) == 0);
   if (status == 0xC000007Bu) status = 0xC00000BBu;      // a good image that this process cannot run (a 32-bit library): the caller may try the next file of its path
   if (status != kSuccess) return status;
-  uint8_t* records = record_buffer.writable_view().data();
+  ByteView records = record_buffer.writable_view();
   uint64_t base = 0;
+  bool written = true;
   for (uint32_t i = 0; i < count; ++i) {
-    uint8_t* out = records + i * kRecordBytes;
-    const uint64_t values[3] = {loaded[i].base, loaded[i].size, loaded[i].entry};
-    for (uint32_t v = 0; v < 3; ++v) for (uint32_t b = 0; b < 8; ++b) out[v * 8 + b] = uint8_t(values[v] >> (8 * b));
-    for (uint32_t k = 0; k < sizeof(loaded[i].name); ++k) out[24 + k] = uint8_t(loaded[i].name[k]);
-    if (StringView(loaded[i].name).equals(canonical.view())) base = loaded[i].base;
+    written = write_record(records.subview(uint64_t{i} * kRecordBytes, kRecordBytes), loaded[i], p.files().allocator()) && written;
+    if (StringView(loaded[i].name).equals(canonical.view()) && !loaded[i].private_layer && base == 0) base = loaded[i].base;
   }
   uint8_t count_bytes[4] = {uint8_t(count), uint8_t(count >> 8), uint8_t(count >> 16), uint8_t(count >> 24)};
-  if (!p.write_user_u64(r.args[1], base) || !p.write_user(r.args[2], ConstByteView(records, count * kRecordBytes)) || (count_at != 0 && !p.write_user(count_at, ConstByteView(count_bytes, 4)))) {
+  if (!written || !p.write_user_u64(r.args[1], base) || !p.write_user(r.args[2], records.first(uint64_t{count} * kRecordBytes)) || (count_at != 0 && !p.write_user(count_at, ConstByteView(count_bytes, 4)))) {
     for (uint32_t i = count; i > 0; --i) host->unload_module(loaded[i - 1].base);
     return kAccessViolation;
   }
@@ -176,15 +212,11 @@ uint32_t nt_release_module(Process& p, const SyscallRequest& r) {
   uint32_t count = 0;
   const uint32_t status = host->release_module(r.args[0], doomed, capacity, &count);
   if (status != kSuccess) return status;
-  uint8_t* records = record_buffer.writable_view().data();
-  for (uint32_t i = 0; i < count; ++i) {
-    uint8_t* out = records + i * kRecordBytes;
-    const uint64_t values[3] = {doomed[i].base, doomed[i].size, doomed[i].entry};
-    for (uint32_t v = 0; v < 3; ++v) for (uint32_t b = 0; b < 8; ++b) out[v * 8 + b] = uint8_t(values[v] >> (8 * b));
-    for (uint32_t k = 0; k < sizeof(doomed[i].name); ++k) out[24 + k] = uint8_t(doomed[i].name[k]);
-  }
+  ByteView records = record_buffer.writable_view();
+  bool written = true;
+  for (uint32_t i = 0; i < count; ++i) written = write_record(records.subview(uint64_t{i} * kRecordBytes, kRecordBytes), doomed[i], p.files().allocator()) && written;
   const uint8_t count_bytes[4] = {uint8_t(count), uint8_t(count >> 8), uint8_t(count >> 16), uint8_t(count >> 24)};
-  if ((count != 0 && !p.write_user(r.args[1], ConstByteView(records, count * kRecordBytes))) || (count_at != 0 && !p.write_user(count_at, ConstByteView(count_bytes, 4)))) return kAccessViolation;
+  if (!written || (count != 0 && !p.write_user(r.args[1], records.first(uint64_t{count} * kRecordBytes))) || (count_at != 0 && !p.write_user(count_at, ConstByteView(count_bytes, 4)))) return kAccessViolation;
   return kSuccess;
 }
 

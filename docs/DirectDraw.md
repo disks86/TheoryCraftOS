@@ -97,7 +97,10 @@ attached z buffer), `lod`, `priority`, `version`, `dd`. Take `dd_lock()` (the gl
 ## Direct3D 1, 2, 3 and 7
 
 The Direct3D part of ddraw.dll (`d3d*.inc`, included at the end of `ddraw.c`) fills the hooks above. It is built on d3d9.dll's COM interfaces, which
-it loads when Direct3D is first used (LoadLibrary: a program that only uses DirectDraw never loads it). `d3d9_ddraw.h` declares them for a
+it loads when Direct3D is first used (LoadLibrary: a program that only uses DirectDraw never loads it). It loads the System32 `d3d9.dll` by its path
+(`GetSystemDirectoryW` + `\d3d9.dll`, SysWOW64 for a 32-bit program through the loader), never a `d3d9.dll` the program brought or loaded (DXVK, a
+ReShade proxy): Windows' ddraw.dll does not use Direct3D 9, and this one needs d3d9's private interfaces (WindowsUserMode.md, "Libraries of the same
+name"; `tests/bundled_dlls_qemu.sh`). `d3d9_ddraw.h` declares them for a
 translation unit that has mingw's `d3d.h` (`scripts/gen-d3d9-ddraw-abi.py`: the enumerations both headers name are DWORDs, the structures of the same
 layout are Direct3D 7's). The logic without COM objects is `d3d_legacy.h` ([Direct3DLegacy.md](Direct3DLegacy.md)).
 

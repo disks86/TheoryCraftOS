@@ -549,8 +549,9 @@ static void test_private_assemblies() {
     CHECK(provider.add_program("/Windows/App/chrome.exe", ConstByteView(program.bytes.data(), program.bytes.size())));
     ConstByteView image;
     CHECK(provider.find("chrome_elf.dll", &image) && image.size() == elf_bytes.size() && image[0x400] == elf_bytes[0x400]);
-    String directory(A);
-    CHECK(provider.directory_of("chrome_elf.dll", &directory) && str(directory.view()) == "C:\\App\\131.0.6778.86\\");
+    String directory(A), where(A);
+    CHECK(provider.locate("chrome_elf.dll", false, LibrarySearch::Normal, &image, &where) && str(where.view()) == "/Windows/App/131.0.6778.86/chrome_elf.dll");
+    CHECK(windows_directory_of_library(where.view(), &directory) && str(directory.view()) == "C:\\App\\131.0.6778.86\\");
     CHECK(!provider.find("other.dll", &image));
     // A program without a manifest only adds its folder.
     FileLibraryProvider plain(A, &fs);
@@ -616,8 +617,199 @@ static void test_image_file_cache() {
   }
 }
 
+// Libraries of one name from different files (docs/WindowsUserMode.md, "Libraries of the same name"): a program that brings its own d3d9.dll, d3d11.dll,
+// d3d12.dll and dxgi.dll (DXVK, vkd3d-proton, a ReShade proxy) beside the system's. The program's imports and the libraries' own follow Windows' search; the
+// internal layers of the System32 libraries (Windows/tcos_dll_layering.h) are the System32 files, whatever the program brought.
+namespace layering {
+constexpr const char* kSys = "/Windows/Windows/System32/";
+constexpr const char* kGame = "/Windows/Game/";
+std::string at(const char* folder, const char* name) { return std::string(folder) + name; }
+// The address the export `index` (0-based, in the order of the spec) of the module has: the builder puts the functions every 0x10 bytes.
+uint64_t function(const Module* m, int index) { return m ? m->base + 0x1000 + 0x10 * (index + 1) : 0; }
+const Module* in(const ModuleSet& set, const std::string& file) { return set.find_file(StringView(file.data(), file.size())); }
+
+// LoadLibrary of one file (UserProgram's SingleFileProvider does the same): the library asked for is that file, the rest comes from the files.
+struct OneFile final : ILibraryProvider {
+  OneFile(FileLibraryProvider& files, std::string name, std::string path) : files(files), name(std::move(name)), path(std::move(path)) {}
+  FileLibraryProvider& files;
+  std::string name, path;
+  bool used = false;
+  bool find(StringView n, ConstByteView* image) override { return files.find(n, image); }
+  bool locate(StringView n, bool wow, LibrarySearch where, ConstByteView* image, String* os_path) override {
+    if (!used && str(n) == name) {
+      used = true;
+      String ignored(A);
+      // (the file at `path`: the provider reads the system folder's copy when asked for that only)
+      const bool system = path.rfind(kSys, 0) == 0;
+      if (!files.locate(n, wow, system ? LibrarySearch::SystemOnly : LibrarySearch::Normal, image, &ignored)) return false;
+      return str(ignored.view()) == path && os_path->assign(StringView(path.data(), path.size()));
+    }
+    return files.locate(n, wow, where, image, os_path);
+  }
+};
+}  // namespace layering
+
+static void test_same_name_libraries() {
+  using namespace layering;
+  // The helpers.
+  CHECK(is_system_library_path("/Windows/Windows/System32/d3d9.dll") && is_system_library_path("/windows/WINDOWS/syswow64/D3D9.DLL"));
+  CHECK(!is_system_library_path("/Windows/Windows/System32/sub/x.dll") && !is_system_library_path("/Windows/Game/d3d9.dll") && !is_system_library_path("/Windows/Windows/System32/"));
+  String folder(A);
+  CHECK(windows_directory_of_library("/Windows/Game/d3d9.dll", &folder) && str(folder.view()) == "C:\\Game\\");
+  CHECK(windows_directory_of_library("/Windows/Windows/SysWOW64/d3d9.dll", &folder) && str(folder.view()) == "C:\\Windows\\SysWOW64\\");
+  CHECK(windows_directory_of_library("/Windows/Windows/System32/d3d9.dll", &folder) && folder.empty());
+  CHECK(windows_directory_of_library("/Other/d3d9.dll", &folder) && folder.empty());
+  CHECK(is_internal_layer("d3d8.dll", "d3d9.dll") && is_internal_layer("ddraw.dll", "d3d9.dll") && is_internal_layer("d3d9.dll", "d3d12.dll") && is_internal_layer("d3d11.dll", "d3d12.dll"));
+  CHECK(is_internal_layer("d3d10core.dll", "d3d11.dll") && is_internal_layer("d3d10_1.dll", "d3d10.dll") && is_internal_layer("d3d10_1.dll", "d3d10core.dll"));
+  CHECK(!is_internal_layer("d3d11.dll", "dxgi.dll") && !is_internal_layer("d3d10.dll", "d3d10core.dll") && !is_internal_layer("d3d9.dll", "d3d8.dll") && !is_internal_layer("app.exe", "d3d9.dll"));
+
+  filesystem::RamFileSystem fs(A);
+  CHECK(fs.create_directory("/Windows") == filesystem::Status::Ok && fs.create_directory("/Windows/Windows") == filesystem::Status::Ok &&
+        fs.create_directory("/Windows/Windows/System32") == filesystem::Status::Ok && fs.create_directory("/Windows/Windows/SysWOW64") == filesystem::Status::Ok &&
+        fs.create_directory("/Windows/Game") == filesystem::Status::Ok);
+  auto lib = [](const char* name, std::vector<Export> exports, std::vector<Import> imports) {
+    Spec s;
+    s.dll_name = name;
+    s.exports = std::move(exports);
+    s.imports = std::move(imports);
+    return build(s);
+  };
+  // This OS's libraries: d3d8 on d3d9 on d3d12; d3d10core on d3d11 (a forwarder and a private export) on d3d12, and d3d11 on dxgi as on Windows.
+  const Built sys_d3d12 = lib("d3d12.dll", {{"D3D12CreateDevice", ""}, {"TcosPrivate12", ""}}, {});
+  const Built sys_d3d9 = lib("d3d9.dll", {{"Direct3DCreate9", ""}, {"TcosPrivate9", ""}}, {{"d3d12.dll", "D3D12CreateDevice"}, {"d3d12.dll", "TcosPrivate12"}});
+  const Built sys_d3d8 = lib("d3d8.dll", {{"Direct3DCreate8", ""}}, {{"d3d9.dll", "Direct3DCreate9"}, {"d3d9.dll", "TcosPrivate9"}});
+  const Built sys_dxgi = lib("dxgi.dll", {{"CreateDXGIFactory", ""}}, {});
+  const Built sys_d3d11 = lib("d3d11.dll", {{"D3D11CreateDevice", ""}, {"OpenAdapter10", ""}, {"TcosD3D10CoreCreateDevice", ""}},
+                              {{"d3d12.dll", "TcosPrivate12"}, {"dxgi.dll", "CreateDXGIFactory"}});
+  const Built sys_d3d10core = lib("d3d10core.dll", {{"D3D10CoreCreateDevice", ""}, {"OpenAdapter10", "d3d11.OpenAdapter10"}}, {{"d3d11.dll", "TcosD3D10CoreCreateDevice"}});
+  // What the program brought: the public entry points only.
+  const Built own_d3d9 = lib("d3d9.dll", {{"Direct3DCreate9", ""}}, {});
+  const Built own_d3d12 = lib("d3d12.dll", {{"D3D12CreateDevice", ""}}, {});
+  const Built own_d3d11 = lib("d3d11.dll", {{"D3D11CreateDevice", ""}, {"OpenAdapter10", ""}}, {});
+  const Built own_dxgi = lib("dxgi.dll", {{"CreateDXGIFactory", ""}}, {});
+  write_file(fs, at(kSys, "d3d12.dll").c_str(), sys_d3d12.bytes);
+  write_file(fs, at(kSys, "d3d9.dll").c_str(), sys_d3d9.bytes);
+  write_file(fs, at(kSys, "d3d8.dll").c_str(), sys_d3d8.bytes);
+  write_file(fs, at(kSys, "dxgi.dll").c_str(), sys_dxgi.bytes);
+  write_file(fs, at(kSys, "d3d11.dll").c_str(), sys_d3d11.bytes);
+  write_file(fs, at(kSys, "d3d10core.dll").c_str(), sys_d3d10core.bytes);
+  write_file(fs, at(kGame, "d3d9.dll").c_str(), own_d3d9.bytes);
+  write_file(fs, at(kGame, "d3d12.dll").c_str(), own_d3d12.bytes);
+  write_file(fs, at(kGame, "d3d11.dll").c_str(), own_d3d11.bytes);
+  write_file(fs, at(kGame, "dxgi.dll").c_str(), own_dxgi.bytes);
+  write_file(fs, "/Windows/Windows/SysWOW64/d3d9.dll", own_dxgi.bytes);      // (only its place matters below)
+
+  Spec program;
+  program.dll = false;
+  program.base = 0x140000000ull;
+  program.imports = {{"d3d9.dll", "Direct3DCreate9"}, {"d3d8.dll", "Direct3DCreate8"}, {"d3d10core.dll", "OpenAdapter10"}, {"d3d11.dll", "D3D11CreateDevice"}};
+  const Built exe = build(program);
+  write_file(fs, "/Windows/Game/app.exe", exe.bytes);
+  FileLibraryProvider files(A, &fs);
+  CHECK(files.add_program("/Windows/Game/app.exe", ConstByteView(exe.bytes.data(), exe.bytes.size())));
+  // The provider: the program's folder first; the system folder only, when asked; a 32-bit program's system folder is SysWOW64.
+  {
+    ConstByteView image;
+    String where(A);
+    CHECK(files.locate("d3d9.dll", false, LibrarySearch::Normal, &image, &where) && str(where.view()) == at(kGame, "d3d9.dll") && image.size() == own_d3d9.bytes.size());
+    CHECK(files.locate("d3d9.dll", false, LibrarySearch::SystemOnly, &image, &where) && str(where.view()) == at(kSys, "d3d9.dll") && image.size() == sys_d3d9.bytes.size() &&
+          image[0x400 + 0x300] == sys_d3d9.bytes[0x400 + 0x300]);
+    CHECK(files.locate("d3d9.dll", true, LibrarySearch::Normal, &image, &where) && str(where.view()) == at(kGame, "d3d9.dll"));
+    CHECK(files.locate("d3d9.dll", true, LibrarySearch::SystemOnly, &image, &where) && str(where.view()) == "/Windows/Windows/SysWOW64/d3d9.dll");
+    CHECK(files.locate("d3d8.dll", false, LibrarySearch::Normal, &image, &where) && str(where.view()) == at(kSys, "d3d8.dll"));
+    CHECK(!files.locate("none.dll", false, LibrarySearch::Normal, &image, &where) && !files.locate("d3d8.dll", true, LibrarySearch::Normal, &image, &where));
+  }
+
+  exe::PeFile pe(A);
+  CHECK(pe.parse(ConstByteView(exe.bytes.data(), exe.bytes.size())));
+  AddressSpace space(A);
+  LoadedImage image;
+  CHECK(load_pe(pe, ConstByteView(exe.bytes.data(), exe.bytes.size()), space, &image) == LoadStatus::Ok);
+  ModuleSet set(A);
+  String detail(A);
+  CHECK(load_windows_modules(space, A, pe, ConstByteView(exe.bytes.data(), exe.bytes.size()), "app.exe", files, &set, &detail) == LoadStatus::Ok);
+  const Module* game_d3d9 = in(set, at(kGame, "d3d9.dll"));
+  const Module* system_d3d9 = in(set, at(kSys, "d3d9.dll"));
+  const Module* system_d3d12 = in(set, at(kSys, "d3d12.dll"));
+  const Module* system_d3d8 = in(set, at(kSys, "d3d8.dll"));
+  const Module* game_d3d11 = in(set, at(kGame, "d3d11.dll"));
+  const Module* system_d3d11 = in(set, at(kSys, "d3d11.dll"));
+  const Module* game_dxgi = in(set, at(kGame, "dxgi.dll"));
+  CHECK(game_d3d9 && system_d3d9 && system_d3d12 && system_d3d8 && game_d3d11 && system_d3d11 && game_dxgi && game_d3d9 != system_d3d9);
+  CHECK(!in(set, at(kGame, "d3d12.dll")) && !in(set, at(kSys, "dxgi.dll")));      // (nothing imports the program's d3d12 by Windows' rules; d3d11's dxgi is the program's)
+  CHECK(set.count() == 9 && set.missing_count() == 0);      // (the program, the two d3d9, d3d12, d3d8, d3d10core, the two d3d11, dxgi; every private export found)
+  if (game_d3d9 && system_d3d9 && system_d3d12 && system_d3d8 && game_d3d11 && system_d3d11 && game_dxgi) {
+    // Which library a name is: the program's (the first of that name, and the internal layers are not found by name at all).
+    CHECK(set.find("d3d9.dll") == game_d3d9 && set.find("d3d11.dll") == game_d3d11 && set.find("dxgi.dll") == game_dxgi && set.find("d3d12.dll") == nullptr);
+    CHECK(set.find_system("d3d9.dll") == system_d3d9 && set.find_system("d3d12.dll") == system_d3d12 && set.find_system("d3d11.dll") == system_d3d11);
+    CHECK(!game_d3d9->private_layer && system_d3d9->private_layer && system_d3d12->private_layer && system_d3d11->private_layer && !system_d3d8->private_layer);
+    CHECK(system_d3d9->system && !game_d3d9->system && str(game_d3d9->directory.view()) == "C:\\Game\\" && system_d3d9->directory.empty());
+    // The program's imports: the program's d3d9 and d3d11; d3d10core's forwarder to d3d11 is the System32 d3d11's export.
+    CHECK(u64_at(space, 0x140000000ull + exe.slots[0]) == function(game_d3d9, 0));
+    CHECK(u64_at(space, 0x140000000ull + exe.slots[2]) == function(system_d3d11, 1) && u64_at(space, 0x140000000ull + exe.slots[3]) == function(game_d3d11, 0));
+    CHECK(set.export_address("d3d10core.dll", "OpenAdapter10") == function(system_d3d11, 1));
+    // d3d8 -> the System32 d3d9 (its private export too), d3d9 -> the System32 d3d12, d3d11 -> the System32 d3d12 but the program's dxgi (Windows' own relation).
+    CHECK(u64_at(space, system_d3d8->base + sys_d3d8.slots[0]) == function(system_d3d9, 0) && u64_at(space, system_d3d8->base + sys_d3d8.slots[1]) == function(system_d3d9, 1));
+    CHECK(u64_at(space, system_d3d9->base + sys_d3d9.slots[0]) == function(system_d3d12, 0) && u64_at(space, system_d3d9->base + sys_d3d9.slots[1]) == function(system_d3d12, 1));
+    CHECK(u64_at(space, system_d3d11->base + sys_d3d11.slots[0]) == function(system_d3d12, 1) && u64_at(space, system_d3d11->base + sys_d3d11.slots[1]) == function(game_dxgi, 0));
+    // The order the entry points run in: each after what it is bound to.
+    auto position = [&](const Module* m) { for (uint64_t i = 0; i < set.init_count(); ++i) if (&set.init_at(i) == m) return int(i); return -1; };
+    CHECK(position(system_d3d12) >= 0 && position(system_d3d12) < position(system_d3d9) && position(system_d3d9) < position(system_d3d8) && position(system_d3d11) < position(in(set, at(kSys, "d3d10core.dll"))));
+    // LoadLibrary by base name finds the program's; by the System32 path, the System32 file, which is an ordinary library from then on.
+    uint64_t base = 0;
+    CHECK(reference_library(&set, "d3d9.dll", &base) && base == game_d3d9->base);
+    CHECK(!reference_library(&set, "d3d12.dll", &base));
+    CHECK(reference_library_file(&set, "/WINDOWS/Windows/system32/D3D9.dll", &base) && base == system_d3d9->base && !system_d3d9->private_layer);
+    CHECK(set.find("d3d9.dll") == game_d3d9);      // (still the first of that name)
+    CHECK(!reference_library_file(&set, at(kGame, "d3d12.dll").c_str(), &base) && reference_library_base(&set, system_d3d12->base) && !reference_library_base(&set, 0x1234));
+  }
+
+  // After start-up: LoadLibrary of the System32 dxgi.dll by its path while the program's dxgi.dll is loaded makes a second library of that name.
+  {
+    OneFile one(files, "dxgi.dll", at(kSys, "dxgi.dll"));
+    const uint64_t before = set.count();
+    CHECK(load_additional_library(space, A, one, &set, "dxgi.dll", &detail) == LoadStatus::Ok && set.count() == before + 1);
+    const Module* second = in(set, at(kSys, "dxgi.dll"));
+    CHECK(second && second != game_dxgi && !second->private_layer && second->system && set.find("dxgi.dll") == game_dxgi && second->refs == 1);
+  }
+  // A ReShade-style proxy: the program's d3d9.dll loads the System32 one by its path; that one brings the System32 d3d12 as its private layer, and both go
+  // when it is freed.
+  {
+    AddressSpace space2(A);
+    Spec proxy_program = program;
+    proxy_program.imports = {{"d3d9.dll", "Direct3DCreate9"}};
+    const Built proxy_exe = build(proxy_program);
+    exe::PeFile pe2(A);
+    CHECK(pe2.parse(ConstByteView(proxy_exe.bytes.data(), proxy_exe.bytes.size())));
+    CHECK(load_pe(pe2, ConstByteView(proxy_exe.bytes.data(), proxy_exe.bytes.size()), space2, &image) == LoadStatus::Ok);
+    ModuleSet set2(A);
+    CHECK(load_windows_modules(space2, A, pe2, ConstByteView(proxy_exe.bytes.data(), proxy_exe.bytes.size()), "app.exe", files, &set2, &detail) == LoadStatus::Ok && set2.count() == 2);
+    OneFile one(files, "d3d9.dll", at(kSys, "d3d9.dll"));
+    CHECK(load_additional_library(space2, A, one, &set2, "d3d9.dll", &detail) == LoadStatus::Ok && set2.count() == 4);
+    const Module* proxy = in(set2, at(kGame, "d3d9.dll"));
+    const Module* real = in(set2, at(kSys, "d3d9.dll"));
+    const Module* layer = in(set2, at(kSys, "d3d12.dll"));
+    CHECK(proxy && real && layer && proxy != real && !real->private_layer && layer->private_layer && set2.find("d3d9.dll") == proxy && set2.missing_count() == 0);
+    CHECK(!in(set2, at(kGame, "d3d12.dll")));
+    if (real && layer) {
+      CHECK(u64_at(space2, real->base + sys_d3d9.slots[1]) == function(layer, 1) && real->refs == 1 && layer->refs == 1);
+      List<Module*> doomed(A);
+      CHECK(release_library(&set2, A, real->base, &doomed) && doomed.count() == 2 && doomed[0] == real && doomed[1] == layer);
+      const uint64_t real_base = real->base, layer_base = layer->base;
+      CHECK(unload_library(space2, &set2, real_base) && unload_library(space2, &set2, layer_base) && set2.count() == 2 && set2.find("d3d9.dll") == proxy);
+    }
+    // A d3d8.dll the program brought (d3d8to9) is not this OS's: its d3d9 import follows Windows' rules and is the program's d3d9.
+    write_file(fs, at(kGame, "d3d8.dll").c_str(), sys_d3d8.bytes);
+    OneFile own8(files, "d3d8.dll", at(kGame, "d3d8.dll"));
+    CHECK(load_additional_library(space2, A, own8, &set2, "d3d8.dll", &detail) == LoadStatus::Ok && set2.count() == 3);
+    const Module* d3d8to9 = in(set2, at(kGame, "d3d8.dll"));
+    CHECK(d3d8to9 && !d3d8to9->system && u64_at(space2, d3d8to9->base + sys_d3d8.slots[0]) == function(proxy, 0) && set2.missing_count() == 1);      // (the proxy has no TcosPrivate9)
+  }
+}
+
 int main() {
   test_names();
+  test_same_name_libraries();
   test_private_assemblies();
   test_load();
   test_own_runtimes();

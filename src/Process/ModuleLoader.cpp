@@ -18,6 +18,7 @@
 #include "Process/ModuleLoader.hpp"
 #include "Process/ImageCache.hpp"
 #include "Utility/ByteBuffer.hpp"
+#include "Windows/tcos_dll_layering.h"
 
 namespace process {
 
@@ -86,10 +87,43 @@ bool canonical_library_name(StringView name, String* out) {
   return true;
 }
 
+namespace {
+bool equals_ignore_case(StringView a, StringView b) {
+  if (a.size() != b.size()) return false;
+  for (uint64_t i = 0; i < a.size(); ++i) if (lower(a[i]) != lower(b[i])) return false;
+  return true;
+}
+}  // namespace
+
+bool is_system_library_path(StringView os_path) {
+  const StringView folders[2] = {StringView("/windows/windows/system32/"), StringView("/windows/windows/syswow64/")};
+  for (StringView folder : folders) {
+    if (os_path.size() <= folder.size() || !equals_ignore_case(os_path.first(folder.size()), folder)) continue;
+    const StringView rest = os_path.without_prefix(folder.size());
+    if (!rest.contains('/')) return true;      // (directly in it, not in a folder below)
+  }
+  return false;
+}
+
+bool windows_directory_of_library(StringView os_path, String* out) {
+  out->clear();
+  // (System32 is the folder an empty one means; a 32-bit program's libraries of SysWOW64 are said to be there, as Windows' GetModuleFileName says)
+  if (is_system_library_path(os_path)) return !equals_ignore_case(os_path.substr(17, 9), "SysWOW64/") || out->assign("C:\\Windows\\SysWOW64\\");
+  const uint64_t slash = os_path.rfind('/');
+  // The Windows world is the OS folder /Windows, drive C; a file elsewhere has no Windows folder.
+  if (slash == StringView::npos || os_path.size() < 9 || !equals_ignore_case(os_path.first(9), "/Windows/")) return true;
+  if (!out->assign("C:\\")) return false;
+  for (char ch : os_path.substr(9, slash + 1 - 9)) if (!out->push_back(ch == '/' ? '\\' : ch)) return false;
+  return true;
+}
+
+bool is_internal_layer(StringView importer, StringView imported) {
+  return tcos_is_internal_layer(importer.data(), importer.size(), imported.data(), imported.size()) != 0;
+}
+
 struct FileLibraryProvider::Entry {
-  Entry(allocators::IAllocator& allocator, StringView n) : name(allocator), directory(allocator), bytes(allocator) { name.assign(n); }
-  String name;
-  String directory;      // the Windows folder it was read from, if not System32
+  Entry(allocators::IAllocator& allocator, StringView p) : path(allocator), bytes(allocator) { path.assign(p); }
+  String path;           // the file in the OS file system: one entry for each file, whatever it was looked for as
   ByteBuffer bytes;
   Entry* next = nullptr;
 };
@@ -228,13 +262,6 @@ bool FileLibraryProvider::add_program(StringView path, ConstByteView image) {
   return true;
 }
 
-void FileLibraryProvider::remember_directory(StringView os) {
-  // The folder as the program sees it: the Windows world is the OS folder /Windows, drive C.
-  if (os.size() > 9 && os.first(9).equals("/Windows/") && entries_->directory.assign("C:\\")) {
-    for (char ch : os.without_prefix(9)) entries_->directory.push_back(ch == '/' ? '\\' : ch);
-  }
-}
-
 FileLibraryProvider::~FileLibraryProvider() {
   while (entries_) {
     Entry* next = entries_->next;
@@ -254,46 +281,31 @@ bool FileLibraryProvider::add_directory(StringView directory) {
 }
 
 bool FileLibraryProvider::find(StringView canonical_name, ConstByteView* image) {
-  kernel::ScopedMutex hold(lock_);
-  for (Entry* e = entries_; e; e = e->next) {
-    if (e->name.view().equals(canonical_name)) {
-      *image = e->bytes.view();
-      return true;
-    }
-  }
-  if (!files_ || canonical_name.contains('/') || canonical_name.contains('\\')) return false;      // a plain file name only
   String path(allocator_);
-  for (const Redirect& r : redirects_.view()) {      // a DLL of a private assembly the program's manifest names
-    if (r.name.view().equals(canonical_name) && path.assign(r.directory.view()) && path.append(canonical_name) && load(path.view(), canonical_name, image)) {
-      remember_directory(r.directory.view());
-      return true;
-    }
-  }
-  for (const String& directory : directories_.view()) {
-    if (path.assign(directory.view()) && path.append(canonical_name) && load(path.view(), canonical_name, image)) {
-      remember_directory(directory.view());
-      return true;
-    }
-  }
-  return path.assign("/Windows/Windows/System32/") && path.append(canonical_name) && load(path.view(), canonical_name, image);
+  return locate(canonical_name, false, LibrarySearch::Normal, image, &path);
 }
 
-// The 32-bit libraries are kept apart from the 64-bit ones of the same name: under "32:<name>".
 bool FileLibraryProvider::find_32bit(StringView canonical_name, ConstByteView* image) {
+  String path(allocator_);
+  return locate(canonical_name, true, LibrarySearch::Normal, image, &path);
+}
+
+// Windows' order: a DLL of a private assembly the program's manifest names (64-bit programs), the program's own folders, then System32 (SysWOW64 for a 32-bit
+// program: the libraries a 32-bit program brought in its folder are of its kind). Each file is read once and kept by its path.
+bool FileLibraryProvider::locate(StringView canonical_name, bool wow, LibrarySearch where, ConstByteView* image, String* os_path) {
   kernel::ScopedMutex hold(lock_);
-  String key(allocator_), path(allocator_);
-  if (!key.assign("32:") || !key.append(canonical_name)) return false;
-  for (Entry* e = entries_; e; e = e->next) {
-    if (e->name.view().equals(key.view())) {
-      *image = e->bytes.view();
-      return true;
+  if (!files_ || canonical_name.empty() || canonical_name.contains('/') || canonical_name.contains('\\')) return false;      // a plain file name only
+  if (where == LibrarySearch::Normal) {
+    if (!wow) {
+      for (const Redirect& r : redirects_.view()) {
+        if (r.name.view().equals(canonical_name) && os_path->assign(r.directory.view()) && os_path->append(canonical_name) && load(os_path->view(), image)) return true;
+      }
+    }
+    for (const String& directory : directories_.view()) {
+      if (os_path->assign(directory.view()) && os_path->append(canonical_name) && load(os_path->view(), image)) return true;
     }
   }
-  if (!files_ || canonical_name.contains('/') || canonical_name.contains('\\')) return false;      // a plain file name only
-  for (const String& directory : directories_.view()) {      // (the program's own folder first: the libraries it brought are of its kind)
-    if (path.assign(directory.view()) && path.append(canonical_name) && load(path.view(), key.view(), image)) return true;
-  }
-  return path.assign("/Windows/Windows/SysWOW64/") && path.append(canonical_name) && load(path.view(), key.view(), image);
+  return os_path->assign(wow ? "/Windows/Windows/SysWOW64/" : "/Windows/Windows/System32/") && os_path->append(canonical_name) && load(os_path->view(), image);
 }
 
 bool FileLibraryProvider::has_own_copy(StringView file_name, bool wow) {
@@ -310,23 +322,21 @@ bool FileLibraryProvider::has_own_copy(StringView file_name, bool wow) {
   return false;
 }
 
-bool FileLibraryProvider::directory_of(StringView canonical_name, String* windows_directory) {
-  kernel::ScopedMutex hold(lock_);
+bool FileLibraryProvider::load(StringView path, ConstByteView* image) {
   for (Entry* e = entries_; e; e = e->next) {
-    if (e->name.view().equals(canonical_name)) return !e->directory.empty() && windows_directory->assign(e->directory.view());
+    if (e->path.view().equals(path)) {
+      *image = e->bytes.view();
+      return true;
+    }
   }
-  return false;
-}
-
-bool FileLibraryProvider::load(StringView path, StringView canonical_name, ConstByteView* image) {
   UniquePointer<filesystem::IFile> file;
   if (files_->open_file(path, filesystem::OpenMode::Read, &file) != filesystem::Status::Ok) return false;
   const uint64_t size = file->size();
   if (size == 0 || size > kMaxLibraryBytes) return false;
   void* memory = allocator_.allocate(sizeof(Entry));
   if (!memory) return false;
-  Entry* entry = new (memory) Entry(allocator_, canonical_name);
-  if (!entry->bytes.put_zeros(size)) { entry->~Entry(); allocator_.deallocate(entry); return false; }
+  Entry* entry = new (memory) Entry(allocator_, path);
+  if (entry->path.size() != path.size() || !entry->bytes.put_zeros(size)) { entry->~Entry(); allocator_.deallocate(entry); return false; }
   ByteView bytes = entry->bytes.writable_view();
   for (uint64_t done = 0; done < size;) {
     uint64_t got = 0;
@@ -375,8 +385,24 @@ bool ModuleSet::library_name(StringView name, String* out) const {
 }
 
 Module* ModuleSet::find(StringView canonical_name) const {
-  for (const UniquePointer<Module>& m : modules_.view()) if (!m->doomed && m->name.view().equals(canonical_name)) return m.get();
+  for (const UniquePointer<Module>& m : modules_.view()) if (!m->doomed && !m->private_layer && m->name.view().equals(canonical_name)) return m.get();
   return nullptr;
+}
+
+Module* ModuleSet::find_file(StringView os_path) const {
+  if (os_path.empty()) return nullptr;
+  for (const UniquePointer<Module>& m : modules_.view()) if (!m->doomed && !m->main && equals_ignore_case(m->file.view(), os_path)) return m.get();
+  return nullptr;
+}
+
+Module* ModuleSet::find_system(StringView canonical_name) const {
+  for (const UniquePointer<Module>& m : modules_.view()) if (!m->doomed && m->system && m->name.view().equals(canonical_name)) return m.get();
+  return nullptr;
+}
+
+Module* ModuleSet::import_target(const Module& importer, StringView canonical_name) const {
+  if (importer.system && is_internal_layer(importer.name.view(), canonical_name)) return find_system(canonical_name);
+  return find(canonical_name);
 }
 
 bool ModuleSet::describe_missing(uint64_t address, String* out) const {
@@ -515,10 +541,17 @@ void initialise_security_cookie(AddressSpace& space, const exe::PeFile& pe, uint
   space.write_privileged(address, ConstByteView(raw, 8));
 }
 
-LoadStatus ensure_loaded(Context& c, StringView canonical, uint32_t depth, Module** result) {
-  if (Module* have = c.set.find(canonical)) {
-    *result = have;
-    return LoadStatus::Ok;
+// `importer` is the library whose import (or forwarder) names it, null for the program's and for the library a LoadLibrary asked for. `requested`: that library,
+// which is loaded anew from the file the provider has for it (the caller looked for a loaded one).
+LoadStatus ensure_loaded(Context& c, StringView canonical, const Module* importer, bool requested, uint32_t depth, Module** result) {
+  // An internal layer of a System32 library is the System32 file of the library it is built on (Windows/tcos_dll_layering.h); anything else is looked for as
+  // Windows does: a loaded library of that name, else the search.
+  const bool layer = importer && importer->system && is_internal_layer(importer->name.view(), canonical);
+  if (!requested) {
+    if (Module* have = layer ? c.set.find_system(canonical) : c.set.find(canonical)) {
+      *result = have;
+      return LoadStatus::Ok;
+    }
   }
   *result = nullptr;
   if (depth > kMaxDepth || c.set.count() >= kMaxModules) {
@@ -526,11 +559,20 @@ LoadStatus ensure_loaded(Context& c, StringView canonical, uint32_t depth, Modul
     return LoadStatus::NeedsLibraries;
   }
   ConstByteView file;
+  String path(c.allocator);
   const bool wow = c.space.is_32bit();      // a 32-bit program: its libraries are 32-bit ones
-  if (!(wow ? c.provider.find_32bit(canonical, &file) : c.provider.find(canonical, &file))) return LoadStatus::Ok;      // not available: its imports become stubs
+  if (!c.provider.locate(canonical, wow, layer ? LibrarySearch::SystemOnly : LibrarySearch::Normal, &file, &path)) return LoadStatus::Ok;      // not available: its imports become stubs
+  if (!requested) {
+    if (Module* same = c.set.find_file(path.view())) {      // that file is loaded (as a private layer, which it is no longer when found by the search)
+      if (!layer) same->private_layer = false;
+      *result = same;
+      return LoadStatus::Ok;
+    }
+  }
   UniquePointer<Module> module = UniquePointer<Module>::make(c.allocator, c.allocator);
-  if (!module || !module->name.assign(canonical)) return LoadStatus::OutOfMemory;
-  c.provider.directory_of(canonical, &module->directory);      // (where it came from, when that is not System32: the program's own folder)
+  if (!module || !module->name.assign(canonical) || !module->file.assign(path.view()) || !windows_directory_of_library(path.view(), &module->directory)) return LoadStatus::OutOfMemory;
+  module->system = is_system_library_path(path.view());
+  module->private_layer = layer;
   const bool parsed_ok = module->owned.parse(file);
   const bool data_only_32bit = parsed_ok && !module->owned.is_pe32_plus() && module->owned.machine() == 0x14C && !pe_image_contains_code(module->owned);
   const bool right_kind = parsed_ok && (wow ? !module->owned.is_pe32_plus() && module->owned.machine() == exe::kPeMachineI386
@@ -606,7 +648,7 @@ LoadStatus ensure_loaded(Context& c, StringView canonical, uint32_t depth, Modul
     if (!note_own_runtime(c, imp.dll.view())) return LoadStatus::OutOfMemory;
     if (!c.set.library_name(imp.dll.view(), &name)) continue;
     Module* dependency = nullptr;
-    status = ensure_loaded(c, name.view(), depth + 1, &dependency);
+    status = ensure_loaded(c, name.view(), raw, false, depth + 1, &dependency);
     if (status != LoadStatus::Ok) return status;
   }
   for (const exe::PeExport& e : raw->pe->exports().view()) {
@@ -614,7 +656,7 @@ LoadStatus ensure_loaded(Context& c, StringView canonical, uint32_t depth, Modul
     const uint64_t dot = e.forwarder.view().find('.');
     if (dot == StringView::npos || !note_own_runtime(c, e.forwarder.view().first(dot)) || !c.set.library_name(e.forwarder.view().first(dot), &name)) continue;
     Module* dependency = nullptr;
-    status = ensure_loaded(c, name.view(), depth + 1, &dependency);
+    status = ensure_loaded(c, name.view(), raw, false, depth + 1, &dependency);
     if (status != LoadStatus::Ok) return status;
   }
   return LoadStatus::Ok;
@@ -633,7 +675,7 @@ uint64_t resolve_export(const ModuleSet& set, const Module& module, StringView n
   if (dot == StringView::npos) return 0;
   String library(allocator);
   if (!set.library_name(forward.first(dot), &library)) return 0;
-  const Module* target = set.find(library.view());
+  const Module* target = set.import_target(module, library.view());      // (by base name, as Windows does; an internal layer is the System32 file)
   if (!target || target == &module) return 0;
   const StringView function = forward.without_prefix(dot + 1);
   if (!function.empty() && function[0] == '#') {
@@ -670,7 +712,12 @@ LoadStatus bind_imports(Context& c, Module& module) {
   for (const exe::PeImport& imp : module.pe->imports().view()) {
     uint64_t address = 0;
     if (c.set.library_name(imp.dll.view(), &library)) {
-      if (const Module* target = c.set.find(library.view())) address = resolve_export(c.set, *target, imp.name.view(), imp.by_ordinal, imp.ordinal, 0, c.allocator);
+      if (Module* target = c.set.import_target(module, library.view())) {
+        address = resolve_export(c.set, *target, imp.name.view(), imp.by_ordinal, imp.ordinal, 0, c.allocator);
+        bool listed = target == &module;
+        for (const Module* d : module.import_deps.view()) listed = listed || d == target;
+        if (!listed && !module.import_deps.push_back(target)) return LoadStatus::OutOfMemory;
+      }
     }
     if (address == 0) {
       // Nothing provides it: a stub that stops the program with a message, if (and only if) it is ever called.
@@ -710,7 +757,7 @@ void order(Context& c, Module& module, uint32_t depth) {
   String name(c.allocator);
   for (const exe::PeImport& imp : module.pe->imports().view()) {
     if (!c.set.library_name(imp.dll.view(), &name)) continue;
-    if (Module* dependency = c.set.find(name.view())) order(c, *dependency, depth + 1);
+    if (Module* dependency = c.set.import_target(module, name.view())) order(c, *dependency, depth + 1);
   }
   if (!module.main) c.set.order_.push_back(&module);
 }
@@ -720,11 +767,8 @@ void order(Context& c, Module& module, uint32_t depth) {
 namespace {
 // The loaded libraries a module imports or forwards to.
 void dependencies_of(const ModuleSet& set, const Module& module, allocators::IAllocator& allocator, List<Module*>* out) {
-  String name(allocator);
-  for (const exe::PeImport& imp : module.pe->imports().view()) {
-    if (!set.library_name(imp.dll.view(), &name)) continue;
-    if (Module* d = set.find(name.view())) out->push_back(d);
-  }
+  (void)set; (void)allocator;
+  for (Module* d : module.import_deps.view()) out->push_back(d);      // (what its imports were bound to when it was loaded)
   for (Module* d : module.forward_deps.view()) out->push_back(d);      // (a forwarded export is no dependency until it is resolved: see link_libraries)
 }
 
@@ -759,7 +803,7 @@ LoadStatus load_additional_library(AddressSpace& space, allocators::IAllocator& 
   (void)init_first;
   for (uint64_t i = 0; i < first; ++i) set->modules_[i]->visit = 1;      // (what was there is ordered already)
   Module* requested = nullptr;
-  LoadStatus status = ensure_loaded(c, canonical_name, 1, &requested);
+  LoadStatus status = ensure_loaded(c, canonical_name, nullptr, true, 1, &requested);
   if (status == LoadStatus::Ok && !requested) { say(c, canonical_name, " was not found"); status = LoadStatus::NeedsLibraries; }
   for (uint64_t i = first; i < set->count() && status == LoadStatus::Ok; ++i) if (!set->modules_[i]->no_bind) status = bind_imports(c, *set->modules_[i]);
   if (status == LoadStatus::Ok) order(c, *requested, 0);
@@ -775,7 +819,7 @@ LoadStatus load_additional_library(AddressSpace& space, allocators::IAllocator& 
       // Resolving an import through a forwarder makes the libraries on the way dependencies of the one that forwards; a forwarder to a library that was loaded for it does too.
       for (const exe::PeImport& imp : m.pe->imports().view()) {
         if (!set->library_name(imp.dll.view(), &name)) continue;
-        const Module* target = set->find(name.view());
+        const Module* target = set->import_target(m, name.view());
         if (!target) continue;
         List<Module*> hops(allocator);
         if (resolve_export(*set, *target, imp.name.view(), imp.by_ordinal, imp.ordinal, 0, allocator, &hops) == 0) continue;
@@ -785,7 +829,7 @@ LoadStatus load_additional_library(AddressSpace& space, allocators::IAllocator& 
         if (e.forwarder.empty()) continue;
         const uint64_t dot = e.forwarder.view().find('.');
         if (dot == StringView::npos || !set->library_name(e.forwarder.view().first(dot), &name)) continue;
-        Module* d = set->find(name.view());
+        Module* d = set->import_target(m, name.view());
         bool added_now = false;
         for (uint64_t k = first; d && k < set->count(); ++k) if (set->modules_[k].get() == d) added_now = true;
         if (d && added_now) add_forward_dependency(m, *d);
@@ -808,6 +852,22 @@ bool reference_library(ModuleSet* set, StringView canonical_name, uint64_t* base
   if (!m || m->main) return false;
   if (!m->pinned) ++m->refs;
   *base = m->base;
+  return true;
+}
+
+bool reference_library_file(ModuleSet* set, StringView os_path, uint64_t* base) {
+  Module* m = set->find_file(os_path);
+  if (!m) return false;
+  m->private_layer = false;      // (the program asked for that file: from now on it is a library like the others)
+  if (!m->pinned) ++m->refs;
+  *base = m->base;
+  return true;
+}
+
+bool reference_library_base(ModuleSet* set, uint64_t base) {
+  Module* m = set->find_base(base);
+  if (!m || m->main || m->doomed) return false;
+  if (!m->pinned) ++m->refs;
   return true;
 }
 
@@ -860,7 +920,7 @@ LoadStatus load_windows_modules(AddressSpace& space, allocators::IAllocator& all
     if (!note_own_runtime(c, imp.dll.view())) return LoadStatus::OutOfMemory;
     if (!out->library_name(imp.dll.view(), &name)) continue;
     Module* dependency = nullptr;
-    const LoadStatus status = ensure_loaded(c, name.view(), 1, &dependency);
+    const LoadStatus status = ensure_loaded(c, name.view(), main_raw, false, 1, &dependency);
     if (status != LoadStatus::Ok) return status;
   }
   // Phase 2: bind.
