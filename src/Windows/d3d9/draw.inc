@@ -231,6 +231,15 @@ static void blend_pair(DWORD src, DWORD dst, UINT *src_out, UINT *dst_out) {
   *src_out = blend_of(src);
   *dst_out = blend_of(dst);
 }
+/* A target format without alpha, kept here as B8G8R8A8 like those with it: Direct3D 9 blends with a destination alpha of 1 there, whatever the
+ * alpha bytes of the texture hold (Wine's ddraw visual alpha_test: DESTALPHA on an X8R8G8B8 frame buffer is ONE, INVDESTALPHA ZERO). */
+static BOOL target_without_alpha(D3DFORMAT format) {
+  return format == D3DFMT_X8R8G8B8 || format == D3DFMT_X8B8G8R8 || format == D3DFMT_R5G6B5 || format == D3DFMT_X1R5G5B5 || format == D3DFMT_X4R4G4B4;
+}
+/* A blend factor with a destination alpha of 1: DESTALPHA is ONE, INVDESTALPHA ZERO, SRCALPHASAT (min(source alpha, 1 - destination alpha)) ZERO. */
+static UINT blend_opaque_target(UINT factor) {
+  return factor == D3D12_BLEND_DEST_ALPHA ? D3D12_BLEND_ONE : factor == D3D12_BLEND_INV_DEST_ALPHA || factor == D3D12_BLEND_SRC_ALPHA_SAT ? D3D12_BLEND_ZERO : factor;
+}
 static UINT op_of(DWORD value, UINT lowest, UINT highest, UINT otherwise) { return value >= lowest && value <= highest ? value : otherwise; }
 
 /* The textures a draw's tables hold: the samplers its pixel shader reads, as 2, 4, 8 or 16. */
@@ -322,6 +331,12 @@ static ID3D12PipelineState *pipeline_get(Dev *d, const Shader *vs, const Shader 
     blend_pair(rs[D3DRS_SRCBLENDALPHA], rs[D3DRS_DESTBLENDALPHA], &s_, &d_);
     key.src_alpha = s_;
     key.dst_alpha = d_;
+  }
+  if (target_without_alpha(d->target[0]->tex->format)) {
+    key.src = blend_opaque_target(key.src);
+    key.dst = blend_opaque_target(key.dst);
+    key.src_alpha = blend_opaque_target(key.src_alpha);
+    key.dst_alpha = blend_opaque_target(key.dst_alpha);
   }
   key.op_alpha = key.separate ? op_of(rs[D3DRS_BLENDOPALPHA], 1, 5, D3DBLENDOP_ADD) : key.op;
   key.write = rs[D3DRS_COLORWRITEENABLE] & 0xF;
@@ -475,7 +490,10 @@ static const Shader *fixed_shader_get(Dev *d) {
     stage->to_temp = (t[D3DTSS_RESULTARG] & D3DTA_SELECTMASK) == D3DTA_TEMP;
     stage->kill = t[TCOS_TSS_KEY_KILL] != 0;
     const Tex *bound = s->tex[n];
-    if (bound && bound->res && !bound->depth) textured |= 1u << n;
+    if (bound && bound->res && !bound->depth) {
+      textured |= 1u << n;
+      stage->dimension = (uint8_t)(bound->kind == 3 ? FFS_TEXTURE_CUBE : bound->kind == 1 ? FFS_TEXTURE_VOLUME : FFS_TEXTURE_2D);
+    }
   }
   ffs_normalize(&key, textured);
   FixedShader *oldest = &d->fixed[0];
@@ -510,16 +528,29 @@ static void shader_constants(float *out, const Shader *shader, const float (*flo
   }
 }
 /* What a fog mode makes of a depth, as the shaders work it out: `fog` x, y for the linear factor depth * x + y, z, w for the exponential one
- * 2 ^ -(depth * (z + w * depth)); `source` y or z becomes 1 for the one that is used, and w 0. FALSE for no mode. */
-static BOOL fog_terms(const State *s, DWORD mode, float fog[4], float source[4]) {
+ * 2 ^ -(depth * (z + w * depth)); `source` y or z becomes 1 for the one that is used, and w 0. FALSE for no mode. `table`: fog by the pixel
+ * (the table mode), else by the vertex. */
+static BOOL fog_terms(const State *s, DWORD mode, BOOL table, float fog[4], float source[4]) {
   float start, end, density;
   memcpy(&start, &s->rs[D3DRS_FOGSTART], 4);
   memcpy(&end, &s->rs[D3DRS_FOGEND], 4);
   memcpy(&density, &s->rs[D3DRS_FOGDENSITY], 4);
   if (mode == D3DFOG_LINEAR) {      /* (end - depth) / (end - start) */
     const float range = end - start;
-    fog[0] = range != 0.0f ? -1.0f / range : 0.0f;
-    fog[1] = range != 0.0f ? end / range : 1.0f;
+    if (range != 0.0f) {
+      fog[0] = -1.0f / range;
+      fog[1] = end / range;
+    } else if (table) {
+      /* (start = end by the pixel: a step at end - no fog before it, all fog from it on - as Windows, Wine's d3d9 fog_special_test and
+       * ddraw7 test_fog_special; a steep slope stands for the division by 0, kept finite for every end) */
+      const float steep = 1e20f / (end > 1.0f ? end : end < -1.0f ? -end : 1.0f);
+      fog[0] = -steep;
+      fog[1] = end * steep;
+    } else {
+      /* (start = end by the vertex: everything is fogged, whatever its depth - Windows, Wine's d3d9 fog_test and fog_special_test) */
+      fog[0] = 0.0f;
+      fog[1] = 0.0f;
+    }
     source[1] = 1.0f;
   } else if (mode == D3DFOG_EXP || mode == D3DFOG_EXP2) {      /* e ^ -(density * depth), e ^ -(density * depth) ^ 2: as powers of two */
     const float log2_e = 1.44269504f;
@@ -551,7 +582,7 @@ static void shader_state(float *out, const State *s, BOOL fog, BOOL vertex_facto
     state[SM_STATE_FOG_COLOUR][0] = ((colour >> 16) & 255) / 255.0f;
     state[SM_STATE_FOG_COLOUR][1] = ((colour >> 8) & 255) / 255.0f;
     state[SM_STATE_FOG_COLOUR][2] = (colour & 255) / 255.0f;
-    if (fog_terms(s, s->rs[D3DRS_FOGTABLEMODE], state[SM_STATE_FOG], state[SM_STATE_FOG_SOURCE])) {
+    if (fog_terms(s, s->rs[D3DRS_FOGTABLEMODE], TRUE, state[SM_STATE_FOG], state[SM_STATE_FOG_SOURCE])) {
       state[SM_STATE_ALPHA][1] = by_w ? 0.0f : 1.0f;
       state[SM_STATE_ALPHA][2] = by_w ? 1.0f : 0.0f;
     } else if (vertex_factor) {
@@ -691,7 +722,7 @@ static UINT64 constants_of(Dev *d, const Layout *l, const Shader *vs, const Shad
           block[36 + row] = world_view.m[row][0];
           block[40 + row] = world_view.m[row][1];
         }
-      fog_terms(s, s->rs[D3DRS_FOGVERTEXMODE], block + 28, block + 32);
+      fog_terms(s, s->rs[D3DRS_FOGVERTEXMODE], FALSE, block + 28, block + 32);
     } else if (s->rs[D3DRS_FOGENABLE] && s->rs[D3DRS_FOGTABLEMODE] == D3DFOG_NONE) {      /* the factor the vertex brings */
       block[32] = 1.0f;
       block[35] = 0.0f;

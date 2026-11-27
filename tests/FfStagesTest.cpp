@@ -433,6 +433,30 @@ void test_key() {
   set_stage(&a, 1, 200, FFS_TEXTURE, FFS_CURRENT, 77, FFS_TEXTURE, FFS_CURRENT);
   ffs_normalize(&a, 0x3);
   CHECK(a.stages == 1 && a.stage[0].colour_arg[1] == FFS_CURRENT && a.stage[0].alpha_op == FFS_SELECTARG1 && a.stage[0].alpha_arg[1] == FFS_CURRENT && !a.stage[0].sample);
+  // the kind of a stage's texture: kept where it samples (its sampler is declared as that kind), 2D where it does not or is no kind
+  a = initial();
+  set_stage(&a, 0, FFS_SELECTARG1, FFS_TEXTURE, FFS_CURRENT, FFS_SELECTARG2, FFS_TEXTURE, FFS_CURRENT);
+  set_stage(&a, 1, FFS_SELECTARG1, FFS_TEXTURE, FFS_CURRENT, FFS_SELECTARG2, FFS_TEXTURE, FFS_CURRENT);
+  set_stage(&a, 2, FFS_SELECTARG1, FFS_CURRENT, FFS_CURRENT, FFS_SELECTARG2, FFS_TEXTURE, FFS_CURRENT);
+  set_stage(&a, 3, FFS_SELECTARG1, FFS_TEXTURE, FFS_CURRENT, FFS_SELECTARG2, FFS_TEXTURE, FFS_CURRENT);
+  a.stage[0].dimension = FFS_TEXTURE_CUBE;
+  a.stage[1].dimension = FFS_TEXTURE_VOLUME;
+  a.stage[2].dimension = FFS_TEXTURE_CUBE;
+  a.stage[3].dimension = 200;
+  ffs_normalize(&a, 0xF);
+  CHECK(a.stage[0].dimension == FFS_TEXTURE_CUBE && a.stage[1].dimension == FFS_TEXTURE_VOLUME && !a.stage[2].sample && a.stage[2].dimension == FFS_TEXTURE_2D &&
+        a.stage[3].dimension == FFS_TEXTURE_2D);
+  {
+    uint32_t tokens[FFS_MAX_TOKENS];
+    const size_t count = ffs_tokens(&a, tokens, FFS_MAX_TOKENS);
+    unsigned cube = 0, volume = 0, flat = 0;
+    for (size_t i = 0; i + 2 < count; ++i)
+      if ((tokens[i] & 0xFFFFu) == 31u && ((tokens[i + 2] >> 28) & 7u) == 2u && ((tokens[i + 2] >> 11) & 3u) == 1u) {      // dcl of a sampler (register type 10)
+        const uint32_t type = tokens[i + 1] & 0x78000000u;
+        cube += type == 0x18000000u; volume += type == 0x20000000u; flat += type == 0x10000000u;
+      }
+    CHECK(count > 0 && cube == 1 && volume == 1 && flat == 1);
+  }
 }
 
 void test_random(HostAllocator& allocator) {

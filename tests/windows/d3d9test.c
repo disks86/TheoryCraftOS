@@ -307,6 +307,15 @@ static void test_textures(void) {
   screen_quad(0, 0, 64, 64, 0.5f, 0x80FFFFFF);
   read_back();
   check(red(pixel(32, 32)) > 120 && red(pixel(32, 32)) < 136, "... and half of white over black is grey (no texture: the vertex colour's alpha)");
+  /* the back buffer is X8R8G8B8: its alpha is 1 to blending, whatever a clear wrote (Wine's ddraw visual alpha_test) */
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_SRCBLEND, D3DBLEND_DESTALPHA);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_DESTBLEND, D3DBLEND_INVDESTALPHA);
+  clear(0x00FF0000);
+  screen_quad(0, 0, 64, 64, 0.5f, 0x400000FF);
+  read_back();
+  check(pixel(32, 32) == 0x0000FF, "DESTALPHA and INVDESTALPHA on a target without alpha are ONE and ZERO");
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
   IDirect3DDevice9_SetRenderState(g_device, D3DRS_ALPHABLENDENABLE, FALSE);
   IDirect3DBaseTexture9 *bound = (IDirect3DBaseTexture9 *)1;
   IDirect3DDevice9_GetTexture(g_device, 0, &bound);
@@ -735,6 +744,19 @@ static void test_fog(void) {
   screen_quad(0, 0, 64, 64, 0.25f, 0xFFFF0000);
   read_back();
   check(near_colour(pixel(32, 32), 255, 0, 0), "... and none before the fog starts");
+  /* start = end by the pixel: no fog before end, all of it from there on (Windows, Wine's d3d9 fog_special_test) */
+  set_float_state(D3DRS_FOGSTART, 0.5f);
+  set_float_state(D3DRS_FOGEND, 0.5f);
+  clear(0xFF000000);
+  screen_quad(0, 0, 64, 64, 0.25f, 0xFFFF0000);
+  read_back();
+  const int step_before = near_colour(pixel(32, 32), 255, 0, 0);
+  clear(0xFF000000);
+  screen_quad(0, 0, 64, 64, 0.75f, 0xFFFF0000);
+  read_back();
+  check(step_before && near_colour(pixel(32, 32), 0, 0, 255), "linear fog by the pixel with start = end: none before end, all after it");
+  set_float_state(D3DRS_FOGSTART, 0.25f);
+  set_float_state(D3DRS_FOGEND, 1.0f);
   IDirect3DDevice9_SetRenderState(g_device, D3DRS_FOGTABLEMODE, D3DFOG_EXP2);
   set_float_state(D3DRS_FOGDENSITY, 2.0f);
   clear(0xFF000000);
@@ -800,6 +822,15 @@ static void test_fog(void) {
   world_quad(0.25f);
   read_back();
   check(near_colour(pixel(32, 32), 191, 191, 255) && pixel(4, 32) == 0, "linear fog by the vertex: three quarters of the colour at a quarter of the way");
+  /* start = end by the vertex: everything is fog, whatever its depth (Windows, Wine's d3d9 fog_test) */
+  set_float_state(D3DRS_FOGSTART, 0.5f);
+  set_float_state(D3DRS_FOGEND, 0.5f);
+  clear(0xFF000000);
+  world_quad(0.25f);
+  read_back();
+  check(near_colour(pixel(32, 32), 0, 0, 255), "linear fog by the vertex with start = end: all fog before end too");
+  set_float_state(D3DRS_FOGSTART, 0.0f);
+  set_float_state(D3DRS_FOGEND, 1.0f);
   D3DMATRIX view;
   memset(&view, 0, sizeof view);
   view.m[0][0] = view.m[1][1] = view.m[2][2] = view.m[3][3] = 1.0f;
@@ -1531,6 +1562,19 @@ static void test_cube_and_volume(void) {
       IDirect3DDevice9_GetTexture(g_device, 0, &bound);
       check(bound == (IDirect3DBaseTexture9 *)cube, "GetTexture gives back the cube");
       if (bound) IDirect3DBaseTexture9_Release(bound);
+      /* ... and from the fixed function's stages (SELECTARG1 of the texture: a cube sampler there too) */
+      IDirect3DDevice9_SetPixelShader(g_device, NULL);
+      IDirect3DDevice9_SetTextureStageState(g_device, 0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+      IDirect3DDevice9_SetTextureStageState(g_device, 0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+      int fixed_good = 0;
+      for (int f = 0; f < 6; ++f)
+        if (lookup_quad(directions[f][0], directions[f][1], directions[f][2]) == (faces[f] & 0xFFFFFF)) ++fixed_good;
+      const DWORD along_z = lookup_quad(0, 0, 1), along_minus_x = lookup_quad(-1, 0, 0);
+      if (along_z != 0x0000FF || along_minus_x != 0x00FFFF) printf("d3d9test: (cube along +z %06lx, along -x %06lx)\n", (unsigned long)along_z, (unsigned long)along_minus_x);
+      check(fixed_good == 6 && along_z == 0x0000FF && along_minus_x == 0x00FFFF,
+            "a cube map sampled by direction from the fixed-function stages: each of the six faces, and along the axes");
+      IDirect3DDevice9_SetTextureStageState(g_device, 0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+      IDirect3DDevice9_SetPixelShader(g_device, ps_cube);
       IDirect3DDevice9_SetTexture(g_device, 0, NULL);
       const DWORD blank = lookup_quad(1, 0, 0);
       check(blank == 0xFFFFFF, "a cube sampler with no texture set samples white");

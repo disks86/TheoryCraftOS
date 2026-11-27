@@ -64,7 +64,10 @@ typedef struct FfsStage {
   uint8_t kill;                         /* a texel of alpha 0 takes the pixel away (DirectDraw's colour key: TCOS_TSS_KEY_KILL); the stage samples */
   uint8_t bump;                         /* (ffs_normalize says) the colour operation is a bump environment one that moves the next stage's coordinates: 1
                                          * D3DTOP_BUMPENVMAP, 2 BUMPENVMAPLUMINANCE; the stage samples */
+  uint8_t dimension;                    /* the kind of the stage's texture: FFS_TEXTURE_2D, _CUBE (sampled by the direction x y z) or _VOLUME (x y z);
+                                         * 0 where the stage does not sample (ffs_normalize) */
 } FfsStage;
+enum { FFS_TEXTURE_2D = 0, FFS_TEXTURE_CUBE = 1, FFS_TEXTURE_VOLUME = 2 };
 /* All of a pixel shader made here: two shaders of the same key are the same shader. */
 typedef struct FfsKey {
   uint8_t stages;                       /* the stages that do something: the first of them */
@@ -130,6 +133,7 @@ static void ffs_normalize(FfsKey *key, unsigned textured) {
     s->kill = (uint8_t)(s->kill && has);
     s->bump = (uint8_t)(s->colour_op == FFS_BUMPENVMAP ? 1 : s->colour_op == FFS_BUMPENVMAPLUMINANCE ? 2 : 0);
     s->sample = (uint8_t)(s->kill || s->bump || ffs_reads_texture(s->colour_op, s->colour_arg) || ffs_reads_texture(s->alpha_op, s->alpha_arg));
+    if (!s->sample || s->dimension > FFS_TEXTURE_VOLUME) s->dimension = FFS_TEXTURE_2D;
     ++count;
   }
   key->stages = (uint8_t)count;
@@ -293,7 +297,9 @@ static size_t ffs_tokens(const FfsKey *key, uint32_t *out, size_t capacity) {
   for (unsigned n = 0; n < stages; ++n) {
     if (!key->stage[n].sample) continue;
     ffs_put(w, FFS_I_DCL | (2u << 24)); ffs_put(w, 0x80000000u); ffs_put(w, ffs_register(FFS_T_COORDINATE, n) | (0xFu << 16));
-    ffs_put(w, FFS_I_DCL | (2u << 24)); ffs_put(w, 0x90000000u); ffs_put(w, ffs_register(FFS_T_SAMPLER, n) | (0xFu << 16));      /* (two-dimensional) */
+    /* (the sampler's type, D3DSAMPLER_TEXTURE_TYPE in bits 27 .. 30: D3DSTT_2D 2, D3DSTT_CUBE 3, D3DSTT_VOLUME 4) */
+    static const uint32_t types[3] = {0x90000000u, 0x98000000u, 0xA0000000u};
+    ffs_put(w, FFS_I_DCL | (2u << 24)); ffs_put(w, types[key->stage[n].dimension <= FFS_TEXTURE_VOLUME ? key->stage[n].dimension : FFS_TEXTURE_2D]); ffs_put(w, ffs_register(FFS_T_SAMPLER, n) | (0xFu << 16));
   }
   ffs_instruction(w, FFS_I_MOV, FFS_R_CURRENT, 0xF, 0, 1, ffs_source(FFS_T_INPUT, 0, FFS_XYZW), none, none);
   if (ffs_reads(key, FFS_TEMP)) ffs_instruction(w, FFS_I_MOV, FFS_R_TEMP, 0xF, 0, 1, none, none, none);      /* (nothing, until a stage writes it) */
