@@ -268,6 +268,8 @@ class IAccelerator {
   // AccelLimits::texture_levels: a texture as `desc` says (0: the device cannot), filled by write_level: one layer (a volume's slice of that level, a cube's face, an
   // array's layer; 0 for Plain) of level `level`, the row of t = 0 first - 4 bytes R, G, B, A a texel (Rgba8, Rgba8Srgb), 16 bytes of floats (Rgba16F, Rgba32F), or the
   // blocks, rows of blocks from t = 0. It is destroyed with destroy_texture.
+  // Why the last draw, draw_images or clear that failed did (a constant string, for the draw statistics), or nullptr.
+  virtual const char* last_failure() const { return nullptr; }
   virtual bool takes_blocks(AccelBlocks blocks) const {
     (void)blocks;
     return false;

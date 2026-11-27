@@ -90,6 +90,13 @@ class IBuffer {
   // CPU access to the contents. Write, then unmap() before a submit that reads it.
   virtual ByteView map() = 0;
   virtual void unmap() = 0;
+  // unmap() of a buffer whose bytes [offset, offset + size) alone were written since it was last unmapped (the rest the device has as it was): a device that sends
+  // uploads sends just those. `others_unused`: no later work reads the bytes outside the range before they are written again (a ring of vertex data), so a device
+  // that must move the buffer need not carry them. The default sends the whole buffer.
+  virtual void unmap_range(uint64_t offset, uint64_t size, bool others_unused = false) {
+    (void)offset, (void)size, (void)others_unused;
+    unmap();
+  }
   // After a submit() in which the GPU may have written the buffer (a storage buffer a compute shader wrote): brings what it holds into map(). True if the contents are current.
   virtual bool read_back() { return true; }
   // A tiled buffer (the memory manager's reserved buffers, Direct3D's tiled resources; kFeature2TileResidency): one byte per kBufferTileBytes of the buffer, non-zero where that

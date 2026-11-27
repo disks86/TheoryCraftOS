@@ -223,10 +223,16 @@ class VirglBuffer final : public IBuffer {
   // new host resource, which the next submits use, and the old one is let go - the host keeps it until the work that reads it is done. Without that a renderer
   // that fills a buffer, submits, fills it again and submits again (the desktop's, around a picture it shows from the GPU) has its first draws read the
   // second contents whenever the GPU is behind.
-  void unmap() override {
-    if (ok_ && device_.in_flight(last_use())) replace_busy_resource();
-    TransferHost3d transfer{header(kCmdTransferToHost3d), {0, 0, 0, static_cast<uint32_t>(memory_.size()), 1, 1}, 0,
-                            id_, 0, 0, 0};
+  void unmap() override { unmap_range(0, memory_.size()); }
+  // (a range: only it goes up, unless the buffer moved to a new host resource - which has none of the old contents: then all of it)
+  void unmap_range(uint64_t offset, uint64_t size, bool others_unused = false) override {
+    if (offset > memory_.size() || size > memory_.size() - offset) offset = 0, size = memory_.size();
+    if (ok_ && device_.in_flight(last_use())) {
+      replace_busy_resource();
+      if (!others_unused) offset = 0, size = memory_.size();
+    }
+    if (size == 0) return;
+    TransferHost3d transfer{header(kCmdTransferToHost3d), {static_cast<uint32_t>(offset), 0, 0, static_cast<uint32_t>(size), 1, 1}, offset, id_, 0, 0, 0};
     device_.gpu().command(as_bytes(transfer), /*fence=*/false);
   }
   // What a compute shader wrote lives on the host: pull it into the guest memory.

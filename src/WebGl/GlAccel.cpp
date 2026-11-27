@@ -1653,7 +1653,7 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
         if (st.textures[k] == att.colors[i]) return no("a texture the draw also renders into");
       if (dcopy && st.textures[k] == att.depth) return no("a texture the draw also renders into");
     }
-    if (!acc->draw_images(att, p.accel_program, st, vertices.view(), static_cast<uint32_t>(tris.count()), constants.view())) return no("the device failed the draw");
+    if (!acc->draw_images(att, p.accel_program, st, vertices.view(), static_cast<uint32_t>(tris.count()), constants.view())) return no(acc->last_failure() ? acc->last_failure() : "the device failed the draw");
     for (uint32_t i = 0; i < att.color_count; ++i) copies[i]->set_ahead(true);
     if (dcopy && (st.depth_write || stencil_writes)) {
       dcopy->set_ahead(true);
@@ -1666,7 +1666,7 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
   if (depth_test && hw_depth_stale_) return no("the device depth is out of date");      // (the upload's depth was refused)
   if (!acc->draw(hw_target_, p.accel_program, st, vertices.view(), static_cast<uint32_t>(tris.count()), constants.view())) {
     hw_valid_ = false;   // the device may have drawn part of it: the caller reads the picture back and goes on on the CPU
-    return no("the device failed the draw");
+    return no(acc->last_failure() ? acc->last_failure() : "the device failed the draw");
   }
   hw_ahead_ = true;
   if (st.depth_write || stencil_writes) hw_depth_ahead_ = true;
