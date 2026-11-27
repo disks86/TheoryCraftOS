@@ -40,7 +40,11 @@
  * destinations a factor (_x2, _x4, _d2), and the colour is what r0 holds at the end. Their r<n> are the temporaries r<n> here, their t<n> (below
  * 1.4, where they are written) the temporaries r<8 + n>.
  *
- * Refused (SM_UNSUPPORTED): of pixel shaders 1.x the bump environment instructions (texbem, texbeml, bem), the ones that look up a cube map
+ *   bump        a pixel shader 1.x with texbem, texbeml or bem: after its fill registers (from `bump_register` on), two registers for each stage up to the
+ *               highest whose bump environment matrix it uses: stage n's matrix (D3DTSS_BUMPENVMAT00, 01, 10, 11) at 2n, its luminance scale and
+ *               offset (D3DTSS_BUMPENVLSCALE, BUMPENVLOFFSET) at 2n + 1 (`bump_stages` of them).
+ *
+ * Refused (SM_UNSUPPORTED): of pixel shaders 1.x the ones that look up a cube map
  * (texm3x3tex, texm3x3spec, texm3x3vspec) and the ones that write the depth (texdepth, texm3x2depth); loops, subroutines and predicates (loop, rep, call, label, setp, break*); integer constants;
  * samplers of a kind other than 2D, cube and volume; texldl and texldd; the depth output; vPos and vFace; textures in a vertex shader. A malformed shader - a token stream that ends early, a register that is not there - is SM_INVALID. */
 #ifndef TCOS_SM_TO_DXBC_H
@@ -67,6 +71,8 @@ typedef struct SmShader {
   unsigned constant_registers;          /* all of cb0: the floats, the bools if used, and a pixel shader's state registers */
   unsigned state_register;              /* the first of its state registers: a pixel shader's SM_STATE_REGISTERS, a vertex shader's SM_VS_STATE_REGISTERS */
   unsigned fill_register;               /* a pixel shader: the first of its fill registers after the state ones, one for each sampler up to the highest it reads */
+  unsigned bump_register;               /* a pixel shader 1.x: the first of its bump registers after the fill ones (see above), `bump_stages` stages of two */
+  unsigned bump_stages;
   unsigned sampler_mask;
   uint8_t sampler_kind[16];             /* what each sampler of sampler_mask is: SM_SAMPLER_2D, SM_SAMPLER_VOLUME or SM_SAMPLER_CUBE (the kernel's TextureKind) */
   SmInput inputs[16];                   /* a vertex shader's declared inputs */
@@ -174,6 +180,8 @@ typedef struct SmContext {
   unsigned bool_words;
   uint16_t fill_word[256];              /* the words that name a sampler's fill register by the sampler's number (sm_translate adds where they begin) */
   unsigned fill_words;
+  uint16_t bump_word[64];               /* ... and those that name a bump register by its number from the first (2 * stage, + 1 for the luminance) */
+  unsigned bump_words;
   unsigned pad_rows;                    /* a pixel shader 1.x: the rows texm3x2pad / texm3x3pad have left so far */
 } SmContext;
 static void sm_sample_fill(SmContext *c, DxOperand d, unsigned saturate, unsigned n);
@@ -763,6 +771,27 @@ static int sm_ps1_row(SmContext *c, const SmParam *p, unsigned row) {
   return SM_OK;
 }
 
+/* An instruction whose last operand is bump register `which` (2 * stage: the matrix, + 1: the luminance scale and offset) of a pixel shader 1.x, swizzled. */
+static void sm_emit_bump(SmContext *c, uint32_t op, DxOperand d, DxOperand a, unsigned which, unsigned swizzle) {
+  if (c->bump_words >= 64) { c->failed = 1; return; }
+  sm_emit3(c, op, 0, d, a, dx_constant(which, swizzle, 0, 0, 0));
+  if (!c->failed) c->bump_word[c->bump_words++] = (uint16_t)(c->words - 1);      /* (the constant's element is the last word) */
+  if (c->out->bump_stages < which / 2 + 1) c->out->bump_stages = which / 2 + 1;
+}
+/* Into scratch 1, x and y: stage n's bump environment matrix times source p's (du, dv) - M00 du + M10 dv, M01 du + M11 dv. */
+static int sm_ps1_bump_move(SmContext *c, const SmParam *p, unsigned n) {
+  SmParam du = *p, dv = *p;
+  DxOperand a, b;
+  du.swizzle = sm_compose(p->swizzle, SM_SWIZZLE_OF(0));
+  dv.swizzle = sm_compose(p->swizzle, SM_SWIZZLE_OF(1));
+  SM_TRY(sm_source(c, &du, 0, &a));
+  SM_TRY(sm_source(c, &dv, 0, &b));
+  sm_emit_bump(c, DXO_MUL, sm_scratch(1, 0x3), a, 2 * n, 0x44u /* x y x y */);
+  sm_emit_bump(c, DXO_MUL, sm_scratch(2, 0x3), b, 2 * n, 0xEEu /* z w z w */);
+  sm_emit3(c, DXO_ADD, 0, sm_scratch(1, 0x3), sm_scratch_source(1), sm_scratch_source(2));
+  return SM_OK;
+}
+
 /* One instruction of a pixel shader 1.x: those that fill a texture register here, the arithmetic ones as in the later models. */
 static int sm_instruction_ps1(SmContext *c, unsigned op, SmParam *p, unsigned count) {
   SmShader *s = c->out;
@@ -817,6 +846,33 @@ static int sm_instruction_ps1(SmContext *c, unsigned op, SmParam *p, unsigned co
       SM_TRY(sm_source(c, &p[1], 0, &at));
       SM_TRY(sm_destination(c, &p[0], &d));
       return sm_ps1_sample(c, d, at, p[0].number);
+    case SMO_TEXBEM: case SMO_TEXBEML: {      /* stage n at its coordinates moved by its bump environment matrix times the source's du, dv (texbeml: then scaled) */
+      if (!old || count != 2 || p[0].type != SMR_ADDR || p[0].number >= 6) return SM_INVALID;
+      const unsigned n = p[0].number;
+      SM_TRY(sm_ps1_coordinates(c, n, DX_SWIZZLE_XYZW, &at));
+      SM_TRY(sm_ps1_bump_move(c, &p[1], n));
+      sm_emit3(c, DXO_ADD, 0, sm_scratch(1, 0x3), sm_scratch_source(1), at);
+      sm_emit2(c, DXO_MOV, 0, sm_scratch(1, 0xC), at);
+      SM_TRY(sm_destination(c, &p[0], &d));
+      SM_TRY(sm_ps1_sample(c, d, sm_scratch_source(1), n));
+      if (op == SMO_TEXBEML) {      /* t<n> * (the source's third number * the luminance scale + the offset), not clamped */
+        SmParam l = p[1];
+        l.swizzle = sm_compose(p[1].swizzle, SM_SWIZZLE_OF(2));
+        SM_TRY(sm_source(c, &l, 0, &a));
+        sm_emit_bump(c, DXO_MUL, sm_scratch(3, 0xF), a, 2 * n + 1, SM_SWIZZLE_OF(0));
+        sm_emit_bump(c, DXO_ADD, sm_scratch(3, 0xF), sm_scratch_source(3), 2 * n + 1, SM_SWIZZLE_OF(1));
+        sm_emit3(c, DXO_MUL, 0, d, dx_temp(DX_TEMP_PS1_TEXTURE + n, DX_SWIZZLE_XYZW), sm_scratch_source(3));
+      }
+      return SM_OK;
+    }
+    case SMO_BEM: {      /* (1.4) dst.rg = src0.rg + stage dst's matrix times src1's r, g */
+      if (old || count != 3 || p[0].type != SMR_TEMP || p[0].number >= 6 || (p[0].mask & 0xC) || p[0].shift) return SM_INVALID;
+      SM_TRY(sm_ps1_bump_move(c, &p[2], p[0].number));
+      SM_TRY(sm_source(c, &p[1], 0, &a));
+      SM_TRY(sm_destination(c, &p[0], &d));
+      sm_emit3(c, DXO_ADD, p[0].saturate ? DX_SATURATE : 0u, d, sm_scratch_source(1), a);
+      return SM_OK;
+    }
     case SMO_TEXM3X2PAD: case SMO_TEXM3X3PAD:
       if (!old || count != 2 || p[0].type != SMR_ADDR || c->pad_rows >= 2) return SM_INVALID;
       SM_TRY(sm_ps1_row(c, p, c->pad_rows));
@@ -867,7 +923,7 @@ static int sm_instruction_ps1(SmContext *c, unsigned op, SmParam *p, unsigned co
       return SM_OK;
     }
     default:
-      return SM_UNSUPPORTED;      /* texbem, texbeml, bem; texm3x3tex, texm3x3spec, texm3x3vspec; texdepth, texm3x2depth */
+      return SM_UNSUPPORTED;      /* texm3x3tex, texm3x3spec, texm3x3vspec; texdepth, texm3x2depth */
   }
 }
 /* The parameters an instruction of a pixel shader 1.x has; 255 for one that is not one of theirs. */
@@ -1101,10 +1157,12 @@ static int sm_translate(const uint32_t *tokens, size_t available, SmShader *out,
   }
   unsigned fills = 0;
   for (unsigned i = 0; i < 16; ++i) if (out->sampler_mask >> i & 1) fills = i + 1;
-  out->constant_registers = out->float_registers + (out->bools_used ? SM_BOOL_REGISTERS : 0u) + (out->vertex ? SM_VS_STATE_REGISTERS : SM_STATE_REGISTERS + fills);
+  out->bump_register = out->vertex ? 0u : out->fill_register + fills;
+  out->constant_registers = out->float_registers + (out->bools_used ? SM_BOOL_REGISTERS : 0u) + (out->vertex ? SM_VS_STATE_REGISTERS : SM_STATE_REGISTERS + fills + 2u * out->bump_stages);
   if (out->constant_registers > 512) return SM_UNSUPPORTED;      /* (more than any version has: 256 + 16 + 1, 224 + 16 + 5 + 16) */
   for (unsigned i = 0; i < c->bool_words; ++i) c->code[c->bool_word[i]] += out->float_registers;      /* (the bools' elements were written as their numbers) */
   for (unsigned i = 0; i < c->fill_words; ++i) c->code[c->fill_word[i]] += out->fill_register;      /* (and the fills' as their samplers') */
+  for (unsigned i = 0; i < c->bump_words; ++i) c->code[c->bump_word[i]] += out->bump_register;      /* (and the bump registers') */
 
   /* the container: the two signatures, then the program with its declarations */
   {

@@ -28,13 +28,20 @@
  *   c0          the texture factor (D3DRS_TEXTUREFACTOR)
  *   c1          numbers of its own (it defines them)
  *   c<2 + n>    the constant of stage n (D3DTSS_CONSTANT)
+ *   c<10 + n>   the bump environment matrix of stage n (D3DTSS_BUMPENVMAT00, 01, 10, 11)
+ *   c<18 + n>   its luminance scale and offset (D3DTSS_BUMPENVLSCALE, BUMPENVLOFFSET, 0, 0)
  *
- * Not there: the bump environment operations, which pass on what they are given, and D3DTOP_PREMODULATE, which is the first argument. */
+ * The bump environment operations (D3DTOP_BUMPENVMAP, BUMPENVMAPLUMINANCE: colour operations only) sample their stage's texture as du, dv (and a
+ * luminance) and move the coordinates the next stage samples at by the stage's matrix times (du, dv): u + M00 du + M10 dv, v + M01 du + M11 dv; the
+ * luminance one then scales what the next stage sampled by saturate(l * scale + offset). The colour such a stage passes on is the current one.
+ * Not there: D3DTOP_PREMODULATE, which is the first argument (no hardware of Direct3D 9 has it: the caps say so). */
 #ifndef TCOS_FF_STAGES_H
 #define TCOS_FF_STAGES_H
 
 #define FFS_STAGES 8u
-#define FFS_CONSTANTS (2u + FFS_STAGES)      /* the constant registers such a shader has */
+#define FFS_CONSTANTS (2u + 3u * FFS_STAGES)      /* the constant registers such a shader has */
+#define FFS_BUMP_MATRIX (2u + FFS_STAGES)         /* c<FFS_BUMP_MATRIX + n>: stage n's bump environment matrix */
+#define FFS_BUMP_LUMINANCE (2u + 2u * FFS_STAGES) /* c<FFS_BUMP_LUMINANCE + n>: its luminance scale and offset */
 #define FFS_MAX_TOKENS 1024u                 /* the tokens of one, at most */
 
 /* The operations (D3DTOP_*) and the arguments (D3DTA_*), by Direct3D 9's numbers. */
@@ -55,6 +62,8 @@ typedef struct FfsStage {
   uint8_t to_temp;                      /* the result goes to the temporary register, not on to the next stage (D3DTSS_RESULTARG) */
   uint8_t sample;                       /* (ffs_normalize says) the stage looks up its texture */
   uint8_t kill;                         /* a texel of alpha 0 takes the pixel away (DirectDraw's colour key: TCOS_TSS_KEY_KILL); the stage samples */
+  uint8_t bump;                         /* (ffs_normalize says) the colour operation is a bump environment one that moves the next stage's coordinates: 1
+                                         * D3DTOP_BUMPENVMAP, 2 BUMPENVMAPLUMINANCE; the stage samples */
 } FfsStage;
 /* All of a pixel shader made here: two shaders of the same key are the same shader. */
 typedef struct FfsKey {
@@ -81,10 +90,15 @@ static int ffs_reads_texture(unsigned op, const uint8_t arg[3]) {
   return 0;
 }
 /* Brings one half of a stage - the colour's or the alpha's - into the form the key has: an operation that is one, only the arguments it reads, and
- * with no texture set nothing that would read one - such a stage passes on what it is given, as Direct3D 9 has it. */
-static void ffs_normalize_half(uint8_t *op, uint8_t arg[3], int textured) {
+ * with no texture set nothing that would read one - such a stage passes on what it is given, as Direct3D 9 has it. `bump`: a bump environment
+ * operation may stay (the colour half of a stage with a texture and a stage after it). */
+static void ffs_normalize_half(uint8_t *op, uint8_t arg[3], int textured, int bump) {
   unsigned used;
   if (*op == FFS_PREMODULATE) *op = FFS_SELECTARG1;
+  if ((*op == FFS_BUMPENVMAP || *op == FFS_BUMPENVMAPLUMINANCE) && bump && textured) {
+    arg[0] = arg[1] = arg[2] = 0;
+    return;
+  }
   if (*op <= FFS_DISABLE || *op > FFS_LERP || *op == FFS_BUMPENVMAP || *op == FFS_BUMPENVMAPLUMINANCE || (!textured && ffs_reads_texture(*op, arg))) {
     *op = FFS_SELECTARG1;
     arg[1] = FFS_CURRENT;
@@ -107,11 +121,15 @@ static void ffs_normalize(FfsKey *key, unsigned textured) {
   while (count < FFS_STAGES && key->stage[count].colour_op != FFS_DISABLE && key->stage[count].colour_op != 0 && key->stage[count].colour_op <= FFS_LERP) {
     FfsStage *s = &key->stage[count];
     const int has = (int)(textured >> count & 1);
-    ffs_normalize_half(&s->colour_op, s->colour_arg, has);
-    ffs_normalize_half(&s->alpha_op, s->alpha_arg, has);
+    /* (a bump environment stage moves the next stage's coordinates: there must be one, which does something) */
+    const int next = count + 1 < FFS_STAGES && key->stage[count + 1].colour_op != FFS_DISABLE && key->stage[count + 1].colour_op != 0 &&
+                     key->stage[count + 1].colour_op <= FFS_LERP;
+    ffs_normalize_half(&s->colour_op, s->colour_arg, has, next);
+    ffs_normalize_half(&s->alpha_op, s->alpha_arg, has, 0);
     s->to_temp = s->to_temp ? 1 : 0;
     s->kill = (uint8_t)(s->kill && has);
-    s->sample = (uint8_t)(s->kill || ffs_reads_texture(s->colour_op, s->colour_arg) || ffs_reads_texture(s->alpha_op, s->alpha_arg));
+    s->bump = (uint8_t)(s->colour_op == FFS_BUMPENVMAP ? 1 : s->colour_op == FFS_BUMPENVMAPLUMINANCE ? 2 : 0);
+    s->sample = (uint8_t)(s->kill || s->bump || ffs_reads_texture(s->colour_op, s->colour_arg) || ffs_reads_texture(s->alpha_op, s->alpha_arg));
     ++count;
   }
   key->stages = (uint8_t)count;
@@ -121,8 +139,9 @@ static void ffs_normalize(FfsKey *key, unsigned textured) {
 /* ---- the tokens ------------------------------------------------------------------------------------------------------------------------------------- */
 
 /* The registers of a shader made here: r0 what goes from stage to stage, r1 the temporary register of the stages, r2 the stage's texture, r3 .. r5
- * an argument that is 1 - something, r6 the stage's result before it is clamped, r7 .. r9 what an operation needs for itself. */
-enum { FFS_R_CURRENT = 0, FFS_R_TEMP, FFS_R_TEXEL, FFS_R_ARGUMENT, FFS_R_RESULT = 6, FFS_R_SCRATCH };
+ * an argument that is 1 - something, r6 the stage's result before it is clamped, r7 .. r9 what an operation needs for itself (r9 also the moved
+ * coordinates of a stage after a bump environment one), r10 the move a bump environment stage worked out, r11 its luminance factor. */
+enum { FFS_R_CURRENT = 0, FFS_R_TEMP, FFS_R_TEXEL, FFS_R_ARGUMENT, FFS_R_RESULT = 6, FFS_R_SCRATCH, FFS_R_BUMP = 10, FFS_R_LUMINANCE = 11 };
 enum { FFS_T_TEMP = 0, FFS_T_INPUT = 1, FFS_T_CONST = 2, FFS_T_COORDINATE = 3, FFS_T_COLOUR_OUT = 8, FFS_T_SAMPLER = 10 };
 enum { FFS_I_MOV = 1, FFS_I_ADD = 2, FFS_I_SUB = 3, FFS_I_MAD = 4, FFS_I_MUL = 5, FFS_I_DP3 = 8, FFS_I_LRP = 18, FFS_I_DCL = 31, FFS_I_TEXKILL = 65, FFS_I_TEXLD = 66,
        FFS_I_DEF = 81 };
@@ -234,6 +253,7 @@ static void ffs_half(FfsWriter *w, unsigned stage, unsigned op, const uint8_t ar
       ffs_instruction(w, FFS_I_MUL, d, mask, 0, 2, ffs_temp(t + 2), four, none);
       break;
     case FFS_MULTIPLYADD: ffs_instruction(w, FFS_I_MAD, d, mask, 0, 3, a1, a2, a0); break;      /* a0 + a1 * a2 */
+    case FFS_BUMPENVMAP: case FFS_BUMPENVMAPLUMINANCE: ffs_instruction(w, FFS_I_MOV, d, mask, 0, 1, ffs_temp(FFS_R_CURRENT), none, none); break;      /* (what it is given) */
     case FFS_LERP: ffs_instruction(w, FFS_I_LRP, d, mask, 0, 3, a0, a1, a2); break;             /* a0 * a1 + (1 - a0) * a2 */
     default: ffs_instruction(w, FFS_I_MOV, d, mask, 0, 1, a1, none, none); break;               /* FFS_SELECTARG1 */
   }
@@ -279,11 +299,27 @@ static size_t ffs_tokens(const FfsKey *key, uint32_t *out, size_t capacity) {
   if (ffs_reads(key, FFS_TEMP)) ffs_instruction(w, FFS_I_MOV, FFS_R_TEMP, 0xF, 0, 1, none, none, none);      /* (nothing, until a stage writes it) */
   for (unsigned n = 0; n < stages; ++n) {
     const FfsStage *s = &key->stage[n];
+    const int moved = n > 0 && key->stage[n - 1].bump;
     if (s->sample) {      /* texldp: the coordinates divided by their fourth number */
+      FfsSource at = ffs_source(FFS_T_COORDINATE, n, FFS_XYZW);
+      if (moved) {      /* (after a bump environment stage: u, v moved by what it worked out - times the fourth number, which the lookup divides by) */
+        ffs_instruction(w, FFS_I_MOV, FFS_R_SCRATCH + 2, 0xF, 0, 1, at, none, none);
+        ffs_instruction(w, FFS_I_MAD, FFS_R_SCRATCH + 2, 0x3, 0, 3, ffs_temp(FFS_R_BUMP), ffs_alpha_of(at), at);
+        at = ffs_temp(FFS_R_SCRATCH + 2);
+      }
       ffs_put(w, FFS_I_TEXLD | (1u << 16) | (3u << 24));
       ffs_put(w, ffs_register(FFS_T_TEMP, FFS_R_TEXEL) | (0xFu << 16));
-      ffs_put(w, ffs_source_token(ffs_source(FFS_T_COORDINATE, n, FFS_XYZW)));
+      ffs_put(w, ffs_source_token(at));
       ffs_put(w, ffs_source_token(ffs_source(FFS_T_SAMPLER, n, FFS_XYZW)));
+      if (moved && key->stage[n - 1].bump == 2)      /* (and scaled by the luminance factor) */
+        ffs_instruction(w, FFS_I_MUL, FFS_R_TEXEL, 0xF, 0, 2, ffs_temp(FFS_R_TEXEL), ffs_temp(FFS_R_LUMINANCE), none);
+    }
+    if (s->bump) {      /* the move: du * (M00, M01) + dv * (M10, M11); the luminance factor saturate(l * scale + offset) */
+      ffs_instruction(w, FFS_I_MUL, FFS_R_BUMP, 0xF, 0, 2, ffs_source(FFS_T_TEMP, FFS_R_TEXEL, 0x00u), ffs_source(FFS_T_CONST, FFS_BUMP_MATRIX + n, 0x44u), none);
+      ffs_instruction(w, FFS_I_MAD, FFS_R_BUMP, 0xF, 0, 3, ffs_source(FFS_T_TEMP, FFS_R_TEXEL, 0x55u), ffs_source(FFS_T_CONST, FFS_BUMP_MATRIX + n, 0xEEu), ffs_temp(FFS_R_BUMP));
+      if (s->bump == 2)
+        ffs_instruction(w, FFS_I_MAD, FFS_R_LUMINANCE, 0xF, 1, 3, ffs_source(FFS_T_TEMP, FFS_R_TEXEL, 0xAAu), ffs_source(FFS_T_CONST, FFS_BUMP_LUMINANCE + n, 0x00u),
+                        ffs_source(FFS_T_CONST, FFS_BUMP_LUMINANCE + n, 0x55u));
     }
     if (s->kill) {      /* alpha * 256 - 0.5: below 0 for alpha 0 only (the smallest other alpha is 1/255) - then texkill */
       ffs_instruction(w, FFS_I_MUL, FFS_R_SCRATCH, 0xF, 0, 2, ffs_source(FFS_T_TEMP, FFS_R_TEXEL, FFS_WWWW), ffs_number(FFS_FOUR), none);

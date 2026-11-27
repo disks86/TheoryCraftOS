@@ -701,9 +701,30 @@ static UINT64 constants_of(Dev *d, const Layout *l, const Shader *vs, const Shad
     float stages[FFS_CONSTANTS][4];
     memset(stages, 0, sizeof stages);
     colour_of_state(s->rs[D3DRS_TEXTUREFACTOR], stages[0]);
-    for (UINT stage = 0; stage < STAGES; ++stage) colour_of_state(s->stage[stage][D3DTSS_CONSTANT], stages[2 + stage]);
+    for (UINT stage = 0; stage < STAGES; ++stage) {
+      colour_of_state(s->stage[stage][D3DTSS_CONSTANT], stages[2 + stage]);
+      /* (the bump environment matrix and luminance scale and offset: floats kept as the bits of the states) */
+      memcpy(&stages[FFS_BUMP_MATRIX + stage][0], &s->stage[stage][D3DTSS_BUMPENVMAT00], 4);
+      memcpy(&stages[FFS_BUMP_MATRIX + stage][1], &s->stage[stage][D3DTSS_BUMPENVMAT01], 4);
+      memcpy(&stages[FFS_BUMP_MATRIX + stage][2], &s->stage[stage][D3DTSS_BUMPENVMAT10], 4);
+      memcpy(&stages[FFS_BUMP_MATRIX + stage][3], &s->stage[stage][D3DTSS_BUMPENVMAT11], 4);
+      memcpy(&stages[FFS_BUMP_LUMINANCE + stage][0], &s->stage[stage][D3DTSS_BUMPENVLSCALE], 4);
+      memcpy(&stages[FFS_BUMP_LUMINANCE + stage][1], &s->stage[stage][D3DTSS_BUMPENVLOFFSET], 4);
+    }
     shader_constants(pixel, ps, stages, FFS_CONSTANTS, 0);
-  } else shader_constants(pixel, ps, s->ps_float, PS_FLOATS, s->ps_bool);
+  } else {
+    shader_constants(pixel, ps, s->ps_float, PS_FLOATS, s->ps_bool);
+    /* (a pixel shader 1.x's bump registers: each stage's bump environment matrix, then its luminance scale and offset) */
+    for (UINT stage = 0; stage < ps->bump_stages && stage < STAGES; ++stage) {
+      float *m = pixel + (ps->bump + 2 * stage) * 4;
+      memcpy(&m[0], &s->stage[stage][D3DTSS_BUMPENVMAT00], 4);
+      memcpy(&m[1], &s->stage[stage][D3DTSS_BUMPENVMAT01], 4);
+      memcpy(&m[2], &s->stage[stage][D3DTSS_BUMPENVMAT10], 4);
+      memcpy(&m[3], &s->stage[stage][D3DTSS_BUMPENVMAT11], 4);
+      memcpy(&m[4], &s->stage[stage][D3DTSS_BUMPENVLSCALE], 4);
+      memcpy(&m[5], &s->stage[stage][D3DTSS_BUMPENVLOFFSET], 4);
+    }
+  }
   shader_state(pixel + ps->state * 4, s, ps->major < 3, TRUE, fog_by_w(s));
   /* (what each sampler's texture has not of the channels Direct3D 9 reads as 1: sm_to_dxbc.h's fill registers) */
   for (UINT i = 0; i < ps->sampler_count; ++i) format_fill(stage_texture(d, ps, i)->format, pixel + (ps->fill + i) * 4);
@@ -815,6 +836,7 @@ static void record_pending_clears(Dev *d) {
   for (UINT i = 0; i < d->clear_count; ++i) {
     const PendingClear *p = &d->clears[i];
     ID3D12GraphicsCommandList_ClearDepthStencilView(d->list, p->depth->view, (D3D12_CLEAR_FLAGS)p->flags, p->z, p->stencil, 0, NULL);
+    p->depth->used = d->epoch;      /* (the list uses it now: a release, or a CPU write, waits for the list) */
     d->recorded = 1;
   }
 }

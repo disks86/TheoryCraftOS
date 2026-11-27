@@ -78,6 +78,8 @@ struct Textures final : graphics::ITextureSet {
 // What a pixel is given.
 struct Inputs {
   Colour diffuse, specular, factor, constant[FFS_STAGES], coordinate[FFS_STAGES];
+  Colour bump[FFS_STAGES];          // each stage's bump environment matrix (M00, M01, M10, M11)
+  Colour luminance[FFS_STAGES];     // ... and its luminance scale and offset
 };
 
 float clamp01(float x) { return x < 0.0f ? 0.0f : x > 1.0f ? 1.0f : x; }
@@ -149,8 +151,23 @@ Colour reference(const FfsKey& key, const Inputs& in) {
     const FfsStage& s = key.stage[n];
     r.stage = n;
     const Colour& at = in.coordinate[n];
-    r.texel = texel_of(n, at.v[0] / at.v[3], at.v[1] / at.v[3]);
-    const Colour colour = r.half(s.colour_op, s.colour_arg, false), alpha = r.half(s.alpha_op, s.alpha_arg, true);
+    float u = at.v[0] / at.v[3], v = at.v[1] / at.v[3];
+    // after a bump environment stage: the coordinates moved by its matrix times its texel's du, dv (and with the luminance one, the texel scaled)
+    const bool moved = n > 0 && key.stage[n - 1].bump;
+    const Colour bump = r.texel;
+    if (moved) {
+      const Colour& m = in.bump[n - 1];
+      u += m.v[0] * bump.v[0] + m.v[2] * bump.v[1];
+      v += m.v[1] * bump.v[0] + m.v[3] * bump.v[1];
+    }
+    r.texel = texel_of(n, u, v);
+    if (moved && key.stage[n - 1].bump == 2) {
+      const float l = clamp01(bump.v[2] * in.luminance[n - 1].v[0] + in.luminance[n - 1].v[1]);
+      for (float& x : r.texel.v) x *= l;
+    }
+    Colour colour = r.half(s.colour_op, s.colour_arg, false);
+    if (s.bump) colour = r.current;      // (the colour such a stage passes on is the current one)
+    const Colour alpha = r.half(s.alpha_op, s.alpha_arg, true);
     const Colour result = {{clamp01(colour.v[0]), clamp01(colour.v[1]), clamp01(colour.v[2]), clamp01(alpha.v[3])}};
     (s.to_temp ? r.temp : r.current) = result;
   }
@@ -184,7 +201,11 @@ Colour run(const Program& p, const Inputs& in) {
   // fewer floats has its state and fill registers where the later constants would be, so those must not be written there.
   float floats[FFS_CONSTANTS][4] = {};
   memcpy(floats[0], in.factor.v, 16);
-  for (unsigned n = 0; n < FFS_STAGES; ++n) memcpy(floats[2 + n], in.constant[n].v, 16);
+  for (unsigned n = 0; n < FFS_STAGES; ++n) {
+    memcpy(floats[2 + n], in.constant[n].v, 16);
+    memcpy(floats[FFS_BUMP_MATRIX + n], in.bump[n].v, 16);
+    memcpy(floats[FFS_BUMP_LUMINANCE + n], in.luminance[n].v, 16);
+  }
   memcpy(constants, floats, (p.float_registers < FFS_CONSTANTS ? p.float_registers : FFS_CONSTANTS) * 16u);
   float state[SM_STATE_REGISTERS][4];
   sm_state_none(state);
@@ -212,6 +233,8 @@ Inputs inputs() {
   for (float& x : in.factor.v) x = unit();
   for (Colour& c : in.constant) for (float& x : c.v) x = unit();
   for (Colour& c : in.coordinate) c = {{unit() * 2.0f - 0.5f, unit() * 2.0f - 0.5f, 0.0f, (next() & 1) ? 1.0f : 0.5f + unit() * 2.0f}};
+  for (Colour& c : in.bump) for (float& x : c.v) x = unit() - 0.5f;
+  for (Colour& c : in.luminance) c = {{unit() * 3.0f, unit() - 0.5f, 0.0f, 0.0f}};
   return in;
 }
 bool same(const Colour& a, const Colour& b) {
@@ -293,8 +316,11 @@ void test_written(HostAllocator& allocator) {
       set_stage(&key, 2, FFS_ADD, FFS_CURRENT, FFS_SPECULAR, op, first | (first & 2 ? FFS_COMPLEMENT : 0), FFS_TEXTURE);
       key.stage[2].alpha_arg[0] = FFS_CONSTANT;
       ffs_normalize(&key, 0x7);
-      const bool passes_on = op == FFS_PREMODULATE || op == FFS_BUMPENVMAP || op == FFS_BUMPENVMAPLUMINANCE;
+      // (D3DTOP_PREMODULATE is the first argument; the bump environment operations stay, for the colour: stage 2 has a texture to move)
+      const bool passes_on = op == FFS_PREMODULATE;
       CHECK(key.stages == 3 && (passes_on ? key.stage[1].colour_op == FFS_SELECTARG1 : key.stage[1].colour_op == op));
+      CHECK(key.stage[1].bump == (op == FFS_BUMPENVMAP ? 1 : op == FFS_BUMPENVMAPLUMINANCE ? 2 : 0) && key.stage[1].sample);
+      CHECK(key.stage[2].bump == 0 && (op != FFS_BUMPENVMAP && op != FFS_BUMPENVMAPLUMINANCE ? true : key.stage[2].alpha_op == FFS_SELECTARG1));
       const bool ok = agrees(allocator, key);
       if (!ok) printf("  operation %u, argument %u\n", op, first);
       CHECK(ok);
@@ -321,6 +347,59 @@ void test_written(HostAllocator& allocator) {
     ffs_normalize(&key, 0);
     const Inputs in = inputs();
     CHECK(make(allocator, key, &p) && same(run(p, in), {{in.diffuse.v[0], in.diffuse.v[1], in.diffuse.v[2], 1.0f}}));
+  }
+}
+
+// The bump environment operations: stage n moves stage n + 1's coordinates (and with the luminance one scales its texel), whatever stage n + 1 does
+// with them; a bump stage that is last, or has no texture, passes on what it is given and moves nothing.
+void test_bump(HostAllocator& allocator) {
+  for (unsigned op = FFS_BUMPENVMAP; op <= FFS_BUMPENVMAPLUMINANCE; ++op) {
+    FfsKey key = initial();
+    set_stage(&key, 0, op, FFS_TEXTURE, FFS_CURRENT, FFS_SELECTARG1, FFS_DIFFUSE, 0);
+    set_stage(&key, 1, FFS_SELECTARG1, FFS_TEXTURE, FFS_CURRENT, FFS_SELECTARG1, FFS_TEXTURE, 0);
+    ffs_normalize(&key, 0x3);
+    Program p;
+    CHECK(key.stages == 2 && key.stage[0].bump == op - FFS_BUMPENVMAP + 1 && key.stage[0].sample && make(allocator, key, &p) && p.samplers == 0x3);
+    CHECK(agrees(allocator, key, 16));
+    // two in a row: stage 1 is moved by stage 0 and moves stage 2
+    set_stage(&key, 1, op, FFS_TEXTURE, FFS_CURRENT, FFS_MODULATE, FFS_TEXTURE, FFS_DIFFUSE);
+    set_stage(&key, 2, FFS_ADD, FFS_TEXTURE, FFS_CURRENT, FFS_SELECTARG1, FFS_CURRENT, 0);
+    key.stage[3].colour_op = FFS_DISABLE;
+    ffs_normalize(&key, 0x7);
+    CHECK(key.stages == 3 && key.stage[1].bump && agrees(allocator, key, 16));
+    // the last stage, or one with no texture: it passes on the current colour
+    FfsKey last = initial();
+    set_stage(&last, 0, FFS_MODULATE, FFS_TEXTURE, FFS_DIFFUSE, FFS_SELECTARG1, FFS_TEXTURE, 0);
+    set_stage(&last, 1, op, FFS_TEXTURE, FFS_CURRENT, FFS_SELECTARG1, FFS_CURRENT, 0);
+    ffs_normalize(&last, 0x3);
+    CHECK(last.stages == 2 && !last.stage[1].bump && last.stage[1].colour_op == FFS_SELECTARG1 && last.stage[1].colour_arg[1] == FFS_CURRENT && agrees(allocator, last));
+    FfsKey bare = initial();
+    set_stage(&bare, 0, op, FFS_TEXTURE, FFS_CURRENT, FFS_SELECTARG1, FFS_DIFFUSE, 0);
+    set_stage(&bare, 1, FFS_SELECTARG1, FFS_TEXTURE, FFS_CURRENT, FFS_SELECTARG1, FFS_TEXTURE, 0);
+    ffs_normalize(&bare, 0x2);
+    CHECK(bare.stages == 2 && !bare.stage[0].bump && !bare.stage[0].sample && agrees(allocator, bare));
+    // a bump operation as the alpha's is no operation: the alpha passes on
+    FfsKey alpha = initial();
+    set_stage(&alpha, 0, FFS_SELECTARG1, FFS_TEXTURE, 0, op, FFS_TEXTURE, 0);
+    set_stage(&alpha, 1, FFS_SELECTARG1, FFS_TEXTURE, 0, FFS_SELECTARG1, FFS_TEXTURE, 0);
+    ffs_normalize(&alpha, 0x3);
+    CHECK(!alpha.stage[0].bump && alpha.stage[0].alpha_op == FFS_SELECTARG1 && alpha.stage[0].alpha_arg[1] == FFS_CURRENT && agrees(allocator, alpha));
+  }
+  // the luminance factor is clamped: a scale and offset far above 1 leave the texel as it is, below 0 make it black
+  {
+    FfsKey key = initial();
+    set_stage(&key, 0, FFS_BUMPENVMAPLUMINANCE, FFS_TEXTURE, FFS_CURRENT, FFS_SELECTARG1, FFS_DIFFUSE, 0);
+    set_stage(&key, 1, FFS_SELECTARG1, FFS_TEXTURE, FFS_CURRENT, FFS_SELECTARG1, FFS_TEXTURE, 0);
+    ffs_normalize(&key, 0x3);
+    Program p;
+    CHECK(make(allocator, key, &p));
+    for (int k = 0; k < 2; ++k) {
+      Inputs in = inputs();
+      in.bump[0] = {{0, 0, 0, 0}};
+      in.luminance[0] = k ? Colour{{-10.0f, -1.0f, 0, 0}} : Colour{{1000.0f, 10.0f, 0, 0}};
+      const Colour got = run(p, in), t = texel_of(1, in.coordinate[1].v[0] / in.coordinate[1].v[3], in.coordinate[1].v[1] / in.coordinate[1].v[3]);
+      CHECK(same(got, k ? Colour{{0, 0, 0, 0}} : t));
+    }
   }
 }
 
@@ -486,6 +565,7 @@ void test_kill(HostAllocator& allocator) {
 int main() {
   HostAllocator allocator;
   test_written(allocator);
+  test_bump(allocator);
   test_kill(allocator);
   test_key();
   test_random(allocator);

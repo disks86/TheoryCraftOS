@@ -401,11 +401,13 @@ static void test_shaders(void) {
         IDirect3DDevice9_CreatePixelShader(g_device, g_ps_math_ps_3_0, &ps_math30) == D3D_OK && ps_math30 &&
         IDirect3DDevice9_CreatePixelShader(g_device, g_ps_tex_ps_2_0, &ps_tex) == D3D_OK && ps_tex, "CreatePixelShader (ps_2_0, ps_3_0, one that samples)");
   if (!vs || !vs11 || !vs30 || !ps_math || !ps_math30 || !ps_tex) return;
-  static const DWORD bump[] = {0xFFFF0101, 0x00000042, 0xB00F0000, 0x00000043, 0xB00F0001, 0xB0E40000, 0x0000FFFF};      /* ps_1_1: tex t0; texbem t1, t0 */
+  /* ps_1_1: tex t0; texm3x3pad t1, t0; texm3x3pad t2, t0; texm3x3tex t3, t0 (a cube look-up the translator has not) */
+  static const DWORD bump[] = {0xFFFF0101, 0x00000042, 0xB00F0000, 0x00000049, 0xB00F0001, 0xB0E40000, 0x00000049, 0xB00F0002, 0xB0E40000, 0x0000004A, 0xB00F0003, 0xB0E40000,
+                               0x0000FFFF};
   check(FAILED(IDirect3DDevice9_CreateVertexShader(g_device, g_ps_math_ps_2_0, &wrong_vs)) && wrong_vs == NULL &&
         FAILED(IDirect3DDevice9_CreatePixelShader(g_device, g_vs_basic_vs_2_0, &wrong_ps)) && wrong_ps == NULL &&
         FAILED(IDirect3DDevice9_CreatePixelShader(g_device, bump, &wrong_ps)) && FAILED(IDirect3DDevice9_CreateVertexShader(g_device, NULL, &wrong_vs)),
-        "a shader of the other stage, one with an instruction that is not there (texbem) and no shader at all are refused");
+        "a shader of the other stage, one with an instruction that is not there (texm3x3tex) and no shader at all are refused");
   DWORD code[256];
   UINT size = 0;
   IDirect3DDevice9 *owner = NULL;

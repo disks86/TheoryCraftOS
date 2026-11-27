@@ -111,7 +111,7 @@ layout are Direct3D 7's). The logic without COM objects is `d3d_legacy.h` ([Dire
 | part | how |
 |---|---|
 | Direct3D 9 device | one per DirectDraw object (`dd->d3d`), made on first use on a hidden window of its own, windowed, an 8x8 back buffer that is never shown, software vertex processing, FPU preserved. Every Direct3D device of the object draws through it: the device whose states it has is `active`; another one puts all of its states back (`all_dirty`) before it draws. |
-| surfaces | the DirectDraw memory stays what counts. A surface Direct3D draws into or samples gets a Direct3D 9 copy, `D3dRes`, in `s->store.shadow.resource` (Flip moves it with the memory): a render target X8R8G8B8 / A8R8G8B8 (whatever the DirectDraw format: converted both ways, 5-6-5 and 5-5-5 with fast paths) with a system-memory twin for GetRenderTargetData / UpdateSurface; a depth buffer D32F_LOCKABLE (D24S8 when the format has stencil bits); a texture A8R8G8B8 / X8R8G8B8 of the managed pool with every level or cube face; a texture with DDSCAPS_3DDEVICE is a render target texture. A CPU write (`cpu_wrote`) of a target or depth buffer is sent at once - a rectangle of one value as a Clear, the rest through UpdateSurface or a lock of the lockable depth -; a texture is sent at its next use (each level's DD_SHADOW_CPU_NEWER). A draw marks the target (and a written depth buffer) DD_SHADOW_GPU_NEWER and `pull` reads it back only when the CPU touches it (Lock, GetDC, Blt, the primary on the screen). |
+| surfaces | the DirectDraw memory stays what counts. A surface Direct3D draws into or samples gets a Direct3D 9 copy, `D3dRes`, in `s->store.shadow.resource` (Flip moves it with the memory): a render target X8R8G8B8 / A8R8G8B8 (whatever the DirectDraw format: converted both ways, 5-6-5 and 5-5-5 with fast paths) with a system-memory twin for GetRenderTargetData / UpdateSurface; a depth buffer D32F_LOCKABLE (D24S8 when the format has stencil bits, made lockable with d3d9.dll's own usage `TCOS_USAGE_LOCKABLE_DEPTH` through `CreateDepthStencilSurfaceEx`: depth codes in its low 24 bits, the stencil above, converted to the DirectDraw format's masks both ways); a texture A8R8G8B8 / X8R8G8B8 of the managed pool with every level or cube face; a texture with DDSCAPS_3DDEVICE is a render target texture. A CPU write (`cpu_wrote`) of a target or depth buffer is sent at once - a rectangle of one value as a Clear, the rest through UpdateSurface or a lock of the lockable depth -; a texture is sent at its next use (each level's DD_SHADOW_CPU_NEWER). A draw marks the target (and a written depth buffer) DD_SHADOW_GPU_NEWER and `pull` reads it back only when the CPU touches it (Lock, GetDC, Blt, the primary on the screen). |
 | textures | every DirectDraw format is converted on the CPU (`dd_to_argb`: palettes, DXT, YUV, luminance). Colour keying (D3DRENDERSTATE_COLORKEYENABLE with a DDSD_CKSRCBLT texture): the key is compared with the texel's colour and alpha bits (Windows does: Wine's test_ck_rgba); keyed texels become alpha 0, the others at least 1/255 (a keyed texture of a format without alpha still counts as one without, so MODULATE takes the vertex's alpha: test_texturemapblend), and d3d9's `TCOS_TSS_KEY_KILL` on the stage discards alpha-0 texels whatever the stages then make of the alpha (MODULATEALPHA with a diffuse alpha of 0 still shows the unkeyed texels: test_colorkey_precision). A palette change, SetColorKey, Load and the CPU's writes make the copy again; SetLOD is the managed texture's LOD. |
 | Direct3D 7 | draws with Direct3D 9's fixed function: render states through `dl_render_state`, texture stage states (the render states of stage 0's sampler are stage 0's states, as they share them), transforms, materials, clip planes, lights (the first eight enabled lights by index are Direct3D 9's lights 0-7), vertex declarations from the FVF code (`dl_fvf_elements`: D3DFVF_RESERVED1 is not d3d9's PSIZE). The clip status is worked out on the CPU from the positions. ProcessVertices is the CPU's (`dl_process_fvf` with Direct3D 7 lighting; the specular alpha is that of the specular colour's source, and a singular world matrix lights no normal - Windows' answer there, while its draws use the matrix itself). Direct3D 3's ProcessVertices gives lit vertices a specular alpha of 0. DXTn surfaces must be whole 4 x 4 blocks (DDERR_INVALIDPARAMS otherwise). |
 | Direct3D 1-3 | untransformed vertices are transformed with the current viewport's clip space, lit with its lights (lights of no colour are skipped: they add nothing and would take places - test_specular_lighting adds 64 of them) (the legacy model, D3DLIGHT/D3DLIGHT2) and the material of D3DLIGHTSTATE_MATERIAL, clipped (Sutherland-Hodgman, `dl_clip_polygon`) and drawn as transformed vertices; transformed vertices go to Direct3D 9 as they are - with the z test off, a copy with z clamped to [0, 1] when one is outside (Windows does not clip them by depth then: test_zenable). TEXTUREMAPBLEND drives stage 0 (`dl_texture_map_blend`, MODULATE taking the texture's alpha only if it has one) until a texture stage state changes. |
@@ -123,10 +123,10 @@ layout are Direct3D 7's). The logic without COM objects is `d3d_legacy.h` ([Dire
 
 What is not there, and why:
 
-- Bump mapping (D3DTOP_BUMPENVMAP*) and bump formats as textures: Direct3D 9's fixed function here has no bump environment mapping (docs/Direct3D9.md);
-  bump textures are sent black.
-- A depth buffer with stencil bits (D24S8, D15S1, D24X4S4) is D24S8 in Direct3D 9, which no lock reads: what Direct3D drew into it is not read back by
-  Lock, and a CPU write that is not one depth value is sent as a Clear with its first value. Depth buffers without stencil are read back and written.
+- Bump maps (V8U8, L6V5U5, X8L8V8U8, Q8W8V8U8, V16U16) go to d3d9.dll as its signed formats, their pixels as they are; D3DTOP_BUMPENVMAP and
+  BUMPENVMAPLUMINANCE are d3d9.dll's fixed function's (docs/Direct3D9.md).
+- A D3DVIEWPORT7 whose depth range is less than 0.001 (dvMinZ and dvMaxZ left 0, or turned round) goes to Direct3D 9 as 0.001 from dvMinZ on, as
+  Windows draws it (Wine's `test_viewport`).
 - Ramp (palette) devices draw in RGB, as DirectX 6 and later do; line patterns, stippling, ROP2 and plane masks are kept as states and not drawn (the
   caps do not claim them).
 - IDirect3DExecuteBuffer::Validate and Optimize, IDirect3DMaterial::Reserve/Unreserve, IDirect3DViewport::LightElements: DDERR_UNSUPPORTED, which is what
@@ -134,10 +134,9 @@ What is not there, and why:
 - GetInfo: S_FALSE, the retail runtime's answer (statistics are a debug runtime's).
 - A device draws on the CPU path for 1-3 and the fixed function for 7, so two devices of different versions on one object switch all states each time
   they alternate (correct, slower).
-- Found by Wine's tests and not fixed yet (numbers in `tests/windows/wine/README.md`): ProcessVertices of Direct3D 7 with a specular power of 0, 16-bit
-  depth read back about 54 / 65535 off, targets of one or two pixels in `test_filling_convention`, a right edge that ends on a pixel centre at x 100 in
-  `test_viewport` (the column is drawn), stretched blits of DXT surfaces (E_NOTIMPL), the HEL caps in `test_enum_devices`. `test_colorkey_precision` is
-  correct as far as it gets but runs past the 40 s limit of the split runs on the CPU renderer.
+- Found by Wine's tests and not fixed yet (numbers in `tests/windows/wine/README.md`): ProcessVertices of Direct3D 7 with a specular power of 0, stretched blits of DXT surfaces (E_NOTIMPL), the HEL caps in `test_enum_devices`. `test_colorkey_precision` is
+  correct as far as it gets but runs past the 40 s limit of the split runs on the CPU renderer: each of its 368 draws covers the 640 x 480 target, 0.5 - 0.7 s
+  on the kernel's shader interpreter (the read-back is 3 ms), so only a faster CPU renderer would help.
 
 ## Not done, and why
 
@@ -158,8 +157,8 @@ What is not there, and why:
 - Wine's tests (`tests/windows/wine/ddraw`): `scripts/winetest.sh ddraw` from a short path (a symlink to the checkout, QEMU's socket path); results in
   `tests/windows/wine/README.md`. A test that hangs stops the rest of its program: run one test function per process with a split copy whose
   START_TEST runs only the function `DDRAW_ONLY` names (generated, not committed) and `WINETEST_QUIET=200 WINETEST_ENV=WINERUN_TIMEOUT_MS=40000`.
-- Numbers (2026-11-26, 64-bit, CPU renderer, DirectDraw and Direct3D): 415 test functions, 316 pass; failed checks ddraw1 47, ddraw2 55, ddraw4 163,
-  ddraw7 428 (per test in `tests/windows/wine/README.md`). `test_map_synchronisation` is left out of the split runs (its draw sizes come from how fast the
+- Numbers (2026-11-26 after the d3d9 gap pass, 64-bit, CPU renderer, DirectDraw and Direct3D): failed checks ddraw1 47, ddraw2 51, ddraw4 87,
+  ddraw7 205 (before it 47, 55, 163, 428) (per test in `tests/windows/wine/README.md`). `test_map_synchronisation` is left out of the split runs (its draw sizes come from how fast the
   first draw was: minutes on the CPU renderer). `tests/windows/ddrawtest.c` 101 checks and `tests/windows/d3dimtest.c` 89 pass on both widths and on virgl.
 - `tests/windows/d3dimtest.c`: Direct3D 1, 2, 3 and 7 - devices, Clear, draws read back, z buffers, colour-keyed textures, lights, state blocks, vertex
   buffers, a 640x480 target with a 24-bit z buffer, a 3D flipping chain, execute buffers, clipping. `GPU=std tests/d3d12_qemu.sh d3dimtest`, the same

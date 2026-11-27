@@ -26,12 +26,17 @@ struct VertexOut {
 VertexOut main(VertexIn i) {
   VertexOut o;
   float4 transformed = mul(float4(i.position.xyz, 1), transform);
+  // (moved by half a pixel to the right and down, times its w: Direct3D 9 has the pixels' centres where the viewport's transform puts whole numbers,
+  // the rasterizer here at halves - as a program's vertex shader is moved, sm_to_dxbc.h)
+  transformed.xy += float2(0.5 * screen.x, -0.5 * screen.y) * transformed.w;
   // A pixel position: Direct3D 9 has the pixels' centres at whole numbers, the rasterizer here at halves.
   float4 pixels = float4((i.position.x - offset.x + 0.5) * screen.x - 1, 1 - (i.position.y - offset.y + 0.5) * screen.y, i.position.z, 1);
   // ... and its fourth number is 1 / w: the position goes on as one that w divides, so that what is between the vertices is as the perspective
   // has it and the pixel stage has the w for its fog. (A fourth number that is no such thing - 0, or below - counts as 1.)
-  float w = 1 / lerp(1, i.position.w, step(1e-30, i.position.w));
-  o.position = lerp(transformed, pixels * w, screen.z);
+  float w = 1 / (i.position.w >= 1e-30 ? i.position.w : 1);
+  // (chosen, not mixed: a lerp of the two with a weight of 1 is the pixel position plus a rounding error of the size of the other - a hundredth of a
+  // pixel, which moves an edge that ends on a pixel's centre to the other side of it)
+  o.position = screen.z != 0 ? pixels * w : transformed;
   o.colour = i.colour;
   o.specular = float4(i.extra.yzw, 0);
   o.texture0 = i.texture0;      // (u, v and in w what the pixel shader divides them by: d3d9.c has been through the texture matrices)

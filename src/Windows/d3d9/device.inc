@@ -98,12 +98,13 @@ static void caps_fill(D3DCAPS9 *caps) {
   caps->GuardBandRight = caps->GuardBandBottom = 32768.0f;
   caps->StencilCaps = 0xFF | D3DSTENCILCAPS_TWOSIDED;
   caps->FVFCaps = TEXTURE_SETS | D3DFVFCAPS_PSIZE;      /* (the sets of texture coordinates a vertex can have) */
-  /* (every operation of the texture stages but the bump environment ones and D3DTOP_PREMODULATE: ff_stages.h) */
+  /* (every operation of the texture stages but D3DTOP_PREMODULATE: ff_stages.h) */
   caps->TextureOpCaps = D3DTEXOPCAPS_DISABLE | D3DTEXOPCAPS_SELECTARG1 | D3DTEXOPCAPS_SELECTARG2 | D3DTEXOPCAPS_MODULATE | D3DTEXOPCAPS_MODULATE2X | D3DTEXOPCAPS_MODULATE4X |
                         D3DTEXOPCAPS_ADD | D3DTEXOPCAPS_ADDSIGNED | D3DTEXOPCAPS_ADDSIGNED2X | D3DTEXOPCAPS_SUBTRACT | D3DTEXOPCAPS_ADDSMOOTH | D3DTEXOPCAPS_BLENDDIFFUSEALPHA |
                         D3DTEXOPCAPS_BLENDTEXTUREALPHA | D3DTEXOPCAPS_BLENDFACTORALPHA | D3DTEXOPCAPS_BLENDTEXTUREALPHAPM | D3DTEXOPCAPS_BLENDCURRENTALPHA |
                         D3DTEXOPCAPS_MODULATEALPHA_ADDCOLOR | D3DTEXOPCAPS_MODULATECOLOR_ADDALPHA | D3DTEXOPCAPS_MODULATEINVALPHA_ADDCOLOR |
-                        D3DTEXOPCAPS_MODULATEINVCOLOR_ADDALPHA | D3DTEXOPCAPS_DOTPRODUCT3 | D3DTEXOPCAPS_MULTIPLYADD | D3DTEXOPCAPS_LERP;
+                        D3DTEXOPCAPS_MODULATEINVCOLOR_ADDALPHA | D3DTEXOPCAPS_DOTPRODUCT3 | D3DTEXOPCAPS_MULTIPLYADD | D3DTEXOPCAPS_LERP | D3DTEXOPCAPS_BUMPENVMAP |
+                        D3DTEXOPCAPS_BUMPENVMAPLUMINANCE;
   caps->MaxTextureBlendStages = STAGES;
   caps->MaxSimultaneousTextures = STAGES;
   caps->MaxUserClipPlanes = 0;
@@ -201,12 +202,13 @@ static HRESULT STDMETHODCALLTYPE dev_GetCreationParameters(Dev *d, D3DDEVICE_CRE
   *parameters = d->creation;
   return D3D_OK;
 }
-/* ValidateDevice: one pass, unless a stage has an operation the device has not (D3DTOP_BUMPENVMAP, BUMPENVMAPLUMINANCE, PREMODULATE) or an argument that is none. */
+/* ValidateDevice: one pass, unless a stage has an operation the device has not (D3DTOP_PREMODULATE; the bump environment ones as alpha operations, which
+ * Direct3D 9 has only for the colour) or an argument that is none. */
 static HRESULT STDMETHODCALLTYPE dev_ValidateDevice(Dev *d, DWORD *passes) {
   for (UINT i = 0; i < STAGES; ++i) {
     const DWORD *t = d->state.stage[i];
     if (t[D3DTSS_COLOROP] == D3DTOP_DISABLE) break;
-    if (t[D3DTSS_COLOROP] == D3DTOP_BUMPENVMAP || t[D3DTSS_COLOROP] == D3DTOP_BUMPENVMAPLUMINANCE || t[D3DTSS_COLOROP] == D3DTOP_PREMODULATE || t[D3DTSS_COLOROP] > D3DTOP_LERP)
+    if (t[D3DTSS_COLOROP] == D3DTOP_PREMODULATE || t[D3DTSS_COLOROP] > D3DTOP_LERP)
       return D3DERR_UNSUPPORTEDCOLOROPERATION;
     if (t[D3DTSS_ALPHAOP] == D3DTOP_BUMPENVMAP || t[D3DTSS_ALPHAOP] == D3DTOP_BUMPENVMAPLUMINANCE || t[D3DTSS_ALPHAOP] == D3DTOP_PREMODULATE || t[D3DTSS_ALPHAOP] > D3DTOP_LERP)
       return D3DERR_UNSUPPORTEDALPHAOPERATION;
@@ -631,7 +633,10 @@ static HRESULT STDMETHODCALLTYPE d3d_CheckDeviceFormat(Direct3D *o, UINT adapter
   if (depth && !(usage & D3DUSAGE_DEPTHSTENCIL) && resource != D3DRTYPE_SURFACE) return D3DERR_NOTAVAILABLE;
   if (block && (volume || (usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)))) return D3DERR_NOTAVAILABLE;
   if (format_is_palette(format) && (usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL | D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING))) return D3DERR_NOTAVAILABLE;
-  if (usage & (D3DUSAGE_DMAP | D3DUSAGE_QUERY_LEGACYBUMPMAP | D3DUSAGE_QUERY_SRGBREAD | D3DUSAGE_QUERY_SRGBWRITE | D3DUSAGE_QUERY_VERTEXTEXTURE)) return D3DERR_NOTAVAILABLE;
+  /* (the signed formats are textures: no targets, depth or vertex textures; they are the bump maps of the fixed function's bump environment operations) */
+  if (format_is_signed(format) && (usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL | D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING))) return D3DERR_NOTAVAILABLE;
+  if ((usage & D3DUSAGE_QUERY_LEGACYBUMPMAP) && !format_is_signed(format)) return D3DERR_NOTAVAILABLE;
+  if (usage & (D3DUSAGE_DMAP | D3DUSAGE_QUERY_SRGBREAD | D3DUSAGE_QUERY_SRGBWRITE | D3DUSAGE_QUERY_VERTEXTEXTURE)) return D3DERR_NOTAVAILABLE;
   if ((usage & D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING) && !format_is_target(format)) return D3DERR_NOTAVAILABLE;
   /* (the levels of a 2D texture of a format that can be drawn into are made from its top level, as Windows' drivers make them by drawing; of the others the texture
    * is made, with no levels made) */
@@ -657,7 +662,7 @@ static HRESULT STDMETHODCALLTYPE d3d_CheckDepthStencilMatch(Direct3D *o, UINT ad
 static HRESULT STDMETHODCALLTYPE d3d_CheckDeviceFormatConversion(Direct3D *o, UINT adapter, D3DDEVTYPE type, D3DFORMAT from, D3DFORMAT to) {
   (void)o; (void)type;
   if (adapter != 0) return D3DERR_INVALIDCALL;
-  return format_bytes(from) && !format_is_palette(from) && format_is_target(to) ? D3D_OK : D3DERR_NOTAVAILABLE;
+  return format_bytes(from) && !format_is_palette(from) && !format_is_signed(from) && format_is_target(to) ? D3D_OK : D3DERR_NOTAVAILABLE;
 }
 static HRESULT STDMETHODCALLTYPE d3d_GetDeviceCaps(Direct3D *o, UINT adapter, D3DDEVTYPE type, D3DCAPS9 *caps) {
   (void)o;

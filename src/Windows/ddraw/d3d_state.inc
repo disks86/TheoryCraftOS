@@ -533,6 +533,9 @@ static HRESULT d3_flush(D3dDevice *dev) {
     if (vp.Width > tw - vp.X) vp.Width = tw - vp.X;
     if (vp.Height > th - vp.Y) vp.Height = th - vp.Y;
     if (dev->version < 7) { vp.MinZ = 0.0f; vp.MaxZ = 1.0f; }
+    /* (a depth range of less than 0.001 - the D3DVIEWPORT7 a program fills in without dvMinZ and dvMaxZ, both 0, or one turned round - is 0.001 from dvMinZ
+     * on: Windows draws a quad at z 1 of the viewport (0, 0) at depth 0.001 and of (0.5, 0) at 0.501, Wine's test_viewport) */
+    if (!(vp.MaxZ >= vp.MinZ + 0.001f)) vp.MaxZ = vp.MinZ + 0.001f;
     D3D_CALL(d9, SetViewport, &vp);
     dev->dirty.viewport = FALSE;
   }
