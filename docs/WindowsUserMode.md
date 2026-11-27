@@ -168,6 +168,55 @@ it is seen (`ModuleSet::library_name`, `own_runtimes_`). A name folded once stay
 forwarders), and a runtime the program first loads by `LoadLibrary` without having imported it (that one is folded). Test: `ModuleLoaderTest`
 (`test_own_runtimes`).
 
+### Libraries of the same name
+
+A library is known by the **file** it was loaded from (`Module::file`, the OS path, compared without case), as on Windows, not by its name alone:
+
+- **A bare name** (an import, `LoadLibrary("d3d9.dll")`, `GetModuleHandle("d3d9.dll")`, `LdrLoadDll` with a search path) is the first loaded library of
+  that base name if there is one - before any folder is looked in -, else the search: the program's folders (and its manifest's private assemblies), then
+  System32 (SysWOW64 for a 32-bit program). `ModuleSet::find`, ntdll's `ldr_find_name`, kernel32's `module_by_name`; `LoadLibraryExW` matches loaded
+  libraries itself before `find_file`.
+- **A path** (`LoadLibrary("C:\\Windows\\System32\\d3d9.dll")`) is the library loaded from that file if there is one (`ModuleSet::find_file`,
+  `reference_library_file`), else that file is loaded as **a library of its own, even when another of that name is loaded**. So a ReShade- or ENB-style
+  proxy `d3d9.dll` / `dxgi.dll` in a program's folder that loads the System32 copy by `GetSystemDirectory` + its name gets the real one, not itself.
+  `GetModuleHandle(path)` is only the library of that file (no fall-back to the name); `GetModuleFileName` is the file's real path - for the libraries a
+  run-time load brings along too (the kernel's record says each one's folder: `LoadRecord.directory`, 592-byte records since 2026-11-26).
+- Uses are counted by library, not by name: `LdrAddRefDll`, `GetModuleHandleEx` and `LdrGetDllHandleEx` add a use of the library at an address
+  (`NtLoadModule` flag 8), and a library's imports keep the uses of the libraries they were bound to (`Module::import_deps`), so a later library of the
+  same name cannot take them.
+- A **forwarder** ("d3d11.OpenAdapter10") is resolved by base name through the same rules as an import of the forwarding library (kernel:
+  `resolve_export`; ntdll: `ldr_export`).
+
+**Internal layers.** Several of this OS's Direct3D libraries are built on each other where Windows' are not (Windows' are each a runtime of their own over
+the driver). A program that brings its own copy of a lower one - DXVK's `d3d9.dll`/`d3d11.dll`, vkd3d-proton's `d3d12.dll` - must not change what the
+upper ones of System32 run on: on Windows a `d3d9.dll` beside the program never affects `ddraw.dll` or `d3d8.dll`, and our libraries use private exports
+(`TcosD3D12*`, `TcosD3D10CoreCreateDevice`, `TcosD3D10_1CreateEffect*`) and private interfaces that a foreign library does not have (an import it lacks
+would be a trap stub). The pairs are in `src/Windows/tcos_dll_layering.h`, shared by the kernel's loader and ntdll:
+
+| importer | imported | why it is ours, not Windows' |
+| --- | --- | --- |
+| d3d8.dll | d3d9.dll | Direct3D 8 is wrappers over d3d9.dll's interfaces |
+| ddraw.dll | d3d9.dll | Direct3D 1-7 draw through a Direct3D 9 device (loaded at run time by its System32 path: docs/DirectDraw.md) |
+| d3d9.dll | d3d12.dll | Direct3D 9 is a layer on d3d12.dll |
+| d3d11.dll | d3d12.dll | Direct3D 11 is a layer on d3d12.dll |
+| d3d10core.dll | d3d11.dll | D3D10CoreCreateDevice and OpenAdapter10(_2) are d3d11.dll's |
+| d3d10_1.dll | d3d10.dll | the shared functions are `.def` forwarders to d3d10.dll, two of them private |
+| d3d10_1.dll | d3d10core.dll | Windows' d3d10_1.dll uses d3d10_1core.dll |
+
+When the importer is the System32 (or SysWOW64) copy, an import or forwarder of such a pair is the System32 file of the imported library: the one loaded
+from there if there is one, else a new instance of that file (`LibrarySearch::SystemOnly`), never a library of that name from the program's folder or one
+the program loaded from elsewhere. A library loaded only so is a **private layer** (`Module::private_layer`, `TCOS_LDRP_PRIVATE_LAYER` 0x08000000 in its
+loader entry's Flags): it is in the module lists but is not found by its base name (Windows has no such library in the process), so the program's
+`LoadLibrary("d3d9.dll")` still searches its own folder. Loading its file by path makes it an ordinary library. Everything else keeps Windows' rules:
+`d3d11.dll`'s and `d3d10.dll`'s `dxgi.dll`, `d3d10.dll`'s `d3d10core.dll` (DXVK's `d3d10core.dll` beside a program is meant to be used by the system's
+`d3d10.dll`), `d3dcompiler_47.dll`, `d3d10ref.dll`. A `d3d8.dll` the program brought (d3d8to9) is not the System32 copy, so its `d3d9.dll` import follows
+the normal rules too.
+
+Not done: a library loaded at run time by an internal layer through `LoadLibrary` by path (ddraw's `d3d9.dll`) is an ordinary library, so a program that
+loads a `d3d9.dll` of its own folder *after* ddraw drew gets the System32 one by base name (Windows would load the program's); a program that loads its own
+first, or imports it, is not affected. Tests: `ModuleLoaderTest` (`test_same_name_libraries`), `tests/bundled_dlls_qemu.sh` (both widths: foreign
+libraries beside the program, and proxies of d3d9.dll and dxgi.dll).
+
 ## The registry and advapi32.dll
 
 The registry is the kernel's (`src/Process/RegistryTree.cpp`, `WindowsRegistry.cpp`): one tree in memory shared by every program, reached by the NT services `NtCreateKey`,

@@ -454,7 +454,19 @@ static D3dDD *d3_dd(DDraw *dd) {
     dd->d3d = d;
   }
   const WORD cw = fpu_get();
-  d->module = LoadLibraryA("d3d9.dll");
+  /* This OS's d3d9.dll by its System32 path (SysWOW64 for a 32-bit program: the loader's redirection), never a d3d9.dll the program brought or loaded: Windows'
+     ddraw.dll does not use Direct3D 9 at all, so a program's own d3d9.dll (DXVK, a ReShade proxy) must not change what ddraw draws with (docs/WindowsUserMode.md). */
+  {
+    WCHAR path[MAX_PATH + 16];
+    static const WCHAR file[] = {'\\', 'd', '3', 'd', '9', '.', 'd', 'l', 'l', 0};
+    const UINT n = GetSystemDirectoryW(path, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) {
+      for (UINT i = 0; i < sizeof file / sizeof file[0]; ++i) path[n + i] = file[i];
+      d->module = LoadLibraryW(path);
+    } else {
+      d->module = NULL;
+    }
+  }
   PFN_Direct3DCreate9 create = d->module ? (PFN_Direct3DCreate9)(void *)GetProcAddress(d->module, "Direct3DCreate9") : NULL;
   d->d9 = create ? create(D9_SDK_VERSION) : NULL;
   if (d->d9) {

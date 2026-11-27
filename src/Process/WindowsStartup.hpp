@@ -54,6 +54,7 @@ struct WindowsModule {
   bool in_init_order = true;
   uint32_t tls_rva = 0, tls_size = 0;      // its TLS directory (0: none)
   StringView directory;             // the Windows folder of its file ("C:\\Program Files\\App\\"); empty: C:\\Windows\\System32
+  bool private_layer = false;       // an internal layer of a System32 library only (Windows/tcos_dll_layering.h): listed, but not found by its name
 };
 
 struct WindowsStartupInput {

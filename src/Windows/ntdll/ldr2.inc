@@ -33,6 +33,45 @@ static int ldr_strcmp(const char *a, const char *b) {
   return (unsigned char)*a - (unsigned char)*b;
 }
 
+/* Is a forwarder of the library at `base` to the library `forward` (its first `length` characters, no extension) an internal layer of a System32 library
+ * (tcos_dll_layering.h)? Then `out` (260 characters) gets the System32 file of the library it names, as the kernel binds such imports. A library is the copy of
+ * System32 when its file is there (C:\Windows\System32\, which a 32-bit process's libraries of SysWOW64 are listed as, or C:\Windows\SysWOW64\). */
+static BOOLEAN ldr_internal_layer_file(PVOID base, const char *forward, ULONG length, WCHAR *out) {
+  static const char kSystem32[] = "c:\\windows\\system32\\", kSysWow64[] = "c:\\windows\\syswow64\\";
+  loader_lock();
+  const LDR_DATA_TABLE_ENTRY *e = ldr_find_base(base);
+  BOOLEAN system = FALSE;
+  char importer[64];
+  ULONG importer_length = 0;
+  if (e && e->FullDllName.Length / 2 > 20 && e->BaseDllName.Length / 2 < sizeof importer) {
+    const WCHAR *full = e->FullDllName.Buffer;
+    const ULONG full_length = e->FullDllName.Length / 2, base_length = e->BaseDllName.Length / 2;
+    for (int which = 0; which < 2 && !system; ++which) {
+      const char *folder = which ? kSysWow64 : kSystem32;
+      ULONG i = 0;
+      while (folder[i] && i < full_length && (full[i] == '/' ? '\\' : (full[i] >= 'A' && full[i] <= 'Z' ? full[i] + 32 : full[i])) == folder[i]) ++i;
+      system = !folder[i] && i + base_length == full_length;      /* (directly in it) */
+    }
+    for (ULONG i = 0; i < base_length; ++i) importer[importer_length++] = e->BaseDllName.Buffer[i] < 128 ? (char)e->BaseDllName.Buffer[i] : '?';
+  }
+  loader_unlock();
+  if (!system || length > 40) return FALSE;
+  char imported[48];
+  for (ULONG i = 0; i < length; ++i) imported[i] = forward[i];
+  imported[length] = '.'; imported[length + 1] = 'd'; imported[length + 2] = 'l'; imported[length + 3] = 'l';
+  if (!tcos_is_internal_layer(importer, importer_length, imported, length + 4)) return FALSE;
+  ULONG n = 0;
+#ifdef __i386__
+  const char *folder = kSysWow64;      /* (a 32-bit process's system libraries are listed there) */
+#else
+  const char *folder = kSystem32;
+#endif
+  for (; folder[n]; ++n) out[n] = (WCHAR)(n == 0 ? 'C' : folder[n]);
+  for (ULONG i = 0; i < length + 4; ++i) out[n++] = (WCHAR)tcos_layering_lower(imported[i]);
+  out[n] = 0;
+  return TRUE;
+}
+
 /* The export of the image at `base` called `name` (or numbered `ordinal` if there is no name); a forwarder is followed into the library it names, which is loaded. */
 static NTSTATUS ldr_export(PVOID base, const char *name, ULONG ordinal, ULONG depth, PVOID *out) {
   ULONG size = 0;
@@ -79,8 +118,20 @@ static NTSTATUS ldr_export(PVOID base, const char *name, ULONG ordinal, ULONG de
   text.Length = (USHORT)((dot + 4) * 2);
   text.MaximumLength = text.Length + 2;
   PVOID target = NULL;
-  NTSTATUS status = LdrGetDllHandle(NULL, 0, &text, &target);
-  if (!NT_SUCCESS(status)) status = LdrLoadDll(NULL, NULL, &text, &target);
+  NTSTATUS status;
+  WCHAR system_file[260];
+  if (ldr_internal_layer_file(base, forward, dot, system_file)) {      /* an internal layer of a System32 library: the System32 file of that library (tcos_dll_layering.h) */
+    UNICODE_STRING path;
+    path.Buffer = system_file;
+    path.Length = 0;
+    while (system_file[path.Length / 2]) path.Length += 2;
+    path.MaximumLength = path.Length + 2;
+    target = TcosFindModuleByFile(system_file);
+    status = target ? STATUS_SUCCESS : LdrLoadDll(NULL, NULL, &path, &target);
+  } else {
+    status = LdrGetDllHandle(NULL, 0, &text, &target);
+    if (!NT_SUCCESS(status)) status = LdrLoadDll(NULL, NULL, &text, &target);
+  }
   if (!NT_SUCCESS(status)) return status;
   const char *symbol = forward + dot + 1;
   if (symbol[0] == '#') {
@@ -159,7 +210,7 @@ EXPORT NTSTATUS NTAPI LdrGetDllHandleByName(PUNICODE_STRING base_name, PUNICODE_
   for (LIST_ENTRY *l = ldr->InLoadOrderModuleList.Flink; l != &ldr->InLoadOrderModuleList && !found; l = l->Flink) {
     LDR_DATA_TABLE_ENTRY *m = (LDR_DATA_TABLE_ENTRY *)l;
     if (full_name && RtlEqualUnicodeString(full_name, &m->FullDllName, TRUE)) found = m;
-    else if (base_name && RtlEqualUnicodeString(base_name, &m->BaseDllName, TRUE)) found = m;
+    else if (base_name && !(m->Flags & TCOS_LDRP_PRIVATE_LAYER) && RtlEqualUnicodeString(base_name, &m->BaseDllName, TRUE)) found = m;      /* (an internal layer is not found by its name) */
   }
   loader_unlock();
   if (!found) return STATUS_DLL_NOT_FOUND;

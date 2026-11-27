@@ -24,6 +24,7 @@
 #define IMPORT
 #include "../tcos_win.h"
 #include "../tcos_syscalls.h"
+#include "../tcos_dll_layering.h"
 
 /* ---- code the compiler expects from the platform ------------------------------------------------------------------------------------------------------- */
 
@@ -1162,7 +1163,12 @@ EXPORT void NTAPI RtlUserThreadStart(ProgramEntry entry, PVOID parameter) {
 
 /* ---- libraries loaded after start-up (LoadLibrary, FreeLibrary) ------------------------------------------------------------------------------------- */
 
-typedef struct { ULONG64 base, size, entry; char name[40]; } LoadRecord;      /* what NtLoadModule and NtReleaseModule report */
+/* What NtLoadModule and NtReleaseModule report: the library's place, its canonical name, flags (1: loaded only as an internal layer of a System32 library,
+ * tcos_dll_layering.h) and the Windows folder of its file ("C:\Games\X\"; empty: System32). */
+typedef struct { ULONG64 base, size, entry; char name[40]; ULONG flags, reserved; WCHAR directory[260]; } LoadRecord;
+_Static_assert(sizeof(LoadRecord) == 592, "the kernel's record (src/Process/WindowsModules.cpp)");
+#define LOAD_RECORD_PRIVATE_LAYER 1u
+#define NT_LOAD_MODULE_ADD_REFERENCE 8u      /* (NtLoadModule's flags, ours) one more use of the library at *base, whatever its name */
 #define LDR_STATIC 0xFFFF
 #define MAX_LOAD_RECORDS 256      /* (a browser's main DLL brings some 50 libraries along; the records live on the heap: DllMain may load more while they are in use) */
 #define STATUS_DLL_NOT_FOUND ((NTSTATUS)0xC0000135)
@@ -1185,7 +1191,7 @@ static void ldr_remove(LIST_ENTRY *e) {
 }
 
 /* A loader entry for a library the kernel mapped: listed in the three module lists. `path` (a UNICODE_STRING) is the file the program asked for; a library that came in
- * because another imports it is in C:\Windows\System32. */
+ * because another imports it is in the folder the kernel says (C:\Windows\System32 when it says none). */
 static LDR_DATA_TABLE_ENTRY *ldr_add(const LoadRecord *record, const UNICODE_STRING *path, int mapped_only, ULONG extra_flags) {
   {      /* a program image loaded as a library is only mapped, like a DONT_RESOLVE load */
     const BYTE *image = (const BYTE *)(ULONG_PTR)record->base;
@@ -1193,8 +1199,16 @@ static LDR_DATA_TABLE_ENTRY *ldr_add(const LoadRecord *record, const UNICODE_STR
     if (!(*(const USHORT *)(image + nt + 22) & 0x2000)) mapped_only = 1;      /* IMAGE_FILE_DLL */
   }
   static const WCHAR system32[] = {'C', ':', '\\', 'W', 'i', 'n', 'd', 'o', 'w', 's', '\\', 'S', 'y', 's', 't', 'e', 'm', '3', '2', '\\', 0};
-  size_t_ base_length = strlen(record->name);
-  size_t_ full_length = path ? path->Length / 2 : 20 + base_length;
+  const WCHAR *folder = system32;
+  size_t_ folder_length = 20;
+  if (record->directory[0]) {
+    folder = record->directory;
+    folder_length = 0;
+    while (folder_length < 259 && record->directory[folder_length]) ++folder_length;
+  }
+  size_t_ base_length = 0;
+  while (base_length < sizeof(record->name) - 1 && record->name[base_length]) ++base_length;
+  size_t_ full_length = path ? path->Length / 2 : folder_length + base_length;
   if (path) {      /* the file name at the end of the path is the library's name */
     size_t_ i = full_length;
     while (i > 0 && path->Buffer[i - 1] != '\\' && path->Buffer[i - 1] != '/') --i;
@@ -1207,8 +1221,8 @@ static LDR_DATA_TABLE_ENTRY *ldr_add(const LoadRecord *record, const UNICODE_STR
   if (path) {
     memcpy(full, path->Buffer, full_length * 2);
   } else {
-    memcpy(full, system32, 20 * 2);
-    for (size_t_ i = 0; i < base_length; ++i) full[20 + i] = (WCHAR)(BYTE)record->name[i];
+    memcpy(full, folder, folder_length * 2);
+    for (size_t_ i = 0; i < base_length; ++i) full[folder_length + i] = (WCHAR)(BYTE)record->name[i];
   }
   full[full_length] = 0;
   e->DllBase = (PVOID)(ULONG_PTR)record->base;
@@ -1220,7 +1234,7 @@ static LDR_DATA_TABLE_ENTRY *ldr_add(const LoadRecord *record, const UNICODE_STR
   e->BaseDllName.Buffer = full + (full_length - base_length);
   e->BaseDllName.Length = (USHORT)(base_length * 2);
   e->BaseDllName.MaximumLength = (USHORT)(base_length * 2 + 2);
-  e->Flags = 0x4 | (mapped_only ? LDRP_MAPPED_ONLY : 0) | extra_flags;      /* LDRP_IMAGE_DLL */
+  e->Flags = 0x4 | (mapped_only ? LDRP_MAPPED_ONLY : 0) | ((record->flags & LOAD_RECORD_PRIVATE_LAYER) ? TCOS_LDRP_PRIVATE_LAYER : 0) | extra_flags;      /* LDRP_IMAGE_DLL */
   e->LoadCount = 1;
   {      /* TlsIndex: -1 when the image has thread-local data that was set up */
     const BYTE *image = (const BYTE *)e->DllBase;
@@ -1321,7 +1335,11 @@ static NTSTATUS ldr_load_one(PULONG flags, PUNICODE_STRING name, PVOID *handle) 
   loader_lock();
   NTSTATUS status = NtLoadModule(name, &base, records, MAX_LOAD_RECORDS, &count, (mapped_only ? 1 : 0) | (redirected ? 4 : 0));
   if (!NT_SUCCESS(status) || count == 0) {      /* (count 0: it was there, one more use, or a library the process started with) */
-    if (NT_SUCCESS(status)) *handle = base;
+    if (NT_SUCCESS(status)) {
+      *handle = base;
+      LDR_DATA_TABLE_ENTRY *e = ldr_find_base(base);
+      if (e) e->Flags &= ~TCOS_LDRP_PRIVATE_LAYER;      /* (an internal layer's file that the program loads is one of its libraries now: the kernel says so too) */
+    }
     loader_unlock();
     RtlFreeHeap(process_heap(), 0, records);
     return status;
@@ -1556,6 +1574,8 @@ EXPORT NTSTATUS NTAPI RtlGetExePath(PCWSTR name, PWSTR *path) {
 }
 EXPORT NTSTATUS NTAPI RtlGetSearchPath(PWSTR *path) { return get_dll_load_path(image_path_name(), NULL, g_path_safe_mode, path); }
 EXPORT VOID NTAPI RtlReleasePath(PWSTR path) { if (path) RtlFreeHeap(process_heap(), 0, path); }
+static LDR_DATA_TABLE_ENTRY *ldr_find_name(const UNICODE_STRING *name);
+EXPORT NTSTATUS NTAPI LdrAddRefDll(ULONG flags, PVOID base);
 EXPORT NTSTATUS NTAPI LdrLoadDll(PWSTR search_path, PULONG flags, PUNICODE_STRING name, PVOID *handle) {
   WCHAR coded[1040];
   BOOLEAN absolute = name->Length >= 6 && name->Buffer[1] == ':' && (name->Buffer[2] == '\\' || name->Buffer[2] == '/');
@@ -1568,6 +1588,17 @@ EXPORT NTSTATUS NTAPI LdrLoadDll(PWSTR search_path, PULONG flags, PUNICODE_STRIN
   }
   BOOLEAN bare = TRUE;
   for (USHORT i = 0; i < name->Length / 2; ++i) if (name->Buffer[i] == '\\' || name->Buffer[i] == '/' || name->Buffer[i] == ':') bare = FALSE;
+  if (bare && search_path && search_path[0]) {      /* a library of that base name that is loaded is the answer before any folder is looked in (as on Windows) */
+    loader_lock();
+    LDR_DATA_TABLE_ENTRY *loaded = ldr_find_name(name);
+    PVOID base = loaded ? loaded->DllBase : NULL;
+    loader_unlock();
+    if (base) {
+      const NTSTATUS status = LdrAddRefDll(0, base);
+      if (NT_SUCCESS(status)) *handle = base;
+      return status;
+    }
+  }
   const BOOLEAN drive_relative = name->Length >= 4 && name->Buffer[1] == ':' && !absolute;      /* ("C:name": the current folder of that drive) */
   if (!bare && !absolute && (!search_path || drive_relative)) {      /* a relative path is taken from the current folder */
     WCHAR full[520], text[520];
@@ -1712,7 +1743,8 @@ EXPORT PVOID NTAPI TcosFindModuleByFile(PCWSTR path) {
   loader_unlock();
   return found;
 }
-/* A loaded library by name, with or without ".dll", in any case; only the file name counts. */
+/* A loaded library by name, with or without ".dll", in any case; only the file name counts. The first in load order, leaving out the internal layers of System32
+ * libraries (tcos_dll_layering.h), which a program does not have on Windows. */
 static WCHAR ldr_upper(WCHAR c) { return c >= 'a' && c <= 'z' ? (WCHAR)(c - 32) : c; }
 static LDR_DATA_TABLE_ENTRY *ldr_find_name(const UNICODE_STRING *name) {
   PEB_LDR_DATA *ldr = NtCurrentPeb()->Ldr;
@@ -1722,6 +1754,7 @@ static LDR_DATA_TABLE_ENTRY *ldr_find_name(const UNICODE_STRING *name) {
   const BOOLEAN has_extension = length >= 4 && text[length - 4] == '.';
   for (LIST_ENTRY *e = ldr->InLoadOrderModuleList.Flink; e != &ldr->InLoadOrderModuleList; e = e->Flink) {
     LDR_DATA_TABLE_ENTRY *m = entry_of(e);
+    if (m->Flags & TCOS_LDRP_PRIVATE_LAYER) continue;
     const SIZE_T base_length = m->BaseDllName.Length / 2;
     const WCHAR *base = m->BaseDllName.Buffer;
     SIZE_T compare = base_length;
@@ -1763,19 +1796,14 @@ EXPORT NTSTATUS NTAPI LdrGetDllHandleEx(ULONG flags, PWSTR path, PULONG characte
       }
     }
   }
-  if (!m) m = ldr_find_name(name);
+  if (!m && !has_folder) m = ldr_find_name(name);      /* (a path names a file: the library of another file of that name is not it) */
   if (!m) { loader_unlock(); return STATUS_DLL_NOT_FOUND; }
   PVOID base = m->DllBase;
-  if (!(flags & 1) && m->LoadCount != LDR_STATIC) {
-    UNICODE_STRING base_name = m->BaseDllName;
-    PVOID again = NULL;
-    loader_unlock();
-    const NTSTATUS status = LdrLoadDll(NULL, NULL, &base_name, &again);
-    if (!NT_SUCCESS(status)) return status;
-    loader_lock();
-    m = ldr_find_base(base);
+  if (!(flags & 1) && !(flags & 2) && m->LoadCount != LDR_STATIC) {      /* one more use of this library (the kernel's count, by its address) */
+    const NTSTATUS status = LdrAddRefDll(0, base);
+    if (!NT_SUCCESS(status)) { loader_unlock(); return status; }
   }
-  if (m && (flags & 2)) m->LoadCount = LDR_STATIC;
+  if (flags & 2) LdrAddRefDll(1, base);      /* pinned */
   loader_unlock();
   *handle = base;
   return STATUS_SUCCESS;
@@ -1873,7 +1901,14 @@ EXPORT NTSTATUS NTAPI LdrAddRefDll(ULONG flags, PVOID base) {
   NTSTATUS status = STATUS_SUCCESS;
   if (!e) status = STATUS_DLL_NOT_FOUND;
   else if (flags & 1) e->LoadCount = LDR_STATIC;      /* pinned: never unloaded */
-  else if (e->LoadCount != LDR_STATIC) ++e->LoadCount;
+  else if (e->LoadCount != LDR_STATIC) {
+    /* the kernel counts the uses that FreeLibrary gives back: one more there, for this library whatever its name or file */
+    LoadRecord one;
+    ULONG count = 0;
+    PVOID at = base;
+    status = NtLoadModule(&e->BaseDllName, &at, &one, 1, &count, NT_LOAD_MODULE_ADD_REFERENCE);
+    if (NT_SUCCESS(status)) ++e->LoadCount;
+  }
   loader_unlock();
   return status;
 }

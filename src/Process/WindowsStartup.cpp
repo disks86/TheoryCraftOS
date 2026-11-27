@@ -18,6 +18,7 @@
 #include "Process/WindowsStartup.hpp"
 #include "Utility/ByteBuffer.hpp"
 #include "Utility/Utf16.hpp"
+#include "Windows/tcos_dll_layering.h"
 #if defined(__x86_64__)
 #include <cpuid.h>
 #endif
@@ -435,7 +436,7 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
       w.u32(entry + 0x40, uint32_t(m.size));           // SizeOfImage
       w.unicode_string(entry + 0x48, strings + base_name.size() + 2, full_name.size(), full_name.size() + 2);      // FullDllName
       w.unicode_string(entry + 0x58, strings, base_name.size(), base_name.size() + 2);                               // BaseDllName
-      w.u32(entry + 0x68, m.main ? 0x20 : 0x4);        // Flags: LDRP_IMAGE_DLL
+      w.u32(entry + 0x68, (m.main ? 0x20 : 0x4) | (m.private_layer ? TCOS_LDRP_PRIVATE_LAYER : 0));      // Flags: LDRP_IMAGE_DLL
       w.u16(entry + 0x6C, 0xFFFF);                     // LoadCount: static
       w.u16(entry + 0x6E, m.tls_rva ? 0xFFFF : 0);     // TlsIndex: -1 for a module with thread-local data
     }
