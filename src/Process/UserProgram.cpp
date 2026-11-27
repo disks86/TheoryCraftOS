@@ -371,6 +371,10 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
     if (status != LoadStatus::Ok) return status;
     describe_image_pages(space_, pe, image.base);      // (the pages are an image, committed, whatever their access)
     const StringView program_file = path.empty() ? StringView("program.exe") : path.substr(path.rfind('\\') == StringView::npos ? 0 : path.rfind('\\') + 1);
+    // The stack first: it has a fixed place below the top, which a 32-bit program's moved libraries (placed from the top down) must leave free.
+    const uint64_t stack_bytes = wow ? kDefaultStackBytes32 : kDefaultStackBytes;
+    status = map_stack(space_, stack_bytes, &stack_top);
+    if (status != LoadStatus::Ok) return status;
     UniquePointer<ModuleSet> modules;
     if (libraries_) {
       modules = UniquePointer<ModuleSet>::make(allocator_, allocator_);
@@ -378,9 +382,6 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
       status = load_windows_modules(space_, allocator_, pe, file, program_file, *libraries_, modules.get(), &detail_, !defer_loading_);
       if (status != LoadStatus::Ok) return status;
     }
-    const uint64_t stack_bytes = wow ? kDefaultStackBytes32 : kDefaultStackBytes;
-    status = map_stack(space_, stack_bytes, &stack_top);
-    if (status != LoadStatus::Ok) return status;
     stack_pointer = windows_initial_stack_pointer(stack_top);
     String command_line(allocator_);
     if (!command_line_.empty() ? !command_line.assign(command_line_.view()) : !join_command_line(arguments, &command_line)) return LoadStatus::OutOfMemory;

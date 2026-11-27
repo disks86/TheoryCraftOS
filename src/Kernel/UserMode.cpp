@@ -1318,6 +1318,12 @@ uint32_t Task::spawn_process(const process::ChildSpec& spec) {
   const ArrayView<const StringView> arguments = spec.arguments.empty() ? ArrayView<const StringView>(argv, argc) : spec.arguments;
   const process::LoadStatus loaded = p.load(spec.image, arguments, spec.environment, ConstByteView(random, sizeof(random)));
   if (loaded != process::LoadStatus::Ok) {
+    // (why: the loader's detail, as the kernel log has it for the first program)
+    console::puts("process: ");
+    console::puts(spec.program_file);
+    console::puts(" not started: ");
+    console::puts(p.load_detail().empty() ? StringView(loaded == process::LoadStatus::OutOfMemory ? "out of memory" : "not a program it can run") : p.load_detail());
+    console::puts("\n");
     discard();
     return loaded == process::LoadStatus::OutOfMemory ? kNoMemory : kInvalidImage;
   }
