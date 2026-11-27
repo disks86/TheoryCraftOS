@@ -124,6 +124,7 @@ class VirglDevice final : public IGraphicsDevice {
   // Whether the host's blend factors may still name the second source (a dual-source pipeline was bound): the next other pipeline is bound by its blend object's reset variant
   // (VirglPipeline::blend_reset), because the host's OpenGL refuses draws into several targets while they do.
   bool host_dual_source_factors_ = false;
+  kernel::Mutex submit_lock_;   // (held through a submit: see submit())
   hardware::VirtioGpu& gpu_;
   uint32_t next_handle_ = 1;  // object handles share one namespace per context
   uint64_t all_used_until_ = 0;   // the last work of a submit that used too many buffers to note each one (see in_flight)

@@ -22,6 +22,9 @@
 #include "Graphics/BlockCompression.hpp"
 #include <new>
 #include "Graphics/Graphics3D/Virgl/VirglProtocol.hpp"
+#include "Kernel/Delay.hpp"
+#include "Kernel/Interrupts.hpp"
+#include "Kernel/Thread.hpp"
 #include "Graphics/Graphics3D/Virgl/VirglVertexPatch.hpp"
 #include "Utility/AllocatedView.hpp"
 #include "Utility/ByteStream.hpp"
@@ -1929,6 +1932,24 @@ void VirglDevice::destroy_command_buffer(ICommandBuffer* commands) {
 
 bool VirglDevice::submit(ICommandBuffer* commands) {
   if (!commands) return false;
+  // One submit at a time: the host's context has one set of bound state (framebuffer, shaders, objects, sampler views, constants), and a submit is sent in parts when its
+  // stream fills - another thread's commands between two parts would leave the rest of this one drawing with that thread's state. (A caller with interrupts masked does
+  // not block - see VirtioGpu::lock_for_command -: it tries for a while and gives up.)
+  struct SubmitLock {
+    kernel::Mutex& mutex;
+    bool held = false;
+    explicit SubmitLock(kernel::Mutex& m) : mutex(m) {
+      if (kernel::irq_enabled() || !kernel::running()) {
+        mutex.lock();
+        held = true;
+        return;
+      }
+      const uint64_t start = hardware::uptime_us();
+      while (!(held = mutex.try_lock()) && hardware::uptime_us() - start < 50000) hardware::delay_spin_us(20);
+    }
+    ~SubmitLock() { if (held) mutex.unlock(); }
+  } submit_lock(submit_lock_);
+  if (!submit_lock.held) return false;
   CommandRecorder& recorder = *static_cast<CommandRecorder*>(commands);
   Stream stream(gpu_.allocator());
   if (!stream.valid()) return false;
