@@ -349,6 +349,123 @@ static void test_textures() {
   CHECK(glGetError() == GL_NO_ERROR);
 }
 
+static GLuint build(const char* vs, const char* fs);
+
+// Block-compressed textures kept as their blocks (decoded only when the CPU samples them), glGetCompressedTexImage of the blocks, sub-images, compressed storage,
+// anisotropy, and sampler2DMS read by texelFetch.
+static void test_compressed_anisotropy_multisample() {
+  Fixture f;
+  // An 8 x 8 DXT1 texture with alpha: four blocks of red (colour 0 red, colour 1 blue, colour 0 > colour 1: four colours, every index 0).
+  uint8_t blocks[4 * 8];
+  for (int b = 0; b < 4; ++b) {
+    uint8_t* p = blocks + b * 8;
+    p[0] = 0x00; p[1] = 0xF8; p[2] = 0x1F; p[3] = 0x00;      // (565: red 0xF800, blue 0x001F)
+    p[4] = p[5] = p[6] = p[7] = 0;
+  }
+  GLuint tex = 0;
+  glGenTextures(1, &tex);
+  glBindTexture(GL_TEXTURE_2D, tex);
+  glCompressedTexImage2D(GL_TEXTURE_2D, 0, 0x83F1, 8, 8, 0, sizeof blocks, blocks);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  CHECK(glGetError() == GL_NO_ERROR);
+  GLint size = 0, compressed = 0;
+  glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x86A0 /* GL_TEXTURE_COMPRESSED_IMAGE_SIZE */, &size);
+  glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_COMPRESSED, &compressed);
+  CHECK(size == 32 && compressed == 1);
+  uint8_t back[32] = {};
+  glGetCompressedTexImage(GL_TEXTURE_2D, 0, back);
+  CHECK(glGetError() == GL_NO_ERROR && memcmp(back, blocks, sizeof blocks) == 0);
+  glEnable(GL_TEXTURE_2D);
+  glColor3f(1, 1, 1);
+  const auto quad = [] {
+    glBegin(GL_QUADS);
+    glTexCoord2f(0, 0); glVertex2f(0, 0);
+    glTexCoord2f(1, 0); glVertex2f(64, 0);
+    glTexCoord2f(1, 1); glVertex2f(64, 64);
+    glTexCoord2f(0, 1); glVertex2f(0, 64);
+    glEnd();
+  };
+  quad();
+  CHECK(near(pixel(10, 10), 255, 0, 0) && near(pixel(50, 50), 255, 0, 0));
+  // the top right block becomes blue (index 1 everywhere): the blocks change, the CPU decodes them again
+  uint8_t blue[8] = {0x00, 0xF8, 0x1F, 0x00, 0x55, 0x55, 0x55, 0x55};
+  glCompressedTexSubImage2D(GL_TEXTURE_2D, 0, 4, 4, 4, 4, 0x83F1, sizeof blue, blue);
+  CHECK(glGetError() == GL_NO_ERROR);
+  quad();
+  CHECK(near(pixel(10, 10), 255, 0, 0) && near(pixel(50, 50), 0, 0, 255));
+  glGetCompressedTexImage(GL_TEXTURE_2D, 0, back);
+  CHECK(memcmp(back + 24, blue, 8) == 0 && memcmp(back, blocks, 24) == 0);
+  // a compressed level is written by glCompressedTexSubImage only
+  const uint8_t texel[4] = {1, 2, 3, 4};
+  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, texel);
+  CHECK(glGetError() == GL_INVALID_OPERATION);
+  // a misaligned sub-image, and blocks of the wrong size
+  glCompressedTexSubImage2D(GL_TEXTURE_2D, 0, 2, 0, 4, 4, 0x83F1, sizeof blue, blue);
+  CHECK(glGetError() == GL_INVALID_VALUE);
+  glCompressedTexImage2D(GL_TEXTURE_2D, 0, 0x83F1, 8, 8, 0, 31, blocks);
+  CHECK(glGetError() == GL_INVALID_VALUE);
+  glDisable(GL_TEXTURE_2D);
+  // compressed storage: zero blocks until written
+  GLuint st = 0;
+  glGenTextures(1, &st);
+  glBindTexture(GL_TEXTURE_2D, st);
+  glTexStorage2D(GL_TEXTURE_2D, 2, 0x83F3, 8, 8);
+  CHECK(glGetError() == GL_NO_ERROR);
+  glGetTexLevelParameteriv(GL_TEXTURE_2D, 1, 0x86A0, &size);
+  CHECK(size == 16);
+  uint8_t dxt5[16] = {255, 255, 0, 0, 0, 0, 0, 0, 0x00, 0xF8, 0x1F, 0x00, 0, 0, 0, 0};
+  glCompressedTexSubImage2D(GL_TEXTURE_2D, 1, 0, 0, 4, 4, 0x83F3, sizeof dxt5, dxt5);
+  CHECK(glGetError() == GL_NO_ERROR);
+  uint8_t level1[16] = {};
+  glGetCompressedTexImage(GL_TEXTURE_2D, 1, level1);
+  CHECK(memcmp(level1, dxt5, 16) == 0);
+  glDeleteTextures(1, &st);
+  // anisotropy: kept, at least 1, at most the implementation's
+  GLfloat most = 0, aniso = 0;
+  glGetFloatv(0x84FF /* GL_MAX_TEXTURE_MAX_ANISOTROPY */, &most);
+  CHECK(most >= 2.0f);
+  glBindTexture(GL_TEXTURE_2D, tex);
+  glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY, 8.0f);
+  glGetTexParameterfv(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY, &aniso);
+  CHECK(aniso == 8.0f && glGetError() == GL_NO_ERROR);
+  glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY, 0.5f);
+  CHECK(glGetError() == GL_INVALID_VALUE);
+  glDeleteTextures(1, &tex);
+  // a multisample texture drawn into (green), then read by texelFetch of sample 0 through a sampler2DMS; textureSize gives its size
+  GLuint ms = 0, fb = 0;
+  glGenTextures(1, &ms);
+  glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, ms);
+  glTexImage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 4, GL_RGBA8, W, H, GL_TRUE);
+  glGenFramebuffers(1, &fb);
+  glBindFramebuffer(GL_FRAMEBUFFER, fb);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D_MULTISAMPLE, ms, 0);
+  glClearColor(0, 1, 0, 1);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  glClearColor(0, 0, 0, 1);
+  glClear(GL_COLOR_BUFFER_BIT);
+  const GLuint p = build("#version 150\nin vec2 pos;\nvoid main(){ gl_Position = vec4(pos, 0.0, 1.0); }\n",
+                         "#version 150\nuniform sampler2DMS s;\nout vec4 color;\n"
+                         "void main(){ ivec2 size = textureSize(s); vec4 c = texelFetch(s, ivec2(gl_FragCoord.xy), 0);\n"
+                         "  color = (size == ivec2(64, 64)) ? c : vec4(1.0, 0.0, 1.0, 1.0); }\n");
+  CHECK(p != 0);
+  glUseProgram(p);
+  glUniform1i(glGetUniformLocation(p, "s"), 0);
+  const float tri[] = {-1, -1, 3, -1, -1, 3};
+  const GLint pos = glGetAttribLocation(p, "pos");
+  glEnableVertexAttribArray(static_cast<GLuint>(pos));
+  glVertexAttribPointer(static_cast<GLuint>(pos), 2, GL_FLOAT, GL_FALSE, 0, tri);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  glDisableVertexAttribArray(static_cast<GLuint>(pos));
+  CHECK(near(pixel(10, 10), 0, 255, 0) && near(pixel(60, 60), 0, 255, 0));
+  glUseProgram(0);
+  glDeleteProgram(p);
+  glDeleteFramebuffers(1, &fb);
+  glDeleteTextures(1, &ms);
+  CHECK(glGetError() == GL_NO_ERROR);
+}
+
 static void test_arrays() {
   Fixture f;
   glClearColor(0, 0, 0, 1);
@@ -2205,6 +2322,7 @@ int main() {
   test_depth_and_blend();
   test_lighting();
   test_textures();
+  test_compressed_anisotropy_multisample();
   test_arrays();
   test_display_lists();
   test_pixels();

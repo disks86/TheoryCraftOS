@@ -2771,7 +2771,8 @@ bool Gen::tex_call(const Node& n, Val* out) {
   const bool proj = top == TexOp::Proj || top == TexOp::ProjBias || top == TexOp::ProjLod;
   const bool plain = top == TexOp::Sample || top == TexOp::Bias || top == TexOp::Lod || top == TexOp::Grad || proj;
   const bool size_query = !wgsl && top == TexOp::Size;      // textureSize(s, 0): row 1 of the sampler's rows (see TgsiSampler)
-  if ((!wgsl && (n.flags & ~2u)) || (!plain && !size_query) || static_cast<uint64_t>(n.first) + 3 > m_.kids.count()) return fail("a texture lookup the device cannot take");
+  const bool fetch = !wgsl && top == TexOp::Fetch;          // texelFetch(s, P, lod or sample): TXF
+  if ((!wgsl && (n.flags & ~2u)) || (!plain && !size_query && !fetch) || static_cast<uint64_t>(n.first) + 3 > m_.kids.count()) return fail("a texture lookup the device cannot take");
   if (!wgsl && (n.count < 9 || static_cast<uint64_t>(n.first) + 9 > m_.kids.count() || m_.kids[static_cast<uint64_t>(n.first) + 7] >= 0 || m_.kids[static_cast<uint64_t>(n.first) + 8] >= 0))
     return fail("a texture lookup with an offset");
   if (wgsl && top != TexOp::Sample) return fail("a texture lookup the device cannot take");
@@ -2794,17 +2795,21 @@ bool Gen::tex_call(const Node& n, Val* out) {
         s->kind != GlobalKind::Handle || s->type.base != Base::SamplerState || s->type.array)
       return fail("a texture the device cannot take");
   } else if (!eval(sampler_id, &sv) || sv.kind != 5 || sv.ival < 0 || !sv.sfloat ||
-             (sv.sdim != kDim2D && sv.sdim != kDim1D && sv.sdim != kDimRect && sv.sdim != kDim3D && sv.sdim != kDimCube && sv.sdim != kDim2DArray)) {
+             (sv.sdim != kDim2D && sv.sdim != kDim1D && sv.sdim != kDimRect && sv.sdim != kDim3D && sv.sdim != kDimCube && sv.sdim != kDim2DArray &&
+              sv.sdim != kDimMultisampled && sv.sdim != kDimMultisampledArray)) {
     return fail("a sampler the device cannot take");
   }
   const uint32_t slot = wgsl ? g->slot : static_cast<uint32_t>(sv.ival);
   const uint8_t dim = wgsl ? kDim2D : sv.sdim;
   const bool shadow = !wgsl && sv.sshadow;
   // (a 3D, cube or array texture: three coordinates, no comparison, no size row)
-  const bool volume = dim == kDim3D || dim == kDimCube || dim == kDim2DArray;
+  const bool volume = dim == kDim3D || dim == kDimCube || dim == kDim2DArray || dim == kDimMultisampledArray;
+  const bool multisampled = dim == kDimMultisampled || dim == kDimMultisampledArray;
   if (volume && (shadow || size_query || legacy)) return fail("a lookup of a 3D, cube or array texture the device cannot take");
+  if (multisampled && !fetch && !size_query) return fail("a lookup of a multisampled texture the device cannot take");
+  if (fetch && (shadow || dim == kDimCube)) return fail("a texel fetch the device cannot take");
   if (volume && proj && dim != kDim3D) return fail("a projective lookup of a cube or array texture");
-  if (size_query) {      // (level 0 only: the size of another level is that of the image the texture has there, which the device does not know)
+  if (size_query && !multisampled) {      // (level 0 only: the size of another level is that of the image the texture has there, which the device does not know)
     const int32_t lod = static_cast<uint64_t>(n.first) + 4 < m_.kids.count() ? m_.kids[static_cast<uint64_t>(n.first) + 4] : -1;
     if (lod >= 0) {
       bool constant;
@@ -2826,6 +2831,7 @@ bool Gen::tex_call(const Node& n, Val* out) {
     ts.shadow = shadow;
     if (!p.samplers.push_back(ts)) return fail("out of memory");
   }
+  if (fetch) p.samplers[index].fetch = true;
   if ((shadow || dim == kDimRect || size_query) && p.samplers[index].params < 0) {      // (its rows: see TgsiSampler; a sampler first used another way gets them now)
     if (p.const_rows + 4 > sh_.limits.const_rows) return fail("too many uniforms");
     p.samplers[index].params = static_cast<int32_t>(p.const_rows);
@@ -2840,6 +2846,54 @@ bool Gen::tex_call(const Node& n, Val* out) {
     out->rows = dim == kDim1D ? 1 : 2;
     out->num = kNumInt;
     out->c[0] = filled('C', static_cast<uint16_t>(ts.params + 1), out->rows);
+    return true;
+  }
+  if (fetch) {
+    // TXF: the texel at integer coordinates (x; y but in 1D; the layer or slice third) of a level - w - of the texture; a multisampled texture's w is its sample, of
+    // the one sample a texel the GL keeps (GL_MAX_COLOR_TEXTURE_SAMPLES): level 0 of the device's texture. Out of the image the device gives zero, as the CPU does.
+    Val coord, lv;
+    if (!eval(coord_id, &coord) || !to_float(coord) || coord.kind || coord.cols != 1) return fail("a texture coordinate the device cannot take");
+    const uint32_t want = dim == kDim1D ? 1u : (volume ? 3u : 2u);
+    if (coord.rows != want) return fail("a texture coordinate the device cannot take");
+    const int32_t lod_id = static_cast<uint64_t>(n.first) + 4 < m_.kids.count() ? m_.kids[static_cast<uint64_t>(n.first) + 4] : -1;
+    Oper level;
+    if (multisampled || lod_id < 0) {
+      if (!scalar_imm(0.0f, &level)) return false;
+    } else {
+      if (!eval(lod_id, &lv) || !to_float(lv) || lv.kind || lv.cols != 1) return fail("a texture level the device cannot take");
+      level = component(lv.c[0], 0);
+    }
+    uint16_t at, ati;
+    Oper zero;
+    if (!new_temp(&at) || !new_temp(&ati) || !scalar_imm(0.0f, &zero)) return false;
+    const Oper cx = component(coord.c[0], 0);
+    inst("MOV", at, "x", &cx);
+    if (dim == kDim1D) {
+      inst("MOV", at, "y", &zero);
+    } else {
+      const Oper cy = component(coord.c[0], 1);
+      inst("MOV", at, "y", &cy);
+    }
+    if (volume) {
+      const Oper cz = component(coord.c[0], 2);
+      inst("MOV", at, "z", &cz);
+    } else {
+      inst("MOV", at, "z", &zero);
+    }
+    inst("MOV", at, "w", &level);
+    const Oper ato = filled('T', at, 4);
+    inst("F2I", ati, "xyzw", &ato);
+    if (!new_val(4, 1, out)) return false;
+    begin_inst("TXF");
+    body.append(" TEMP[");
+    body.append_uint(out->c[0].idx);
+    body.append("].xyzw, ");
+    put_oper(filled('T', ati, 4));
+    body.append(", SAMP[");
+    body.append_uint(index);
+    body.append("], ");
+    body.append(dim == kDim3D ? "3D" : (dim == kDim2DArray || dim == kDimMultisampledArray) ? "2D_ARRAY" : "2D");
+    end_inst();
     return true;
   }
   Val coord;
@@ -4949,7 +5003,8 @@ bool assemble(String& out, const Gen& g, const Shared& sh, uint32_t attributes, 
     out.append("]\nDCL SVIEW[");
     out.append_uint(i);
     const uint8_t dim = i < sh.out->samplers.count() ? sh.out->samplers[i].dim : kDim2D;
-    out.append(dim == kDim3D ? "], 3D, FLOAT\n" : dim == kDimCube ? "], CUBE, FLOAT\n" : dim == kDim2DArray ? "], 2D_ARRAY, FLOAT\n" : "], 2D, FLOAT\n");
+    // (a multisampled texture is one sample a texel here: a 2D texture, or a 2D array, on the device)
+    out.append(dim == kDim3D ? "], 3D, FLOAT\n" : dim == kDimCube ? "], CUBE, FLOAT\n" : (dim == kDim2DArray || dim == kDimMultisampledArray) ? "], 2D_ARRAY, FLOAT\n" : "], 2D, FLOAT\n");
   }
   write_header_decl(out, "CONST", const_rows);
   if (g.uses_addr) out.append("DCL ADDR[0]\n");

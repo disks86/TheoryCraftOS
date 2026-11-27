@@ -981,10 +981,13 @@ bool Interp::tex_call(const Node& node, Ref* out) {
     case kDim3D: case kDimCube: case kDimCubeArray: dims = 3; break;
     default: dims = 2; break;
   }
-  const bool layered = tt.dim == kDim2DArray || tt.dim == kDimCubeArray || tt.dim == kDim1DArray;
+  const bool layered = tt.dim == kDim2DArray || tt.dim == kDimCubeArray || tt.dim == kDim1DArray || tt.dim == kDimMultisampledArray;
+  // (a multisampled texture: texelFetch's third argument is the sample, not a level - the GL keeps one sample a texel, GL_MAX_COLOR_TEXTURE_SAMPLES: sample 0 is
+  // the texel, another reads as zero, which GL leaves undefined)
+  const bool multisampled = !wgsl && (tt.dim == kDimMultisampled || tt.dim == kDimMultisampledArray);
   if (op == TexOp::Size || op == TexOp::Levels || op == TexOp::Samples) {
     rq.mode = op == TexOp::Size ? SampleMode::Size : (op == TexOp::Levels ? SampleMode::Levels : SampleMode::Samples);
-    if (have[4]) rq.level = icomp(kid[4], 0);
+    if (have[4] && !multisampled) rq.level = icomp(kid[4], 0);      // (textureSize of a multisampled texture takes no level)
     uint32_t raw[4];
     m.host_->sample(rq, raw);
     Type rt = op == TexOp::Size ? make_type(Base::Int, static_cast<uint8_t>(dims + (layered && tt.dim != kDimCubeArray ? 1 : 0))) : make_type(Base::Int);
@@ -1003,6 +1006,16 @@ bool Interp::tex_call(const Node& node, Ref* out) {
     for (uint32_t i = 0; i < 3 && i < count_of(co.t); ++i) rq.icoord[i] = icomp(co, i);
     if (wgsl && have[3]) rq.icoord[dims] = icomp(kid[3], 0);   // array index
     if (have[4]) rq.level = icomp(kid[4], 0);
+    if (multisampled) {
+      const int32_t sample = rq.level;
+      rq.level = 0;
+      if (sample != 0) {
+        uint32_t* w;
+        if (!new_value(make_type(tt.texel, 4), out, &w)) return false;
+        for (uint32_t i = 0; i < 4; ++i) w[i] = 0;
+        return true;
+      }
+    }
     if (have[7]) for (uint32_t i = 0; i < 3 && i < count_of(kid[7].t); ++i) rq.offset[i] = icomp(kid[7], i);
     if (op == TexOp::Store) {
       if (!have[5]) return fail("textureStore needs a value");

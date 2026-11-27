@@ -35,14 +35,21 @@
 
 namespace webgl {
 
-// How a texture is read: nearest or linear filtering (there are no mipmaps), and for each axis wrap around or take the edge texel.
+// How a texture is read: nearest or linear filtering, and for each axis wrap around or take the edge texel.
 struct AccelSampler {
-  bool linear = false;
+  bool linear = false;            // (minification's filter within a level; magnification's too unless separate_mag)
   bool repeat_s = true, repeat_t = true;
   // A mipmapped image (create_image with levels): the filter between levels (0 none: level 0 only, 1 the nearest level, 2 linear between two) and the levels' range.
   uint8_t mip = 0;
   float min_lod = 0, max_lod = 1000, lod_bias = 0;
   bool mirror_s = false, mirror_t = false;   // (with repeat: GL_MIRRORED_REPEAT)
+  // AccelLimits::sampler_state: in place of the above for an axis, the border colour outside the image (GL_CLAMP_TO_BORDER; `border`, the channels as the texture
+  // reads them) or mirror once then the edge (GL_MIRROR_CLAMP_TO_EDGE); magnification by its own filter; anisotropic filtering of up to `anisotropy` lookups.
+  bool border_s = false, border_t = false;
+  bool mirror_once_s = false, mirror_once_t = false;
+  float border[4] = {0, 0, 0, 0};
+  bool separate_mag = false, mag_linear = false;
+  uint8_t anisotropy = 1;
 };
 constexpr uint32_t kAccelMaxTextures = 16;
 
@@ -71,12 +78,26 @@ struct AccelLimits {
   // write_image / read_image of Depth and DepthStencil images, and write_depth / read_depth of a target: the device's depth (and stencil) can be written and read,
   // so a draw the CPU makes in between does not leave the device's depth out of date
   bool depth_transfer = false;
+  bool sampler_state = false;     // AccelSampler's border, mirror-once, separate magnification and anisotropy
+  uint8_t max_anisotropy = 1;
+  // create_texture_levels: sampled textures of every kind with levels (and their formats: colour, float, blocks the device takes - takes_blocks)
+  bool texture_levels = false;
 };
 
 // The kinds of device image (create_image). Rgba8 (Srgb: sRGB encoded) has 8-bit channels; Rgba16F and Rgba32F floats; Depth a float depth image. Pixels go in and out
 // as w * h * 4 bytes R, G, B, A (Rgba8, Rgba8Srgb), w * h * 16 bytes of little-endian floats (Rgba16F, Rgba32F) - the row of t = 0 (window y 0) first.
 enum class AccelFormat : uint8_t { Rgba8, Rgba8Srgb, Rgba16F, Rgba32F, Depth, DepthStencil };   // (DepthStencil: AccelLimits::stencil, a depth image with an 8-bit stencil plane)
-enum class AccelKind : uint8_t { Volume, Cube, Array };   // (create_layered)
+enum class AccelKind : uint8_t { Volume, Cube, Array, Plain };   // (create_layered; Plain: a 2D texture - create_texture_levels)
+// Block-compressed formats a device may sample as they are (IAccelerator::takes_blocks): S3TC/DXT1 (BC1) with alpha, DXT3, DXT5, RGTC1/2 unsigned and signed, BPTC.
+enum class AccelBlocks : uint8_t { None, Bc1, Bc1Srgb, Bc2, Bc2Srgb, Bc3, Bc3Srgb, Bc4U, Bc4S, Bc5U, Bc5S, Bc6U, Bc6S, Bc7, Bc7Srgb };
+// A sampled texture (create_texture_levels): `kind`, w x h, `layers` (a volume's slices at level 0, a cube's 6, an array's layers, 1 for Plain), `levels` levels, of
+// `format` (Rgba8, Rgba8Srgb, Rgba16F, Rgba32F) or, when `blocks` is not None, of those blocks.
+struct AccelTextureDesc {
+  uint32_t w = 0, h = 0, layers = 1, levels = 1;
+  AccelKind kind = AccelKind::Plain;
+  AccelFormat format = AccelFormat::Rgba8;
+  AccelBlocks blocks = AccelBlocks::None;
+};
 constexpr uint32_t kAccelMaxColors = 8;
 // The images a draw renders into (draw_images, clear_images): colours[0 .. color_count - 1], fragment output n going to colors[n], and a Depth image (0: none). All
 // have one size. color_count may be 0 (a depth-only draw).
@@ -243,6 +264,21 @@ class IAccelerator {
   virtual uint32_t create_layered(uint32_t w, uint32_t h, uint32_t layers, AccelKind kind) {
     (void)w, (void)h, (void)layers, (void)kind;
     return 0;
+  }
+  // AccelLimits::texture_levels: a texture as `desc` says (0: the device cannot), filled by write_level: one layer (a volume's slice of that level, a cube's face, an
+  // array's layer; 0 for Plain) of level `level`, the row of t = 0 first - 4 bytes R, G, B, A a texel (Rgba8, Rgba8Srgb), 16 bytes of floats (Rgba16F, Rgba32F), or the
+  // blocks, rows of blocks from t = 0. It is destroyed with destroy_texture.
+  virtual bool takes_blocks(AccelBlocks blocks) const {
+    (void)blocks;
+    return false;
+  }
+  virtual uint32_t create_texture_levels(const AccelTextureDesc& desc) {
+    (void)desc;
+    return 0;
+  }
+  virtual bool write_level(uint32_t texture, uint32_t level, uint32_t layer, ConstByteView data) {
+    (void)texture, (void)level, (void)layer, (void)data;
+    return false;
   }
   virtual bool write_layer(uint32_t image, uint32_t layer, ConstByteView rgba) {
     (void)image, (void)layer, (void)rgba;

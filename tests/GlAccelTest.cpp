@@ -1732,6 +1732,79 @@ static void test_depth_transfer() {
   CHECK(a.live == 0);
 }
 
+// AccelLimits::texture_levels: a compressed texture goes to the device as its blocks (and is never decoded on the CPU for it), a DXT1 image without alpha that has
+// transparent texels goes decoded (GL reads them as opaque black, the device's BC1 as transparent), a sub-image sends the blocks again, and texelFetch draws on the
+// device - each against the CPU.
+static void test_device_compressed_textures() {
+  TestAllocator a;
+  for (int device = 1; device >= 0; --device) {
+    TgsiAccel ref;
+    ref.texture_levels = true;
+    set_accelerator(device ? &ref : nullptr);
+    {
+      GlContext gl(a, true, 32, 32, noaa());
+      static const char* kVs = "attribute vec3 pos; varying vec2 uv; void main() { uv = pos.xy * 0.5 + 0.5; gl_Position = vec4(pos, 1.0); }";
+      static const char* kFs = "precision mediump float; varying vec2 uv; uniform sampler2D tex; void main() { gl_FragColor = texture2D(tex, uv); }";
+      const uint32_t prog = make_program(gl, kVs, kFs);
+      gl.use_program(prog);
+      quad_buffer(gl, prog, 0.0f);
+      // 8 x 8 DXT1 with alpha: red blocks (colour 0 red > colour 1 blue, index 0)
+      uint8_t blocks[4 * 8];
+      for (int b = 0; b < 4; ++b) {
+        uint8_t* p = blocks + b * 8;
+        p[0] = 0x00, p[1] = 0xF8, p[2] = 0x1F, p[3] = 0x00, p[4] = p[5] = p[6] = p[7] = 0;
+      }
+      const uint32_t t = gl.create_texture();
+      gl.bind_texture(0x0DE1, t);
+      gl.compressed_tex_image(0x0DE1, 0, 0x83F1, 8, 8, 1, 0, ConstByteView(blocks, sizeof blocks), false);
+      gl.tex_parameter(0x0DE1, 0x2801, 0x2600);
+      gl.tex_parameter(0x0DE1, 0x2800, 0x2600);
+      CHECK(gl.get_error() == 0);
+      gl.clear(0x4000);
+      gl.draw_arrays(4, 0, 6, 1);
+      if (device) CHECK(gl.hardware_stats().gpu_draws == 1 && ref.block_writes == 1);
+      CHECK(pixel(gl, 4, 4) == 0xFFFF0000u && pixel(gl, 28, 28) == 0xFFFF0000u);
+      // a block of blue (index 1): the blocks go up again
+      const uint8_t blue[8] = {0x00, 0xF8, 0x1F, 0x00, 0x55, 0x55, 0x55, 0x55};
+      gl.compressed_tex_sub_image(0x0DE1, 0, 4, 4, 0, 4, 4, 1, 0x83F1, ConstByteView(blue, sizeof blue), false);
+      gl.draw_arrays(4, 0, 6, 1);
+      if (device) CHECK(gl.hardware_stats().gpu_draws == 2 && ref.block_writes == 2);
+      CHECK(pixel(gl, 4, 4) == 0xFFFF0000u && pixel(gl, 28, 28) == 0xFF0000FFu);
+      // RGB DXT1 with a transparent texel (colour 0 <= colour 1, index 3): decoded for the device, black and opaque
+      uint8_t rgb[4 * 8];
+      for (int b = 0; b < 4; ++b) {
+        uint8_t* p = rgb + b * 8;
+        p[0] = 0x1F, p[1] = 0x00, p[2] = 0x00, p[3] = 0xF8, p[4] = p[5] = p[6] = p[7] = 0xFF;      // (colour 0 blue < colour 1 red: three colours, index 3 everywhere)
+      }
+      const uint32_t t2 = gl.create_texture();
+      gl.bind_texture(0x0DE1, t2);
+      gl.compressed_tex_image(0x0DE1, 0, 0x83F0, 8, 8, 1, 0, ConstByteView(rgb, sizeof rgb), false);
+      gl.tex_parameter(0x0DE1, 0x2801, 0x2600);
+      gl.tex_parameter(0x0DE1, 0x2800, 0x2600);
+      const int blocks_before = ref.block_writes;
+      gl.clear(0x4000);
+      gl.draw_arrays(4, 0, 6, 1);
+      if (device) CHECK(gl.hardware_stats().gpu_draws == 3 && ref.block_writes == blocks_before);
+      CHECK(pixel(gl, 10, 10) == 0xFF000000u);
+      // texelFetch (GLSL ES 3.00) of the first texture: the device's TXF
+      gl.bind_texture(0x0DE1, t);
+      static const char* kVs3 = "#version 300 es\nin vec3 pos; void main() { gl_Position = vec4(pos, 1.0); }";
+      static const char* kFs3 = "#version 300 es\nprecision mediump float; uniform sampler2D tex; out vec4 o;\nvoid main() { o = texelFetch(tex, ivec2(gl_FragCoord.xy) / 4, 0); }";
+      const uint32_t fetch = make_program(gl, kVs3, kFs3);
+      gl.use_program(fetch);
+      quad_buffer(gl, fetch, 0.0f);
+      gl.clear(0x4000);
+      gl.draw_arrays(4, 0, 6, 1);
+      if (device && gl.hardware_stats().gpu_draws != 4) printf("texelFetch: %s\n", gl.hardware_stats().last_refusal ? gl.hardware_stats().last_refusal : "-");
+      if (device) CHECK(gl.hardware_stats().gpu_draws == 4);
+      if (pixel(gl, 2, 2) != 0xFFFF0000u || pixel(gl, 30, 30) != 0xFF0000FFu) printf("texelFetch (%s): %08x %08x\n", device ? "device" : "cpu", pixel(gl, 2, 2), pixel(gl, 30, 30));
+      CHECK(pixel(gl, 2, 2) == 0xFFFF0000u && pixel(gl, 30, 30) == 0xFF0000FFu);
+    }
+    set_accelerator(nullptr);
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
   test_translate_overloads();
   test_bound_fragment_outputs();
@@ -1751,6 +1824,7 @@ int main() {
   test_framebuffer_objects();
   test_framebuffer_objects_mrt();
   test_mipmapped_texture();
+  test_device_compressed_textures();
   test_instancing_and_buffer_state();
   test_stage_programs();
   test_refused_program_and_failed_draw();

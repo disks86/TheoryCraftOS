@@ -27,7 +27,9 @@
 // is only what the CPU draws and clears put there, and a draw with the depth test after hw_upload stays on the CPU until the depth is cleared on the device.
 
 #include "WebGl/GlContext.hpp"
+#include "Utility/ByteStream.hpp"
 #include "WebGl/GlAssemble.hpp"
+#include "WebGl/GlCompressed.hpp"
 
 namespace webgl {
 
@@ -167,6 +169,8 @@ bool GlContext::hw_current(Image& im, AccelImage& copy) {
 // The device copy is newer than the pixels: they come back. A depth copy cannot be read; if a clear is all the device did to it since, the CPU does the same clear,
 // else the depth the device drew is lost to the CPU (counted in the draw statistics) and both copies go on from the CPU's.
 void GlContext::hw_sync_image(Image& im) {
+  // (a lazy compressed image: its blocks are decoded for the CPU - the device's copies are of the blocks, which stay)
+  if (im.lazy() && !im.decode()) hw_stats_.note("a compressed image that would not decode");
   if (!im.hw || !im.hw->ahead) return;
   AccelImage& copy = *im.hw;
   const bool depth_copy = copy.format == AccelFormat::Depth || copy.format == AccelFormat::DepthStencil;
@@ -206,13 +210,13 @@ void GlContext::hw_sync_image(Image& im) {
 }
 
 void GlContext::hw_sync_texture(Texture& t) {
-  if (objects_->hw_ahead <= 0) return;
+  if ((objects_->hw_ahead <= 0 && objects_->budget.lazy <= 0)) return;
   for (const UniquePointer<Image>& im : t.images)
     if (im) hw_sync_image(*im);
 }
 
 void GlContext::hw_sync_images() {
-  if (objects_->hw_ahead <= 0) return;
+  if ((objects_->hw_ahead <= 0 && objects_->budget.lazy <= 0)) return;
   for (const UniquePointer<Texture>& t : objects_->textures)
     if (t) hw_sync_texture(*t);
   for (const UniquePointer<Renderbuffer>& rb : objects_->rbos)
@@ -220,7 +224,7 @@ void GlContext::hw_sync_images() {
 }
 
 void GlContext::hw_sync_for_cpu_draw(const Target& target) {
-  if (objects_->hw_ahead <= 0) return;
+  if ((objects_->hw_ahead <= 0 && objects_->budget.lazy <= 0)) return;
   hw_sync_target(target);
   for (const TextureUnit& u : units_) {
     const uint32_t names[] = {u.tex2d, u.cube, u.tex3d, u.array, u.tex1d, u.rect, u.array1d, u.cube_array, u.ms2d, u.ms2d_array};
@@ -230,7 +234,7 @@ void GlContext::hw_sync_for_cpu_draw(const Target& target) {
 }
 
 void GlContext::hw_sync_target(const Target& t) {
-  if (objects_->hw_ahead <= 0 || t.is_default) return;
+  if ((objects_->hw_ahead <= 0 && objects_->budget.lazy <= 0) || t.is_default) return;
   for (Image* im : t.color)
     if (im) hw_sync_image(*im);
   if (t.depth) hw_sync_image(*t.depth);
@@ -411,7 +415,7 @@ bool GlContext::hw_mip_texture(Texture& t, const SamplerObj& so, uint32_t* handl
   sampler->mip = so.min_filter == 0x2702 || so.min_filter == 0x2703 ? 2 : 1;
   sampler->min_lod = so.min_lod < 0 ? 0 : so.min_lod;
   sampler->max_lod = so.max_lod;
-  sampler->lod_bias = so.lod_bias + t.lod_bias;
+  sampler->lod_bias = so.lod_bias;
   *handle = copy->handle;
   return true;
 }
@@ -424,11 +428,27 @@ bool GlContext::hw_layered_texture(const TgsiSampler& ts, uint32_t unit, uint32_
   IAccelerator* acc = accelerator();
   if (!acc || !acc->limits().layered_textures) return no("a 3D, cube or array texture on a device without them");
   const TextureUnit& u = units_[unit];
-  const bool cube = ts.dim == shader::kDimCube, volume = ts.dim == shader::kDim3D;
-  const uint32_t name = cube ? u.cube : (volume ? u.tex3d : u.array);
-  const uint32_t target = cube ? 0x8513 : (volume ? 0x806F : 0x8C1A);
+  const bool cube = ts.dim == shader::kDimCube, volume = ts.dim == shader::kDim3D, ms_array = ts.dim == shader::kDimMultisampledArray;
+  const uint32_t name = cube ? u.cube : (volume ? u.tex3d : ms_array ? u.ms2d_array : u.array);
+  const uint32_t target = cube ? 0x8513 : (volume ? 0x806F : ms_array ? 0x9102 : 0x8C1A);
   Texture* t = name && name <= objects_->textures.count() ? objects_->textures[name - 1].get() : nullptr;
-  if (!t || t->target != target) return no("a texture of a kind the device cannot sample");
+  const AccelKind kind = cube ? AccelKind::Cube : (volume ? AccelKind::Volume : AccelKind::Array);
+  if (!t || t->target != target) {
+    if (!ts.shadow && (!t || t->target == 0) && hw_incomplete_texture(kind, handle, why)) return true;
+    return no("a texture of a kind the device cannot sample");
+  }
+  if (acc->limits().texture_levels) {
+    // (every level, format and sampler state the device has: hw_sampled_texture)
+    const SamplerObj so = unit_sampler(u, *t);
+    if (t->swizzle[0] != 0x1903 || t->swizzle[1] != 0x1904 || t->swizzle[2] != 0x1905 || t->swizzle[3] != 0x1906) return no("a texture swizzle");
+    if (so.compare_mode != 0) return no("a texture comparison");
+    bool mipmapped;
+    if (!hw_sampler_state(so, sampler, &mipmapped, why)) return false;
+    bool is_cube;
+    if (!texture_complete(*t, so, &is_cube)) return hw_incomplete_texture(kind, handle, why);
+    return hw_sampled_texture(*t, ts.dim, (mipmapped || ts.fetch) && !ms_array, handle, why);
+  }
+  if (ms_array) return no("a multisampled array texture on a device without levels of every texture");
   SamplerObj so;
   if (u.sampler && u.sampler <= objects_->samplers.count() && objects_->samplers[u.sampler - 1]) so = *objects_->samplers[u.sampler - 1];
   else {
@@ -507,6 +527,256 @@ bool GlContext::hw_layered_texture(const TgsiSampler& ts, uint32_t unit, uint32_
   return true;
 }
 
+SamplerObj GlContext::unit_sampler(const TextureUnit& u, const Texture& t) const {
+  if (u.sampler && u.sampler <= objects_->samplers.count() && objects_->samplers[u.sampler - 1]) return *objects_->samplers[u.sampler - 1];
+  SamplerObj so;
+  so.min_filter = t.min_filter;
+  so.mag_filter = t.mag_filter;
+  so.wrap_s = t.wrap_s;
+  so.wrap_t = t.wrap_t;
+  so.wrap_r = t.wrap_r;
+  so.compare_mode = t.compare_mode;
+  so.compare_func = t.compare_func;
+  so.min_lod = t.min_lod;
+  so.max_lod = t.max_lod;
+  so.lod_bias = t.lod_bias;
+  so.anisotropy = t.anisotropy;
+  for (uint32_t k = 0; k < 4; ++k) so.border[k] = t.border_color[k];
+  return so;
+}
+
+bool GlContext::hw_sampler_state(const SamplerObj& so, AccelSampler* sampler, bool* mipmapped, const char** why) {
+  const auto no = [why](const char* reason) { *why = reason; return false; };
+  IAccelerator* acc = accelerator();
+  if (!acc) return no("no accelerator");
+  const AccelLimits l = acc->limits();
+  const uint32_t minf = so.min_filter, magf = so.mag_filter;
+  *mipmapped = minf >= 0x2700 && minf <= 0x2703;
+  if ((minf != 0x2600 && minf != 0x2601 && !*mipmapped) || (magf != 0x2600 && magf != 0x2601)) return no("a texture filter");
+  // (the filter within a level: a mipmapped one's NEAREST_MIPMAP_* / LINEAR_MIPMAP_* part; magnification's when it differs, with the device's sampler state)
+  const bool within_linear = minf == 0x2601 || minf == 0x2701 || minf == 0x2703, mag_linear = magf == 0x2601;
+  sampler->linear = within_linear;
+  sampler->separate_mag = false;
+  if (mag_linear != within_linear) {
+    if (!l.sampler_state) return no("different filters for minification and magnification");
+    sampler->separate_mag = true;
+    sampler->mag_linear = mag_linear;
+  }
+  sampler->mip = !*mipmapped ? 0 : (minf == 0x2702 || minf == 0x2703 ? 2 : 1);
+  // Wrap modes: REPEAT, MIRRORED_REPEAT and CLAMP_TO_EDGE on any device; CLAMP_TO_BORDER and MIRROR_CLAMP_TO_EDGE with its sampler state; GL_CLAMP (compatibility)
+  // where no filter reaches past the edge texel - nearest filters -, where it is CLAMP_TO_EDGE.
+  bool any_border = false;
+  const auto axis = [&](uint32_t mode, bool* repeat, bool* mirror, bool* border, bool* once) {
+    *repeat = mode == 0x2901 || mode == 0x8370;
+    *mirror = mode == 0x8370;
+    *border = *once = false;
+    switch (mode) {
+      case 0x2901: case 0x8370: case 0x812F: return true;
+      case 0x812D: any_border = *border = true; return l.sampler_state;
+      case 0x8742: *once = true; return l.sampler_state;
+      case 0x2900: return !within_linear && !mag_linear;
+      default: return false;
+    }
+  };
+  if (!axis(so.wrap_s, &sampler->repeat_s, &sampler->mirror_s, &sampler->border_s, &sampler->mirror_once_s) ||
+      !axis(so.wrap_t, &sampler->repeat_t, &sampler->mirror_t, &sampler->border_t, &sampler->mirror_once_t))
+    return no("a texture wrap mode");
+  for (uint32_t k = 0; k < 4; ++k) sampler->border[k] = any_border ? so.border[k] : 0.0f;
+  sampler->anisotropy = 1;
+  if (so.anisotropy > 1 && l.max_anisotropy > 1) {
+    const float a = so.anisotropy > static_cast<float>(l.max_anisotropy) ? static_cast<float>(l.max_anisotropy) : so.anisotropy;
+    sampler->anisotropy = static_cast<uint8_t>(a);
+  }
+  sampler->min_lod = so.min_lod < 0 ? 0 : so.min_lod;
+  sampler->max_lod = so.max_lod;
+  sampler->lod_bias = so.lod_bias;
+  return true;
+}
+
+AccelBlocks GlContext::hw_blocks_of(Image& im) const {
+  const IAccelerator* acc = accelerator();
+  if (!acc || !im.codec || !im.blocks_current()) return AccelBlocks::None;
+  const bool srgb = im.info && im.info->srgb;
+  AccelBlocks b = AccelBlocks::None;
+  switch (im.codec->codec) {
+    case Codec::Bc1Rgb:
+    case Codec::Bc1Rgba: b = srgb ? AccelBlocks::Bc1Srgb : AccelBlocks::Bc1; break;
+    case Codec::Bc2: b = srgb ? AccelBlocks::Bc2Srgb : AccelBlocks::Bc2; break;
+    case Codec::Bc3: b = srgb ? AccelBlocks::Bc3Srgb : AccelBlocks::Bc3; break;
+    case Codec::Bc4U: b = AccelBlocks::Bc4U; break;
+    case Codec::Bc4S: b = AccelBlocks::Bc4S; break;
+    case Codec::Bc5U: b = AccelBlocks::Bc5U; break;
+    case Codec::Bc5S: b = AccelBlocks::Bc5S; break;
+    case Codec::Bc6U: b = AccelBlocks::Bc6U; break;
+    case Codec::Bc6S: b = AccelBlocks::Bc6S; break;
+    case Codec::Bc7: b = srgb ? AccelBlocks::Bc7Srgb : AccelBlocks::Bc7; break;
+    default: return AccelBlocks::None;      // (ETC, EAC, ASTC: decoded)
+  }
+  if (!acc->takes_blocks(b)) return AccelBlocks::None;
+  if (im.codec->codec == Codec::Bc1Rgb) {
+    // (a block of three colours - colour 0 <= colour 1 - whose texel has index 3: GL's RGB DXT1 reads it as opaque black, the device's BC1 as transparent black)
+    const ConstByteView blocks = im.blocks.view();
+    for (uint64_t at = 0; at + 8 <= blocks.size(); at += 8) {
+      const uint32_t c0 = blocks[at] | uint32_t{blocks[at + 1]} << 8, c1 = blocks[at + 2] | uint32_t{blocks[at + 3]} << 8;
+      if (c0 > c1) continue;
+      for (uint64_t k = 4; k < 8; ++k) {
+        const uint8_t v = blocks[at + k];
+        if ((v & 3) == 3 || ((v >> 2) & 3) == 3 || ((v >> 4) & 3) == 3 || ((v >> 6) & 3) == 3) return AccelBlocks::None;
+      }
+    }
+  }
+  return b;
+}
+
+bool GlContext::hw_incomplete_texture(AccelKind kind, uint32_t* handle, const char** why) {
+  IAccelerator* acc = accelerator();
+  if (!acc || !acc->limits().texture_levels) {
+    *why = "an incomplete texture";
+    return false;
+  }
+  if (hw_incomplete_owner_ != acc) {
+    if (hw_incomplete_owner_)
+      for (uint32_t& h : hw_incomplete_)
+        if (h) hw_incomplete_owner_->destroy_texture(h);
+    for (uint32_t& h : hw_incomplete_) h = 0;
+    hw_incomplete_owner_ = acc;
+  }
+  uint32_t& h = hw_incomplete_[static_cast<uint32_t>(kind) & 3];
+  if (!h) {
+    AccelTextureDesc d;
+    d.w = d.h = 1;
+    d.kind = kind;
+    d.layers = kind == AccelKind::Cube ? 6 : 1;
+    h = acc->create_texture_levels(d);
+    const uint8_t black[4] = {0, 0, 0, 255};
+    bool ok = h != 0;
+    for (uint32_t layer = 0; ok && layer < d.layers; ++layer) ok = acc->write_level(h, 0, layer, ConstByteView(black, 4));
+    if (!ok) {
+      if (h) acc->destroy_texture(h);
+      h = 0;
+      *why = "an incomplete texture";
+      return false;
+    }
+  }
+  *handle = h;
+  return true;
+}
+
+bool GlContext::hw_sampled_texture(Texture& t, uint8_t dim, bool mipmapped, uint32_t* handle, const char** why) {
+  const auto no = [why](const char* reason) { *why = reason; return false; };
+  IAccelerator* acc = accelerator();
+  if (!acc || !acc->limits().texture_levels) return no("a mipmapped texture filter");
+  const AccelLimits l = acc->limits();
+  const bool cube = dim == shader::kDimCube, volume = dim == shader::kDim3D, array = dim == shader::kDim2DArray || dim == shader::kDimMultisampledArray;
+  const AccelKind kind = cube ? AccelKind::Cube : volume ? AccelKind::Volume : array ? AccelKind::Array : AccelKind::Plain;
+  const uint32_t faces = cube ? 6 : 1;
+  const int32_t base = t.base_level < 0 ? 0 : t.base_level;
+  if (base >= static_cast<int32_t>(kMaxLevels)) return no("an incomplete texture");
+  auto image_at = [&](uint32_t face, uint32_t level) -> Image* {
+    const uint64_t at = uint64_t{face} * kMaxLevels + static_cast<uint32_t>(base) + level;
+    return static_cast<uint32_t>(base) + level < kMaxLevels && at < t.images.count() && t.images[at] && t.images[at]->defined() ? t.images[at].get() : nullptr;
+  };
+  Image* b = image_at(0, 0);
+  if (!b) return no("an incomplete texture");
+  if (b->ss != 1) return no("a layered or multisampled texture");
+  if (b->w > 8192 || b->h > 8192) return no("a texture larger than the device takes");
+  if (cube && b->w != b->h) return no("an incomplete texture");
+  const uint32_t layers = cube ? 6 : (volume || array ? b->d : 1);
+  if (layers == 0 || layers > 2048) return no("a texture of more layers than the device takes");
+  // the levels: base, base + 1 ... while each is half the one before (texture_complete checked them), up to max_level and the 1 x 1 level
+  uint32_t levels = 1;
+  if (mipmapped) {
+    const int32_t last = t.max_level < base ? base : (t.max_level > static_cast<int32_t>(kMaxLevels) - 1 ? static_cast<int32_t>(kMaxLevels) - 1 : t.max_level);
+    uint32_t w = b->w, h = b->h, d = b->d;
+    for (int32_t lv = base + 1; lv <= last && (w > 1 || h > 1 || (volume && d > 1)); ++lv) {
+      w = w > 1 ? w / 2 : 1;
+      h = h > 1 ? h / 2 : 1;
+      if (volume) d = d > 1 ? d / 2 : 1;
+      bool all = true;
+      for (uint32_t f = 0; f < faces && all; ++f) {
+        const Image* im = image_at(f, levels);
+        all = im && im->w == w && im->h == h && im->d == d && im->info == b->info;
+      }
+      if (!all) break;
+      ++levels;
+    }
+  }
+  for (uint32_t f = 0; f < faces; ++f) {
+    const Image* im = image_at(f, 0);
+    if (!im || im->info != b->info || im->ss != 1 || im->w != b->w || im->h != b->h || im->d != b->d) return no("an incomplete texture");
+  }
+  // Blocks as they are where every image has them and the device takes them, else the decoded texels.
+  AccelBlocks blocks = hw_blocks_of(*b);
+  for (uint32_t f = 0; f < faces && blocks != AccelBlocks::None; ++f)
+    for (uint32_t k = 0; k < levels && blocks != AccelBlocks::None; ++k)
+      if (hw_blocks_of(*image_at(f, k)) != blocks) blocks = AccelBlocks::None;
+  AccelFormat format = AccelFormat::Rgba8;
+  if (blocks == AccelBlocks::None) {
+    switch (b->info->store) {
+      case Store::U8x4:
+        if (b->info->is_signed) return no("a texture format the device cannot sample");
+        if (b->info->srgb && !l.srgb_images) return no("a texture format the device cannot sample");
+        format = b->info->srgb ? AccelFormat::Rgba8Srgb : AccelFormat::Rgba8;
+        break;
+      case Store::F32x4:
+        if (!l.float_textures) return no("a texture format the device cannot sample");
+        format = AccelFormat::Rgba32F;
+        break;
+      default: return no("a texture format the device cannot sample");
+    }
+  }
+  AccelImage* copy = t.hw_mips.get();
+  if (!copy || copy->owner != acc || copy->format != format || copy->blocks != blocks || copy->kind != kind || copy->w != b->w || copy->h != b->h || copy->levels != levels ||
+      copy->layers != layers || t.hw_mip_base != base) {
+    t.hw_mips.reset();
+    AccelTextureDesc d;
+    d.w = b->w;
+    d.h = b->h;
+    d.layers = layers;
+    d.levels = levels;
+    d.kind = kind;
+    d.format = format;
+    d.blocks = blocks;
+    const uint32_t made = acc->create_texture_levels(d);
+    if (!made) return no("the device refused a texture");
+    t.hw_mips = UniquePointer<AccelImage>::make(a_);
+    if (!t.hw_mips) {
+      acc->destroy_texture(made);
+      return no("out of memory");
+    }
+    copy = t.hw_mips.get();
+    copy->owner = acc;
+    copy->handle = made;
+    copy->format = format;
+    copy->blocks = blocks;
+    copy->kind = kind;
+    copy->w = b->w;
+    copy->h = b->h;
+    copy->levels = levels;
+    copy->layers = layers;
+    t.hw_mip_base = base;
+    for (uint64_t& v : t.hw_mip_versions) v = 0;
+  }
+  for (uint32_t f = 0; f < faces; ++f)
+    for (uint32_t k = 0; k < levels; ++k) {
+      Image& im = *image_at(f, k);
+      if (blocks == AccelBlocks::None) hw_sync_image(im);      // (the pixels: a level the device drew into comes back, a compressed one is decoded)
+      const uint64_t v = im.version();
+      uint64_t& seen = t.hw_mip_versions[uint64_t{f} * kMaxLevels + k];
+      if (seen == v) continue;
+      // (a cube's face is its layer; a volume's or an array's slices are its layers, of this level)
+      const uint32_t slices = cube ? 1 : (volume || array ? im.d : 1);
+      const uint64_t slice_bytes = blocks != AccelBlocks::None ? compressed_size(*im.codec, im.w, im.h, 1) : uint64_t{im.w} * im.h * texel_bytes(im.info->store);
+      const ConstByteView data = blocks != AccelBlocks::None ? im.blocks.view() : im.px.view();
+      if (data.size() != slice_bytes * slices) return no("an incomplete texture");
+      for (uint32_t z = 0; z < slices; ++z)
+        if (!acc->write_level(copy->handle, k, cube ? f : z, data.subview(z * slice_bytes, slice_bytes))) return no("the device refused a texture");
+      seen = v;
+    }
+  *handle = copy->handle;
+  return true;
+}
+
 // The texture bound to `unit` as the device can read sampler `ts`: a 2D (or 1D, rectangle) texture with a filter and wrap mode the device has. Its image goes to the
 // device as its copy there (Image::hw), which is what a framebuffer object drew into when it did (no CPU copy then); a mipmapped filter takes the texture's levels
 // (hw_mip_texture). A shadow sampler reads depth (a depth image the device drew into, or the CPU's depth sent as floats in R) with nearest filtering; the shader
@@ -517,40 +787,35 @@ bool GlContext::hw_texture(const TgsiSampler& ts, uint32_t unit, uint32_t* handl
   // on the CPU: Unigine Heaven's 2048-wide loading picture took 4 s a frame there)
   constexpr uint32_t kMaxSide = 8192;
   if (unit >= kMaxTextureUnits) return no("a texture unit past the last");
-  if (ts.dim == shader::kDim3D || ts.dim == shader::kDimCube || ts.dim == shader::kDim2DArray) return hw_layered_texture(ts, unit, handle, sampler, why);
+  if (ts.dim == shader::kDim3D || ts.dim == shader::kDimCube || ts.dim == shader::kDim2DArray || ts.dim == shader::kDimMultisampledArray)
+    return hw_layered_texture(ts, unit, handle, sampler, why);
   const TextureUnit& u = units_[unit];
-  const uint32_t name = ts.dim == shader::kDim1D ? u.tex1d : (ts.dim == shader::kDimRect ? u.rect : u.tex2d);
-  const uint32_t target = ts.dim == shader::kDim1D ? 0x0DE0 : (ts.dim == shader::kDimRect ? 0x84F5 : 0x0DE1);
+  const bool multisampled = ts.dim == shader::kDimMultisampled;      // (one sample a texel: a 2D texture on the device, read by TXF)
+  const uint32_t name = ts.dim == shader::kDim1D ? u.tex1d : (ts.dim == shader::kDimRect ? u.rect : multisampled ? u.ms2d : u.tex2d);
+  const uint32_t target = ts.dim == shader::kDim1D ? 0x0DE0 : (ts.dim == shader::kDimRect ? 0x84F5 : multisampled ? 0x9100 : 0x0DE1);
   Texture* t = name && name <= objects_->textures.count() ? objects_->textures[name - 1].get() : nullptr;      // (no hw_sync_texture: the device reads its copies)
-  if (!t || t->target != target) return no("a texture of a kind the device cannot sample");
-  SamplerObj so;
-  if (u.sampler && u.sampler <= objects_->samplers.count() && objects_->samplers[u.sampler - 1]) so = *objects_->samplers[u.sampler - 1];
-  else {
-    so.min_filter = t->min_filter;
-    so.mag_filter = t->mag_filter;
-    so.wrap_s = t->wrap_s;
-    so.wrap_t = t->wrap_t;
-    so.compare_mode = t->compare_mode;
-    so.compare_func = t->compare_func;
-    so.min_lod = t->min_lod;
-    so.max_lod = t->max_lod;
-    so.lod_bias = t->lod_bias;
+  if (!t || t->target != target) {
+    // (no texture of the kind bound, or one never bound to a target: GL samples an incomplete texture, (0, 0, 0, 1))
+    if (!ts.shadow && (!t || t->target == 0) && hw_incomplete_texture(AccelKind::Plain, handle, why)) return true;
+    return no("a texture of a kind the device cannot sample");
   }
+  const SamplerObj so = unit_sampler(u, *t);
   if (t->swizzle[0] != 0x1903 || t->swizzle[1] != 0x1904 || t->swizzle[2] != 0x1905 || t->swizzle[3] != 0x1906) return no("a texture swizzle");
-  const bool mipmapped = so.min_filter >= 0x2700 && so.min_filter <= 0x2703;
-  const bool nearest = so.min_filter == 0x2600 && so.mag_filter == 0x2600, linear = so.min_filter == 0x2601 && so.mag_filter == 0x2601;
-  if (!mipmapped && !nearest && !linear) return no("different filters for minification and magnification");
-  auto wrap = [](uint32_t mode, bool* repeat, bool* mirror) {
-    *repeat = mode == 0x2901 || mode == 0x8370;
-    *mirror = mode == 0x8370;
-    return mode == 0x2901 || mode == 0x812F || mode == 0x8370;
-  };
-  if (!wrap(so.wrap_s, &sampler->repeat_s, &sampler->mirror_s) || !wrap(so.wrap_t, &sampler->repeat_t, &sampler->mirror_t)) return no("a texture wrap mode");
+  bool mipmapped;
+  if (!hw_sampler_state(so, sampler, &mipmapped, why)) return false;
   if (!ts.shadow && so.compare_mode != 0) return no("a texture comparison");      // (a comparison through a sampler that is not a shadow one: the CPU's)
-  if (ts.dim == shader::kDim1D) sampler->repeat_t = true;
-  sampler->linear = linear && !ts.shadow;
+  if (ts.dim == shader::kDim1D) {
+    sampler->repeat_t = true;
+    sampler->mirror_t = sampler->border_t = sampler->mirror_once_t = false;
+  }
+  // (a shadow sampler's filtering is the shader's - params row 0 -: the device reads the nearest texel)
+  const bool linear = so.min_filter == 0x2601 && so.mag_filter == 0x2601;
+  if (ts.shadow) sampler->linear = sampler->separate_mag = false;
   bool cube;
-  if (!texture_complete(*t, so, &cube) || t->images.count() == 0) return no("an incomplete texture");
+  if (!texture_complete(*t, so, &cube) || t->images.count() == 0) {
+    if (!ts.shadow && hw_incomplete_texture(AccelKind::Plain, handle, why)) return true;
+    return no("an incomplete texture");
+  }
   const int32_t base = t->base_level < 0 ? 0 : t->base_level;
   if (static_cast<uint64_t>(base) >= t->images.count() || !t->images[static_cast<uint64_t>(base)] || !t->images[static_cast<uint64_t>(base)]->defined()) return no("an incomplete texture");
   Image& im = *t->images[static_cast<uint64_t>(base)];
@@ -588,6 +853,11 @@ bool GlContext::hw_texture(const TgsiSampler& ts, uint32_t unit, uint32_t* handl
     return *handle != 0 || no("the device refused the texture");
   }
   if (!ts.shadow && !depth_image) {
+    // (its levels, or its blocks, as one device texture - unless a framebuffer object drew into its base level, whose device copy is then read as it is)
+    // (texelFetch reads any level: all of them go to the device; a multisampled texture has one)
+    const bool all_levels = (mipmapped || ts.fetch) && !multisampled;
+    if (!(im.hw && im.hw->ahead) && acc->limits().texture_levels && (all_levels || im.codec)) return hw_sampled_texture(*t, ts.dim, all_levels, handle, why);
+    if (ts.fetch && !multisampled && !(im.hw && im.hw->ahead)) return no("a texel fetch on a device without levels of every texture");
     if (mipmapped && !(im.hw && im.hw->ahead)) return hw_mip_texture(*t, so, handle, sampler, why);
     // (a mipmapped filter on a texture the device drew into: its level 0 alone, which is what a framebuffer's picture sampled at its own size reads)
     if (mipmapped) {
@@ -1216,46 +1486,53 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
     for (uint32_t k = 0; k < nattr; ++k)
       if ((instanced & (1u << k)) && !put_attribute(k, i / attribs[k]->divisor + desktop.base_instance)) return false;
 
-  // uniforms: the CONST rows
+  // uniforms: the CONST rows (zero where no constant is; each constant written into its row, in one pass over them)
   ByteBuffer constants(a_);
-  for (uint32_t row = 0; row < t.const_rows; ++row) {
-    uint32_t lanes[4] = {0, 0, 0, 0};
+  if (!constants.put_zeros(uint64_t{t.const_rows} * 16)) return no("out of memory");
+  {
+    ByteView rows = constants.writable_view();
     for (const TgsiConstant& c : t.constants) {
-      if (c.row != row) continue;
+      if (c.row >= t.const_rows) continue;
+      uint32_t lanes[4] = {0, 0, 0, 0};
+      bool have[4] = {false, false, false, false};
       if (c.stage == kTgsiClipPlanes) {      // (the user clip planes, eye space)
-        for (uint32_t i = 0; i < c.comps && i < 4; ++i) lanes[i] = f2u(c.slot / 4 < 8 ? desktop.clip_planes[c.slot / 4][i] : 0.0f);
-        continue;
-      }
-      if (c.stage == kTgsiPatchLevels) {      // (the default tessellation levels: outer, then inner)
+        for (uint32_t i = 0; i < c.comps && i < 4; ++i) lanes[i] = f2u(c.slot / 4 < 8 ? desktop.clip_planes[c.slot / 4][i] : 0.0f), have[i] = true;
+      } else if (c.stage == kTgsiPatchLevels) {      // (the default tessellation levels: outer, then inner)
         for (uint32_t i = 0; i < c.comps && i < 4; ++i) {
           const uint32_t at = c.slot + i;
           lanes[i] = f2u(at < 4 ? desktop.patch_outer[at] : (at < 6 ? desktop.patch_inner[at - 4] : 0.0f));
+          have[i] = true;
         }
-        continue;
+      } else {
+        const ExtraStage* extra = c.stage >= 2 && c.stage < 5 ? p.extra[c.stage - 2].get() : nullptr;
+        if (c.stage >= 2 && !extra) continue;
+        const List<uint32_t>& shared = c.stage == 0 ? p.vs_shared : (c.stage == 1 ? p.fs_shared : extra->shared);
+        for (uint32_t i = 0; i < c.comps && i < 4; ++i) {
+          if (c.slot + i >= shared.count()) continue;
+          const uint32_t bits = shared[c.slot + i];
+          // (the device keeps integers and booleans as float values, exact up to 2^24: a larger integer draws on the CPU, which wraps as GLSL says)
+          switch (c.convert) {
+            case kTgsiFromInt:
+              if (!exact_int(static_cast<int32_t>(bits))) return no("an integer the device cannot hold exactly");
+              lanes[i] = f2u(static_cast<float>(static_cast<int32_t>(bits)));
+              break;
+            case kTgsiFromUint:
+              if (bits > kExactInt) return no("an integer the device cannot hold exactly");
+              lanes[i] = f2u(static_cast<float>(bits));
+              break;
+            case kTgsiFromBool: lanes[i] = f2u(bits ? 1.0f : 0.0f); break;
+            default: lanes[i] = bits; break;
+          }
+          have[i] = true;
+        }
       }
-      const ExtraStage* extra = c.stage >= 2 && c.stage < 5 ? p.extra[c.stage - 2].get() : nullptr;
-      if (c.stage >= 2 && !extra) continue;
-      const List<uint32_t>& shared = c.stage == 0 ? p.vs_shared : (c.stage == 1 ? p.fs_shared : extra->shared);
-      for (uint32_t i = 0; i < c.comps && i < 4; ++i) {
-        if (c.slot + i >= shared.count()) continue;
-        const uint32_t bits = shared[c.slot + i];
-        // (the device keeps integers and booleans as float values, exact up to 2^24: a larger integer draws on the CPU, which wraps as GLSL says)
-        switch (c.convert) {
-          case kTgsiFromInt:
-            if (!exact_int(static_cast<int32_t>(bits))) return no("an integer the device cannot hold exactly");
-            lanes[i] = f2u(static_cast<float>(static_cast<int32_t>(bits)));
-            break;
-          case kTgsiFromUint:
-            if (bits > kExactInt) return no("an integer the device cannot hold exactly");
-            lanes[i] = f2u(static_cast<float>(bits));
-            break;
-          case kTgsiFromBool: lanes[i] = f2u(bits ? 1.0f : 0.0f); break;
-          default: lanes[i] = bits; break;
-        }
+      // (a constant fills the lanes it has of its row: the components from 0, as the rows were laid out - a later constant of the same lanes is the one kept, as before)
+      for (uint32_t i = 0; i < 4; ++i) {
+        if (!have[i]) continue;
+        ByteWriter w{rows.subview((uint64_t{c.row} * 4 + i) * 4, 4)};
+        w.le32(lanes[i]);
       }
     }
-    for (uint32_t i = 0; i < 4; ++i)
-      if (!constants.put32(lanes[i])) return no("out of memory");
   }
 
   const float ss = static_cast<float>(target.ss);

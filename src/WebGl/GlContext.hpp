@@ -75,6 +75,10 @@ struct AccelImage {
   uint32_t handle = 0;
   AccelFormat format = AccelFormat::Rgba8;
   uint32_t w = 0, h = 0, levels = 1;
+  // (a texture's sampled copy - GlContext::hw_sampled_texture -: its layers, kind and blocks)
+  uint32_t layers = 1;
+  AccelKind kind = AccelKind::Plain;
+  AccelBlocks blocks = AccelBlocks::None;
   uint64_t synced = 0;           // the Image::version() the copy holds (0: none - the copy is out of date unless ahead)
   bool ahead = false;            // (set_ahead: the share group counts the images that are ahead, GlObjects::hw_ahead)
   int32_t* ahead_count = nullptr;
@@ -87,8 +91,56 @@ struct AccelImage {
   uint64_t cpu_seen = 0;
 };
 
+struct CompressedFormat;   // (GlCompressed.hpp)
+
+// What the images of a share group hold (their pixels and compressed blocks, as stored) and how many of them are lazy (Image::lazy). GlObjects owns it; each
+// image's share follows it (ImageShare).
+struct ImageBudget {
+  uint64_t bytes = 0;
+  int32_t lazy = 0;
+};
+// An image's part of an ImageBudget: moves with the image and gives its bytes back when it goes.
+class ImageShare {
+ public:
+  ImageShare() = default;
+  ImageShare(const ImageShare&) = delete;
+  ImageShare& operator=(const ImageShare&) = delete;
+  ImageShare(ImageShare&& o) : budget_(o.budget_), bytes_(o.bytes_), lazy_(o.lazy_) { o.budget_ = nullptr, o.bytes_ = 0, o.lazy_ = false; }
+  ImageShare& operator=(ImageShare&& o) {
+    if (this != &o) {
+      set(0, false);
+      budget_ = o.budget_, bytes_ = o.bytes_, lazy_ = o.lazy_;
+      o.budget_ = nullptr, o.bytes_ = 0, o.lazy_ = false;
+    }
+    return *this;
+  }
+  ~ImageShare() { set(0, false); }
+  void attach(ImageBudget* budget) {
+    const uint64_t n = bytes_;
+    const bool l = lazy_;
+    set(0, false);
+    budget_ = budget;
+    set(n, l);
+  }
+  void set(uint64_t bytes, bool lazy) {
+    if (budget_) {
+      budget_->bytes = budget_->bytes - bytes_ + bytes;
+      budget_->lazy += (lazy ? 1 : 0) - (lazy_ ? 1 : 0);
+    }
+    bytes_ = bytes;
+    lazy_ = lazy;
+  }
+  bool lazy() const { return lazy_; }
+  uint64_t bytes() const { return bytes_; }
+
+ private:
+  ImageBudget* budget_ = nullptr;
+  uint64_t bytes_ = 0;
+  bool lazy_ = false;
+};
+
 struct Image {
-  explicit Image(allocators::IAllocator& a) : px(a) {}
+  explicit Image(allocators::IAllocator& a) : px(a), blocks(a) {}
   uint32_t w = 0, h = 0, d = 1;   // (for a multisampled image these are the stored samples: ss x ss of them per pixel)
   uint32_t compressed = 0;        // the compressed format it was uploaded in (it is stored decoded), or 0
   uint32_t ss = 1;                // 2 for a 4-sample image, which is kept as a 2x supersampled image and averaged when resolved
@@ -108,9 +160,33 @@ struct Image {
   const uint8_t* texel(uint32_t x, uint32_t y, uint32_t z) const { return px.view().data() + ((uint64_t{z} * h + y) * w + x) * texel_bytes(info->store); }
   bool allocate(const FormatInfo* fi, uint32_t width, uint32_t height, uint32_t depth);
 
+  // A block-compressed image (`compressed` names its format) keeps the blocks it came in: `blocks` (rows of blocks top to bottom - GL's order, the first row of
+  // texels first - slice after slice), in `codec`'s format. They are the image while it is lazy (px not decoded: a CPU use decodes first, through
+  // GlContext::hw_sync_image; the device takes the blocks as they are), and still are after decode() while the pixels have not changed since (blocks_current).
+  ByteBuffer blocks;
+  const CompressedFormat* codec = nullptr;
+  bool lazy() const { return share_.lazy(); }
+  // Stores `data` as the image's blocks: a lazy image of `fi` (the decoded format) w x h x d. False if memory ran out (the image is then undefined).
+  bool set_blocks(const FormatInfo* fi, const CompressedFormat* cf, uint32_t width, uint32_t height, uint32_t depth, ConstByteView data);
+  // Replaces the blocks of a w x h x d box at (x, y, z) (block-aligned; `data` its blocks): the image is lazy afterwards (its decoded pixels, if any, go). False
+  // if the box is not inside the blocks.
+  bool replace_blocks(uint32_t x, uint32_t y, uint32_t z, uint32_t width, uint32_t height, uint32_t depth, ConstByteView data);
+  // Decodes the blocks into px (a lazy image): false if memory ran out or the blocks are damaged, the image then keeps its blocks and stays lazy.
+  bool decode();
+  // Whether the blocks are still what the image holds (it is lazy, or decoded and not written since).
+  bool blocks_current();
+  // The share group's count of image bytes this image's px and blocks are in (set where the image is made; see ImageBudget).
+  void set_budget(ImageBudget* budget) { share_.attach(budget); }
+  uint64_t stored_bytes() const { return share_.bytes(); }
+  // No storage: an undefined image (a 0 x 0 upload, a storage that failed).
+  void release();
+
  private:
+  void account(bool lazy) { share_.set(px.size() + blocks.size(), lazy); }
   uint64_t version_ = 0;
+  uint64_t blocks_version_ = 0;   // (the version the pixels had when decoded from the blocks: 0, none)
   bool changed_ = true;
+  ImageShare share_;
 };
 
 struct Color4 {
@@ -172,10 +248,12 @@ struct Texture {
   uint32_t depth_mode = 0x1909;           // GL_DEPTH_TEXTURE_MODE: GL_LUMINANCE
   uint32_t swizzle[4] = {0x1903, 0x1904, 0x1905, 0x1906};
   bool stencil_mode = false;              // GL_DEPTH_STENCIL_TEXTURE_MODE is GL_STENCIL_INDEX
-  // The 3D hardware's copy of its mipmap levels (sampled with a mipmapped filter; GlAccel.cpp): which level each of its levels is, at which Image::version().
+  float anisotropy = 1;                   // GL_TEXTURE_MAX_ANISOTROPY
+  // The 3D hardware's copy of its mipmap levels (sampled with a mipmapped filter, or a compressed or layered texture; GlAccel.cpp): which level each of its levels is,
+  // at which Image::version() of each face and level ([face * kMaxLevels + level]).
   UniquePointer<AccelImage> hw_mips;
   int32_t hw_mip_base = 0;
-  uint64_t hw_mip_versions[kMaxLevels] = {};
+  uint64_t hw_mip_versions[6 * kMaxLevels] = {};
   // ... and of a 3D, cube or array texture's base level (hw_layered_texture): the versions of its image (of each face of a cube)
   UniquePointer<AccelImage> hw_layers;
   uint8_t hw_layer_kind = 0;
@@ -187,7 +265,9 @@ struct SamplerObj {
   float min_lod = -1000, max_lod = 1000;
   float border[4] = {0, 0, 0, 0};
   float lod_bias = 0;
+  float anisotropy = 1;      // GL_TEXTURE_MAX_ANISOTROPY (1 .. kMaxAnisotropy)
 };
+constexpr float kMaxAnisotropy = 16;
 
 // Samples a texture. (GlSampler.cpp; the WebGPU device uses it too.)
 void sample_images(const SampleSource& src, const SamplerObj& sampler, const shader::SampleRequest& rq, uint32_t out[4]);
@@ -478,6 +558,8 @@ struct GlObjects {
   explicit GlObjects(allocators::IAllocator& a) : buffers(a), textures(a), rbos(a), shaders(a), programs(a), samplers(a) {}
   // the images of these textures and renderbuffers whose 3D hardware copy is newer than their pixels (AccelImage::ahead; first: it outlives them)
   int32_t hw_ahead = 0;
+  // what their images and the buffers hold, and how many images are lazy (Image::lazy; first too: it outlives them)
+  ImageBudget budget;
   List<UniquePointer<Buffer>> buffers;
   List<UniquePointer<Texture>> textures;
   List<UniquePointer<Renderbuffer>> rbos;
@@ -581,8 +663,20 @@ class GlContext final : public shader::ITextureHost {
   void reset_hardware_stats() { hw_stats_ = HardwareStats(); }
   // The 3D hardware's copies of images that are newer than the CPU's pixels come back (GlAccel.cpp): one texture's, or all of the share group's. Whatever reads or
   // writes a texture's pixels on the CPU calls one of these first.
+  // (they also decode lazy compressed images - Image::lazy - which a CPU use needs as pixels)
   void hw_sync_texture(Texture& t);
   void hw_sync_images();
+  // What the share group's images and buffers may hold together (default kMaxTotalBytes, a WebGL page's share; a desktop GL context gets the machine's).
+  void set_memory_budget(uint64_t bytes) { max_total_bytes_ = bytes; }
+  uint64_t memory_budget() const { return max_total_bytes_; }
+  // The largest width and height of an image (GL_MAX_TEXTURE_SIZE): kMaxTextureSize unless set (at most 1 << (kMaxLevels - 1), what the levels hold).
+  void set_max_texture_size(uint32_t size) { max_texture_size_ = size > (1u << (kMaxLevels - 1)) ? (1u << (kMaxLevels - 1)) : size; }
+  uint32_t max_texture_size() const { return max_texture_size_; }
+  // Whether `add` more bytes fit when `release` of the ones held now go (GL_OUT_OF_MEMORY otherwise).
+  bool budget_allows(uint64_t add, uint64_t release) const {
+    const uint64_t held = objects_->budget.bytes, kept = held > release ? held - release : 0;
+    return add <= max_total_bytes_ && kept <= max_total_bytes_ - add;
+  }
   GlContext& operator=(const GlContext&) = delete;
 
   bool valid() const { return valid_; }
@@ -904,7 +998,9 @@ class GlContext final : public shader::ITextureHost {
   uint32_t width_, height_;
   uint32_t error_ = 0;
   uint64_t version_ = 1;
-  uint64_t total_bytes_ = 0;
+  // (the share group's images and buffers together - objects_->budget.bytes - may hold this much; a desktop context's is set to the machine's: set_memory_budget)
+  uint64_t max_total_bytes_ = kMaxTotalBytes;
+  uint32_t max_texture_size_ = kMaxTextureSize;   // (a desktop context's: set_max_texture_size)
 
   GlObjects own_objects_;
   GlObjects* objects_;      // own_objects_, or those of a share group (set_objects)
@@ -1019,6 +1115,20 @@ class GlContext final : public shader::ITextureHost {
   static bool hw_fbo_colors(const Target& t, uint32_t* count, const char** why);
   bool hw_mip_texture(Texture& t, const SamplerObj& so, uint32_t* handle, AccelSampler* sampler, const char** why);
   bool hw_layered_texture(const TgsiSampler& ts, uint32_t unit, uint32_t* handle, AccelSampler* sampler, const char** why);
+  // The sampler state of `so` (filters, wraps, border colour, anisotropy) as the device's: false (*why) where the device has no such state. *mipmapped: a filter between levels.
+  bool hw_sampler_state(const SamplerObj& so, AccelSampler* sampler, bool* mipmapped, const char** why);
+  // The sampler unit `u` reads `t` with: its sampler object's state, else the texture's own (with its border colour and anisotropy).
+  SamplerObj unit_sampler(const TextureUnit& u, const Texture& t) const;
+  // The texture's levels (all of them for a mipmapped filter, else its base) and faces or layers as one device texture (AccelLimits::texture_levels), each image
+  // written up when its version changed - a compressed one's blocks as they are where the device takes them. `dim`: the sampler's (shader::kDim*).
+  bool hw_sampled_texture(Texture& t, uint8_t dim, bool mipmapped, uint32_t* handle, const char** why);
+  // The device's block format of a compressed image (None: decoded texels go up instead - a format the device has not, or a DXT1 image without alpha that has
+  // transparent texels, which GL reads as opaque black and the device as transparent).
+  AccelBlocks hw_blocks_of(Image& im) const;
+  // A texture of `kind` that reads (0, 0, 0, 1) everywhere: what GL samples from an incomplete texture.
+  bool hw_incomplete_texture(AccelKind kind, uint32_t* handle, const char** why);
+  uint32_t hw_incomplete_[4] = {};   // (by AccelKind)
+  IAccelerator* hw_incomplete_owner_ = nullptr;
 };
 
 // Vertex fetch shared by the software and accelerated draws (GlDraw.cpp): the four float lanes (as bit patterns, missing ones 0, 0, 0, 1) of the attribute element at

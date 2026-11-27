@@ -17,6 +17,7 @@
  */
 
 #include "Graphics/Graphics3D/WebGlAccelerator.hpp"
+#include "Graphics/BlockCompression.hpp"
 #include "Utility/AllocatedView.hpp"
 #include "Utility/ByteStream.hpp"
 #include "WebGl/TgsiTranslator.hpp"
@@ -86,7 +87,130 @@ webgl::AccelLimits WebGlAccelerator::limits() const {
   l.depth_bias = info.limits.depth_bias;
   l.layered_textures = (info.features & kFeatureTextureKinds) != 0;
   l.stencil = info.limits.stencil;
+  // (the GL path's samplers: border colours and mirror-once need the address modes, a separate magnification filter and anisotropy the sampler state)
+  l.sampler_state = (info.features & kFeatureAddressModes) && (info.features2 & kFeature2SamplerState) && (info.features2 & kFeature2SeparateFilters);
+  l.max_anisotropy = l.sampler_state ? kMaxAnisotropy : 1;
+  l.texture_levels = (info.features & kFeatureTextureKinds) && (info.features2 & kFeature2MipmappedLayers);
   return l;
+}
+
+namespace {
+// The device's format of a block-compressed AccelBlocks (Undefined for None).
+Format blocks_format(webgl::AccelBlocks b) {
+  using B = webgl::AccelBlocks;
+  switch (b) {
+    case B::Bc1: return Format::Bc1Unorm;
+    case B::Bc1Srgb: return Format::Bc1Srgb;
+    case B::Bc2: return Format::Bc2Unorm;
+    case B::Bc2Srgb: return Format::Bc2Srgb;
+    case B::Bc3: return Format::Bc3Unorm;
+    case B::Bc3Srgb: return Format::Bc3Srgb;
+    case B::Bc4U: return Format::Bc4Unorm;
+    case B::Bc4S: return Format::Bc4Snorm;
+    case B::Bc5U: return Format::Bc5Unorm;
+    case B::Bc5S: return Format::Bc5Snorm;
+    case B::Bc6U: return Format::Bc6hUfloat;
+    case B::Bc6S: return Format::Bc6hSfloat;
+    case B::Bc7: return Format::Bc7Unorm;
+    case B::Bc7Srgb: return Format::Bc7Srgb;
+    case B::None: break;
+  }
+  return Format::Undefined;
+}
+}  // namespace
+
+bool WebGlAccelerator::takes_blocks(webgl::AccelBlocks blocks) const {
+  const Format f = blocks_format(blocks);
+  if (f == Format::Undefined) return false;
+  // (BC1-3 are the device's with kFeatureCompressedFormats; the others when it keeps them as blocks - kFormatNative - and samples them)
+  if (static_cast<uint32_t>(f) < static_cast<uint32_t>(Format::R8Unorm)) return (device_.info().features & kFeatureCompressedFormats) != 0;
+  const uint32_t caps = device_.format_caps(f);
+  return (caps & kFormatSampled) && (caps & kFormatNative) && (caps & kFormatMipmaps);
+}
+
+uint32_t WebGlAccelerator::create_texture_levels(const webgl::AccelTextureDesc& desc) {
+  const webgl::AccelLimits l = limits();
+  using webgl::AccelKind;
+  if (!l.texture_levels || desc.w == 0 || desc.h == 0 || desc.levels == 0 || desc.levels > mip_level_limit({desc.w, desc.h}) || desc.layers == 0 || desc.layers > kMaxTextureLayers) return 0;
+  if (desc.kind == AccelKind::Plain && desc.layers != 1) return 0;
+  if (desc.kind == AccelKind::Cube && (desc.layers != 6 || desc.w != desc.h)) return 0;
+  ImageDesc d;
+  d.extent = {desc.w, desc.h};
+  d.mip_levels = desc.levels;
+  d.usage = kImageSampled;
+  d.kind = desc.kind == AccelKind::Volume ? TextureKind::Texture3D : desc.kind == AccelKind::Cube ? TextureKind::TextureCube : desc.kind == AccelKind::Array ? TextureKind::Texture2DArray : TextureKind::Texture2D;
+  d.layers = desc.layers;
+  if (desc.blocks != webgl::AccelBlocks::None) {
+    if (!takes_blocks(desc.blocks)) return 0;
+    d.format = blocks_format(desc.blocks);
+  } else {
+    switch (desc.format) {
+      case webgl::AccelFormat::Rgba8: d.format = Format::B8G8R8A8Unorm; break;
+      case webgl::AccelFormat::Rgba8Srgb:
+        if (!l.srgb_images) return 0;
+        d.format = Format::B8G8R8A8Srgb;
+        break;
+      case webgl::AccelFormat::Rgba16F:
+      case webgl::AccelFormat::Rgba32F:
+        if (!l.float_textures) return 0;
+        d.format = desc.format == webgl::AccelFormat::Rgba16F ? Format::R16G16B16A16Float : Format::R32G32B32A32Float;
+        break;
+      default: return 0;
+    }
+  }
+  kernel::ScopedMutex guard(lock_);
+  UniquePointer<Texture> t = UniquePointer<Texture>::make(allocator_);
+  if (!t) return 0;
+  t->width = desc.w;
+  t->height = desc.h;
+  t->format = desc.format;
+  t->levels = desc.levels;
+  t->layers = desc.layers;
+  t->kind = desc.kind;
+  t->blocks = desc.blocks;
+  t->sampled_levels = true;
+  t->image = device_.create_image(d);
+  if (!t->image) return 0;
+  return add_texture(static_cast<UniquePointer<Texture>&&>(t));
+}
+
+bool WebGlAccelerator::write_level(uint32_t handle, uint32_t level, uint32_t layer, ConstByteView data) {
+  kernel::ScopedMutex guard(lock_);
+  Texture* t = texture_at(handle);
+  if (!t || !t->sampled_levels || level >= t->levels) return false;
+  const uint32_t w = mip_extent(t->width, level), h = mip_extent(t->height, level);
+  // (a volume's level has fewer slices: each a layer here)
+  const uint32_t layers = t->kind == webgl::AccelKind::Volume ? (t->layers >> level ? t->layers >> level : 1u) : t->layers;
+  if (layer >= layers) return false;
+  if (t->blocks != webgl::AccelBlocks::None) {
+    if (data.size() != compressed_image_bytes(blocks_format(t->blocks), w, h)) return false;
+    return t->image->write_compressed(level, layer, data);
+  }
+  const uint64_t texels = uint64_t{w} * h;
+  const bool floats = t->format == webgl::AccelFormat::Rgba16F || t->format == webgl::AccelFormat::Rgba32F;
+  if (data.size() != texels * (floats ? 16 : 4)) return false;
+  bool ok = false;
+  if (floats) {
+    ArrayView<Vec4> scratch = allocate_view<Vec4>(allocator_, texels);
+    if (scratch.empty()) return false;
+    ByteReader r(data);
+    for (Vec4& v : scratch) {
+      v.x = __builtin_bit_cast(float, r.le32());      // (the size was checked: every read is inside)
+      v.y = __builtin_bit_cast(float, r.le32());
+      v.z = __builtin_bit_cast(float, r.le32());
+      v.w = __builtin_bit_cast(float, r.le32());
+    }
+    ok = t->image->write_subresource_float(level, layer, scratch);
+    release_view(allocator_, scratch);
+    return ok;
+  }
+  ArrayView<uint32_t> scratch = allocate_view<uint32_t>(allocator_, texels);
+  if (scratch.empty()) return false;
+  for (uint64_t i = 0; i < texels; ++i)   // 0xAARRGGBB
+    scratch[i] = (uint32_t{data[i * 4 + 3]} << 24) | (uint32_t{data[i * 4]} << 16) | (uint32_t{data[i * 4 + 1]} << 8) | data[i * 4 + 2];
+  ok = t->image->write_subresource(level, layer, scratch);
+  release_view(allocator_, scratch);
+  return ok;
 }
 
 uint32_t WebGlAccelerator::create_program(const char* vs_tgsi, const char* fs_tgsi, uint32_t attributes, uint32_t varyings, uint32_t textures) {
@@ -514,9 +638,18 @@ bool WebGlAccelerator::run_pass_on(const RenderPassBegin& pass, uint32_t width, 
       const webgl::AccelSampler& as = state->samplers[i];
       SamplerDesc sampler;
       sampler.filter = as.linear ? Filter::Linear : Filter::Nearest;
-      const auto mode = [](bool repeat, bool mirror) { return mirror ? AddressMode::MirrorRepeat : (repeat ? AddressMode::Repeat : AddressMode::ClampToEdge); };
-      sampler.address_u = mode(as.repeat_s, as.mirror_s);
-      sampler.address_v = mode(as.repeat_t, as.mirror_t);
+      const auto mode = [](bool repeat, bool mirror, bool border, bool mirror_once) {
+        return border ? AddressMode::ClampToBorder : mirror_once ? AddressMode::MirrorOnce : mirror ? AddressMode::MirrorRepeat : (repeat ? AddressMode::Repeat : AddressMode::ClampToEdge);
+      };
+      sampler.address_u = mode(as.repeat_s, as.mirror_s, as.border_s, as.mirror_once_s);
+      sampler.address_v = mode(as.repeat_t, as.mirror_t, as.border_t, as.mirror_once_t);
+      if (as.border_s || as.border_t) {
+        sampler.custom_border = true;
+        for (uint32_t k = 0; k < 4; ++k) sampler.border_rgba[k] = as.border[k];
+      }
+      sampler.separate_mag = as.separate_mag;
+      sampler.mag_filter = as.mag_linear ? Filter::Linear : Filter::Nearest;
+      sampler.max_anisotropy = as.anisotropy < 1 ? 1 : (as.anisotropy > kMaxAnisotropy ? kMaxAnisotropy : as.anisotropy);
       sampler.mip_filter = as.mip == 2 ? MipFilter::Linear : (as.mip == 1 ? MipFilter::Nearest : MipFilter::None);
       sampler.min_lod = as.min_lod;
       sampler.max_lod = as.max_lod;

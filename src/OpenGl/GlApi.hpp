@@ -119,6 +119,7 @@ class GlApi {
   GlSurface* surface() const { return surface_; }
   // What the 3D hardware drew is brought into the surface's images (GlService, before a swap or a read of the front buffer).
   void sync_hardware() { gl_.hw_sync(); }
+  void set_memory_budget(uint64_t bytes) { gl_.set_memory_budget(bytes); }
   const webgl::GlContext::HardwareStats& hardware_stats() const { return gl_.hardware_stats(); }
   void reset_hardware_stats() { gl_.reset_hardware_stats(); }
   // The surface changed its size or swapped: the engine's images are where the surface now has them.

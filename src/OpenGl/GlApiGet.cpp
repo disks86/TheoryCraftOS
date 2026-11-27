@@ -163,15 +163,16 @@ bool GlApi::get_values(uint32_t pname, double* out, uint32_t* count, uint32_t* k
     case GL_SAMPLE_MASK_VALUE: return one(static_cast<int32_t>(sample_mask_));
     case GL_MAX_COLOR_TEXTURE_SAMPLES: case GL_MAX_DEPTH_TEXTURE_SAMPLES: case GL_MAX_INTEGER_SAMPLES: return one(1);      // (a multisample texture keeps one sample)
     case GL_MAX_TEXTURE_BUFFER_SIZE: return one(65536);      // (GL 3.1's least)
-    case GL_MAX_TEXTURE_SIZE: return one(16384);
-    case GL_MAX_RECTANGLE_TEXTURE_SIZE: return one(16384);
-    case GL_MAX_CUBE_MAP_TEXTURE_SIZE: return one(16384);
+    case GL_MAX_TEXTURE_SIZE: return one(gl_.max_texture_size());
+    case 0x84FF: return one(static_cast<int64_t>(webgl::kMaxAnisotropy));      // GL_MAX_TEXTURE_MAX_ANISOTROPY
+    case GL_MAX_RECTANGLE_TEXTURE_SIZE: return one(gl_.max_texture_size());
+    case GL_MAX_CUBE_MAP_TEXTURE_SIZE: return one(gl_.max_texture_size());
     case GL_MAX_3D_TEXTURE_SIZE: return one(2048);
     case GL_MAX_ARRAY_TEXTURE_LAYERS: return one(2048);
     case GL_MAX_TEXTURE_LOD_BIAS: return one(16);
     case GL_MAX_ELEMENTS_VERTICES: case GL_MAX_ELEMENTS_INDICES: return one(1 << 24);
     case GL_MAX_VIEWPORT_DIMS: out[0] = out[1] = 16384; *count = 2; return true;
-    case GL_MAX_RENDERBUFFER_SIZE: return one(16384);
+    case GL_MAX_RENDERBUFFER_SIZE: return one(gl_.max_texture_size());
     case GL_MAX_COLOR_ATTACHMENTS: case GL_MAX_DRAW_BUFFERS: return one(webgl::kMaxDrawBuffers);
     case GL_MAX_VARYING_COMPONENTS: return one(gpu::kMaxVarying);
     case GL_MAX_VERTEX_UNIFORM_COMPONENTS: case GL_MAX_FRAGMENT_UNIFORM_COMPONENTS: return one(16384);

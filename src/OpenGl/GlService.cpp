@@ -79,6 +79,7 @@ GlStatus GlService::create_context(uint64_t pid, const ContextRequest& request, 
   }
   c->api = UniquePointer<GlApi>::make(a_, a_, *group, config);
   if (!c->api) return GlStatus::NoMemory;
+  if (memory_budget_) c->api->set_memory_budget(memory_budget_);
   c->group = group;
   c->request = request;
   c->handle = p->next_handle++;

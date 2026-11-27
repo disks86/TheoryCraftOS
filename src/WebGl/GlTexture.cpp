@@ -19,6 +19,7 @@
 // Texture and renderbuffer storage for the GL context: the table of formats, pixel upload and download conversions, mipmaps and sampling.
 #include "WebGl/GlContext.hpp"
 #include "WebGl/GlPixels.hpp"
+#include "WebGl/GlCompressed.hpp"
 
 namespace webgl {
 
@@ -127,15 +128,112 @@ bool Image::allocate(const FormatInfo* fi, uint32_t width, uint32_t height, uint
   hw.reset();      // (new storage: the 3D hardware's copy, of the old, goes)
   changed_ = true;
   px.clear();
-  if (!px.put_zeros(n)) return false;
+  blocks.clear();
+  codec = nullptr;
+  blocks_version_ = 0;
+  if (!px.put_zeros(n)) {
+    info = nullptr;
+    w = h = 0;
+    d = 1;
+    account(false);
+    return false;
+  }
   info = fi;
   w = width;
   h = height;
   d = depth;
+  account(false);
   return true;
 }
 
+void Image::release() {
+  hw.reset();
+  changed_ = true;
+  px.clear();
+  blocks.clear();
+  codec = nullptr;
+  blocks_version_ = 0;
+  info = nullptr;
+  w = h = 0;
+  d = 1;
+  account(false);
+}
+
+bool Image::set_blocks(const FormatInfo* fi, const CompressedFormat* cf, uint32_t width, uint32_t height, uint32_t depth, ConstByteView data) {
+  hw.reset();
+  changed_ = true;
+  px.clear();
+  blocks.clear();
+  blocks_version_ = 0;
+  if (data.size() != compressed_size(*cf, width, height, depth) || !blocks.append(data)) {
+    blocks.clear();
+    codec = nullptr;
+    info = nullptr;
+    w = h = 0;
+    d = 1;
+    account(false);
+    return false;
+  }
+  codec = cf;
+  info = fi;
+  w = width;
+  h = height;
+  d = depth;
+  account(true);
+  return true;
+}
+
+bool Image::replace_blocks(uint32_t x, uint32_t y, uint32_t z, uint32_t width, uint32_t height, uint32_t depth, ConstByteView data) {
+  if (!codec || !blocks_current()) return false;
+  const CompressedFormat& cf = *codec;
+  const uint64_t row_blocks = (w + cf.bw - 1) / cf.bw, rows = (h + cf.bh - 1) / cf.bh;
+  const uint64_t bx = x / cf.bw, by = y / cf.bh, bw = (width + cf.bw - 1) / cf.bw, bh = (height + cf.bh - 1) / cf.bh;
+  if (data.size() != compressed_size(cf, width, height, depth) || bx + bw > row_blocks || by + bh > rows || uint64_t{z} + depth > d) return false;
+  ByteView dst = blocks.writable_view();
+  for (uint64_t k = 0; k < depth; ++k)
+    for (uint64_t r = 0; r < bh; ++r) {
+      ByteView out;
+      if (!dst.try_subview((((uint64_t{z} + k) * rows + by + r) * row_blocks + bx) * cf.block_bytes, bw * cf.block_bytes, &out)) return false;
+      out.copy_from(data.subview((k * bh + r) * bw * cf.block_bytes, bw * cf.block_bytes));
+    }
+  // (the blocks are the image now: decoded pixels of the old ones go, the device's copies follow the version)
+  px.clear();
+  blocks_version_ = 0;
+  changed_ = true;
+  account(true);
+  return true;
+}
+
+bool Image::decode() {
+  if (!lazy()) return true;
+  const uint64_t n = uint64_t{w} * h * d * texel_bytes(info->store);
+  if (!codec || n > (2048ull << 20) || !px.put_zeros(n)) {
+    px.clear();
+    return false;
+  }
+  // (the decoder writes through write_texel: px is in place first; a decode error leaves the image lazy, its pixels as they were - none)
+  if (!decode_compressed(*codec, blocks.view(), w, h, d, this, 0, 0, 0)) {
+    px.clear();
+    return false;
+  }
+  blocks_version_ = version();
+  account(false);
+  return true;
+}
+
+bool Image::blocks_current() {
+  if (!codec || blocks.size() == 0) return false;
+  return lazy() || (blocks_version_ != 0 && blocks_version_ == version());
+}
+
+// (an image whose pixels are not there - a lazy one - or a texel outside them reads as zeros and takes no writes: the callers sync lazy images first, see
+// GlContext::hw_sync_image, and this keeps a missed one from reading or writing past the pixels)
 void read_texel(const Image& img, uint32_t x, uint32_t y, uint32_t z, uint32_t out[4]) {
+  const uint64_t tb = texel_bytes(img.info->store), at = ((uint64_t{z} * img.h + y) * img.w + x) * tb;
+  if (at + tb > img.px.size()) {
+    out[0] = out[1] = out[2] = out[3] = 0;
+    return;
+  }
   const uint8_t* p = img.texel(x, y, z);
   switch (img.info->store) {
     case Store::U8x4: out[0] = p[0]; out[1] = p[1]; out[2] = p[2]; out[3] = p[3]; return;
@@ -146,6 +244,8 @@ void read_texel(const Image& img, uint32_t x, uint32_t y, uint32_t z, uint32_t o
 }
 
 void write_texel(Image& img, uint32_t x, uint32_t y, uint32_t z, const uint32_t v[4]) {
+  const uint64_t tb = texel_bytes(img.info->store), at = ((uint64_t{z} * img.h + y) * img.w + x) * tb;
+  if (at + tb > img.px.size()) return;
   uint8_t* p = img.texel(x, y, z);
   switch (img.info->store) {
     case Store::U8x4: p[0] = static_cast<uint8_t>(v[0]); p[1] = static_cast<uint8_t>(v[1]); p[2] = static_cast<uint8_t>(v[2]); p[3] = static_cast<uint8_t>(v[3]); return;

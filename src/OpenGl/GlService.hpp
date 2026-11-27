@@ -80,6 +80,8 @@ class GlService {
   // (`what`: which draws - "" for all of a context's, else a name of a part of them)
   using ReportFunction = void (*)(uint64_t pid, const webgl::GlContext::HardwareStats& stats, const char* what);
   void set_report(ReportFunction report) { report_ = report; }
+  // What one share group's textures, renderbuffers and buffers may hold together (GL_OUT_OF_MEMORY past it): set from the machine's memory (0: webgl's default).
+  void set_memory_budget(uint64_t bytes) { memory_budget_ = bytes; }
   allocators::IAllocator& allocator() { return a_; }
 
  private:
@@ -117,6 +119,7 @@ class GlService {
   void report(uint64_t pid, const Context& c) const;
   allocators::IAllocator& a_;
   ReportFunction report_ = nullptr;
+  uint64_t memory_budget_ = 0;
   kernel::Mutex lock_;      // the list of processes only
   List<SharedPointer<Process>> processes_;
 };
