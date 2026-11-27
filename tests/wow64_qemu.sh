@@ -45,7 +45,7 @@ build=${BUILD:-build-wow64-qemu}
 work=${TMPDIR:-/tmp}/tcos-wow64-qemu
 rm -rf "$work"; mkdir -p "$work"
 programs=("$@")
-[ ${#programs[@]} -eq 0 ] && programs=(hello32 crt32 seh32 gui32 lib32 old32 dx32 d3d11test d3d10test d3d9test d3d8test ddrawtest d3dimtest com32 com64 xml32 cab32 cab64 share32 d3d12videotest d3d11videotest d3d12encodetest d3d12encodecodectest)
+[ ${#programs[@]} -eq 0 ] && programs=(hello32 crt32 seh32 gui32 lib32 old32 dx32 d3d11test d3d10test d3d9test d3d8test ddrawtest d3dimtest com32 com64 xml32 cab32 cab64 share32 d3d12videotest d3d11videotest d3d12encodetest d3d12encodecodectest d3dproxytest)
 i686-w64-mingw32-gcc -O1 -ffreestanding -nostdlib -Isrc/Windows -Wl,--entry=_start32 -Wl,--subsystem,console -o "$work/hello32.exe" tests/windows/hello32.c
 i686-w64-mingw32-gcc -O1 -o "$work/crt32.exe" tests/windows/crt32.c
 i686-w64-mingw32-gcc -O1 -shared -o "$work/plug32.dll" tests/windows/plug32.c      # (a library crt32 loads while it runs)
@@ -112,6 +112,8 @@ i686-w64-mingw32-gcc -O1 -o "$work/d3d12videotest.exe" tests/windows/d3d12videot
 i686-w64-mingw32-gcc -O1 -I "$work" -o "$work/d3d11videotest.exe" tests/windows/d3d11videotest.c -ld3d11 -ld3d12 -ldxgi -luuid -ldxguid -luser32
 i686-w64-mingw32-gcc -O1 -o "$work/d3d12encodetest.exe" tests/windows/d3d12encodetest.c -ld3d12 -ldxgi -luuid -ldxguid      # (video encoding and motion estimation)
 i686-w64-mingw32-gcc -O1 -o "$work/d3d12encodecodectest.exe" tests/windows/d3d12encodecodectest.c -ld3d12 -ldxgi -luuid -ldxguid      # (HEVC and AV1 encoding)
+# (the Direct3D family with proxies' wrappers and foreign objects: src/Windows/tcos_object.h)
+i686-w64-mingw32-gcc -O1 -o "$work/d3dproxytest.exe" tests/windows/d3dproxytest.c -ld3d10 -ld3d11 -ld3d9 -ldxgi -ld3d12 -luuid -ldxguid -luser32 -lgdi32
 status=0
 for program in "${programs[@]}"; do
   arguments=

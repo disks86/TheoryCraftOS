@@ -23,9 +23,14 @@
  * QueryAdapterInfo: src/Process/Win32k/Dxg/DxgAdapters.cpp): the name, the memory and the capabilities come from there, the displays from the kernel's display mode list. Everything
  * else is in this DLL: the objects and their interfaces, private data, the display mode lists, closest-mode matching, the checks of the swap chain descriptions and the HRESULTs.
  *
- * Swap chains. A Direct3D runtime makes the back buffers: the swap chain asks the device it was created with (a Direct3D 12 command queue) for the ITcosPresenter interface
- * (tcosdx.h), has it create the buffers, and on Present has it hand over the pixels of the buffer, which go to the window with SetDIBitsToDevice. So a windowed swap chain works for
- * any runtime that implements that interface; there is no compositor, no flip, no tearing and no exclusive full screen (SetFullscreenState(TRUE) is refused with
+ * Swap chains. A Direct3D runtime makes the back buffers: the swap chain asks the device it was created with (a Direct3D 12 command queue, a Direct3D 11 or 10 device) for the
+ * ITcosPresenter interface (tcosdx.h), has it create the buffers, and on Present has it hand over the pixels of the buffer, which go to the window with SetDIBitsToDevice.
+ * Any other runtime - one that does not answer ITcosPresenter: DXVK, vkd3d-proton, a program's own - gets the same swap chain through its public interfaces (the
+ * "fallback" below): the back buffers are textures it makes with CreateTexture2D or CreateCommittedResource, and Present copies the buffer into a staging texture
+ * (CopyResource, Map) or, for Direct3D 12, into a readback buffer with a command list on the swap chain's queue and a fence wait, and shows the pixels the same way. A
+ * proxy's wrapper (ReShade) that forwards ITcosPresenter is the first kind; one that does not, the second. The buffer index of a swap chain of Direct3D 12 moves on at each
+ * Present (FLIP_SEQUENTIAL, FLIP_DISCARD: the only effects Direct3D 12 takes); one of Direct3D 10 or 11 always draws into buffer 0 and shows buffer 0, whatever the effect,
+ * as Windows renames its buffers. There is no compositor, no tearing and no exclusive full screen (SetFullscreenState(TRUE) is refused with
  * DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, as on a system whose display cannot be taken over).
  *
  * Not here: output duplication, gamma control (it reports one control point and no ramp), HDR (everything is sRGB, 8 bits), overlays, frame statistics, stereo, IDXGIDevice and the
@@ -34,10 +39,14 @@
 #define INITGUID
 #define COBJMACROS
 #define CONST_VTABLE
+#define WIDL_C_INLINE_WRAPPERS 1      /* (the methods that return a structure: their hidden-pointer ABI) */
 #define WIN32_LEAN_AND_MEAN
 #include "../dxcommon.h"
 #include <unknwn.h>
 #include <dxgi1_6.h>
+#include <d3d10.h>
+#include <d3d11.h>
+#include <d3d12.h>
 #include "../tcosdx.h"
 
 #undef DECLSPEC_IMPORT
@@ -119,11 +128,31 @@ typedef struct Output {
 } Output;
 
 #define MAX_BUFFERS 16
+/* How a swap chain gets its buffers and their pixels: the runtime's ITcosPresenter, or the runtime's public interfaces (a runtime that is not this system's) */
+enum { SC_PRESENTER, SC_D3D11, SC_D3D10, SC_D3D12 };
 typedef struct SwapChain {
   DxObj o;
   Factory *factory;
   IUnknown *device;
-  ITcosPresenter *presenter;
+  int kind;                      /* SC_* */
+  BOOL on_queue;                 /* made with a Direct3D 12 command queue: the buffer index moves on at each Present */
+  ITcosPresenter *presenter;     /* SC_PRESENTER */
+  /* the fallback (fallback_*): a Direct3D 11 device and its immediate context, a Direct3D 10 device, or a Direct3D 12 queue with what copies a buffer to memory */
+  ID3D11Device *d11;
+  ID3D11DeviceContext *ctx11;
+  ID3D11Texture2D *staging11;
+  ID3D10Device *d10;
+  ID3D10Texture2D *staging10;
+  ID3D12CommandQueue *queue12;
+  ID3D12Device *dev12;
+  ID3D12CommandAllocator *alloc12;
+  ID3D12GraphicsCommandList *list12;
+  ID3D12Fence *fence12;
+  UINT64 fence_value;
+  HANDLE fence_event;
+  ID3D12Resource *readback12;
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint12;
+  UINT64 readback_bytes;
   HWND window;
   DXGI_SWAP_CHAIN_DESC1 desc;
   DXGI_SWAP_CHAIN_FULLSCREEN_DESC fullscreen;
@@ -545,19 +574,236 @@ static HRESULT STDMETHODCALLTYPE out_DuplicateOutput1(Output *This, IUnknown *de
 static void release_buffers(SwapChain *s) {
   for (UINT i = 0; i < MAX_BUFFERS; ++i)
     if (s->buffers[i]) { s->buffers[i]->lpVtbl->Release(s->buffers[i]); s->buffers[i] = NULL; }
+  /* (what the fallback copies through has the buffers' size and format: made again with them) */
+  if (s->staging11) { ID3D11Texture2D_Release(s->staging11); s->staging11 = NULL; }
+  if (s->staging10) { ID3D10Texture2D_Release(s->staging10); s->staging10 = NULL; }
+  if (s->readback12) { ID3D12Resource_Release(s->readback12); s->readback12 = NULL; }
+}
+/* (waits until the swap chain's copies on its Direct3D 12 queue are done) */
+static void fallback12_wait(SwapChain *s) {
+  if (!s->fence12 || ID3D12Fence_GetCompletedValue(s->fence12) >= s->fence_value) return;
+  if (s->fence_event && SUCCEEDED(ID3D12Fence_SetEventOnCompletion(s->fence12, s->fence_value, s->fence_event))) WaitForSingleObject(s->fence_event, INFINITE);
 }
 static void swap_chain_destroy(DxObj *o) {
   SwapChain *s = (SwapChain *)o;
+  fallback12_wait(s);
   release_buffers(s);
   mem_free(s->pixels);
   if (s->presenter) s->presenter->lpVtbl->Release(s->presenter);
+  if (s->ctx11) ID3D11DeviceContext_Release(s->ctx11);
+  if (s->d11) ID3D11Device_Release(s->d11);
+  if (s->d10) ID3D10Device_Release(s->d10);
+  if (s->list12) ID3D12GraphicsCommandList_Release(s->list12);
+  if (s->alloc12) ID3D12CommandAllocator_Release(s->alloc12);
+  if (s->fence12) ID3D12Fence_Release(s->fence12);
+  if (s->fence_event) CloseHandle(s->fence_event);
+  if (s->dev12) ID3D12Device_Release(s->dev12);
+  if (s->queue12) ID3D12CommandQueue_Release(s->queue12);
   if (s->device) s->device->lpVtbl->Release(s->device);
   if (s->factory) dx_Release(OBJ(s->factory));
 }
 
+/* ---- the fallback: a runtime that is not this system's, through its public interfaces ---- */
+
+/* The bind flags of a back buffer: what its DXGI usage says (Direct3D 11 and 10 have the same values). */
+static UINT back_buffer_binds(UINT usage) {
+  UINT bind = 0;
+  if (usage & DXGI_USAGE_RENDER_TARGET_OUTPUT) bind |= D3D11_BIND_RENDER_TARGET;
+  if (usage & DXGI_USAGE_SHADER_INPUT) bind |= D3D11_BIND_SHADER_RESOURCE;
+  if (usage & DXGI_USAGE_UNORDERED_ACCESS) bind |= D3D11_BIND_UNORDERED_ACCESS;
+  return bind;
+}
+static HRESULT fallback_buffers(SwapChain *s) {
+  const DXGI_SWAP_CHAIN_DESC1 *d = &s->desc;
+  HRESULT hr = S_OK;
+  if (s->kind == SC_D3D11) {
+    const D3D11_TEXTURE2D_DESC td = {d->Width, d->Height, 1, 1, d->Format, {1, 0}, D3D11_USAGE_DEFAULT, back_buffer_binds(d->BufferUsage), 0,
+                                     (d->Flags & DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE) ? (UINT)D3D11_RESOURCE_MISC_GDI_COMPATIBLE : 0u};
+    for (UINT i = 0; i < d->BufferCount && SUCCEEDED(hr); ++i) hr = ID3D11Device_CreateTexture2D(s->d11, &td, NULL, (ID3D11Texture2D **)&s->buffers[i]);
+    const D3D11_TEXTURE2D_DESC sd = {d->Width, d->Height, 1, 1, d->Format, {1, 0}, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0};
+    if (SUCCEEDED(hr)) hr = ID3D11Device_CreateTexture2D(s->d11, &sd, NULL, &s->staging11);
+  } else if (s->kind == SC_D3D10) {
+    const D3D10_TEXTURE2D_DESC td = {d->Width, d->Height, 1, 1, d->Format, {1, 0}, D3D10_USAGE_DEFAULT, back_buffer_binds(d->BufferUsage), 0,
+                                     (d->Flags & DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE) ? (UINT)D3D10_RESOURCE_MISC_GDI_COMPATIBLE : 0u};
+    for (UINT i = 0; i < d->BufferCount && SUCCEEDED(hr); ++i) hr = ID3D10Device_CreateTexture2D(s->d10, &td, NULL, (ID3D10Texture2D **)&s->buffers[i]);
+    const D3D10_TEXTURE2D_DESC sd = {d->Width, d->Height, 1, 1, d->Format, {1, 0}, D3D10_USAGE_STAGING, 0, D3D10_CPU_ACCESS_READ, 0};
+    if (SUCCEEDED(hr)) hr = ID3D10Device_CreateTexture2D(s->d10, &sd, NULL, &s->staging10);
+  } else {
+    const D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+    D3D12_RESOURCE_DESC rd;
+    memset(&rd, 0, sizeof rd);
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = d->Width;
+    rd.Height = d->Height;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.Format = d->Format;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | ((d->BufferUsage & DXGI_USAGE_UNORDERED_ACCESS) ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE);
+    /* (a back buffer begins in the PRESENT state - COMMON -, as Windows hands it out) */
+    for (UINT i = 0; i < d->BufferCount && SUCCEEDED(hr); ++i)
+      hr = ID3D12Device_CreateCommittedResource(s->dev12, &heap, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_PRESENT, NULL, &IID_ID3D12Resource, (void **)&s->buffers[i]);
+    if (SUCCEEDED(hr)) {
+      UINT rows = 0;
+      UINT64 row_bytes = 0;
+      ID3D12Device_GetCopyableFootprints(s->dev12, &rd, 0, 1, 0, &s->footprint12, &rows, &row_bytes, &s->readback_bytes);
+      const D3D12_HEAP_PROPERTIES rb = {D3D12_HEAP_TYPE_READBACK, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+      D3D12_RESOURCE_DESC bd;
+      memset(&bd, 0, sizeof bd);
+      bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+      bd.Width = s->readback_bytes;
+      bd.Height = 1;
+      bd.DepthOrArraySize = 1;
+      bd.MipLevels = 1;
+      bd.Format = DXGI_FORMAT_UNKNOWN;
+      bd.SampleDesc.Count = 1;
+      bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+      hr = s->readback_bytes ? ID3D12Device_CreateCommittedResource(s->dev12, &rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource,
+                                                                    (void **)&s->readback12)
+                             : E_INVALIDARG;
+    }
+  }
+  return hr;
+}
+
+/* One row of a back buffer as B8G8R8A8 (what goes to the window; sRGB values are shown as they are). */
+static UINT half_to_byte(UINT h) {
+  const UINT e = (h >> 10) & 31, m = h & 1023;
+  if (h & 0x8000) return 0;
+  if (e == 0) return 0;
+  if (e >= 15) return 255;
+  const UINT v = ((1024 + m) * 255) >> (10 + 15 - e);      /* value = (1 + m / 1024) * 2^(e - 15) */
+  return v > 255 ? 255 : v;
+}
+static void row_to_bgra(DXGI_FORMAT format, const BYTE *src, BYTE *dst, UINT width) {
+  switch (format) {
+    case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: memcpy(dst, src, (SIZE_T)width * 4); break;
+    case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+      for (UINT x = 0; x < width; ++x) { dst[x * 4] = src[x * 4 + 2]; dst[x * 4 + 1] = src[x * 4 + 1]; dst[x * 4 + 2] = src[x * 4]; dst[x * 4 + 3] = src[x * 4 + 3]; }
+      break;
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+      for (UINT x = 0; x < width; ++x) {
+        UINT v;
+        memcpy(&v, src + x * 4, 4);
+        dst[x * 4] = (BYTE)(((v >> 20) & 1023) >> 2); dst[x * 4 + 1] = (BYTE)(((v >> 10) & 1023) >> 2); dst[x * 4 + 2] = (BYTE)((v & 1023) >> 2);
+        dst[x * 4 + 3] = (BYTE)((v >> 30) * 85);
+      }
+      break;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+      for (UINT x = 0; x < width; ++x) {
+        UINT16 c[4];
+        memcpy(c, src + (SIZE_T)x * 8, 8);
+        dst[x * 4] = (BYTE)half_to_byte(c[2]); dst[x * 4 + 1] = (BYTE)half_to_byte(c[1]); dst[x * 4 + 2] = (BYTE)half_to_byte(c[0]); dst[x * 4 + 3] = (BYTE)half_to_byte(c[3]);
+      }
+      break;
+    default: memset(dst, 0, (SIZE_T)width * 4); break;
+  }
+}
+static UINT format_bytes(DXGI_FORMAT format) { return format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 : 4; }
+
+/* The pixels of a back buffer, as the presenter's ReadBackBuffer gives them: B8G8R8A8 rows `pitch` apart, after the work queued before. */
+static HRESULT fallback_read(SwapChain *s, IUnknown *buffer, BYTE *dst, UINT pitch) {
+  const UINT w = s->desc.Width, h = s->desc.Height;
+  if (s->kind == SC_D3D11) {
+    D3D11_MAPPED_SUBRESOURCE m;
+    ID3D11DeviceContext_CopyResource(s->ctx11, (ID3D11Resource *)s->staging11, (ID3D11Resource *)buffer);
+    HRESULT hr = ID3D11DeviceContext_Map(s->ctx11, (ID3D11Resource *)s->staging11, 0, D3D11_MAP_READ, 0, &m);      /* (waits for the copy) */
+    if (FAILED(hr)) return hr;
+    if (m.RowPitch < w * format_bytes(s->desc.Format)) { ID3D11DeviceContext_Unmap(s->ctx11, (ID3D11Resource *)s->staging11, 0); return E_FAIL; }
+    for (UINT y = 0; y < h; ++y) row_to_bgra(s->desc.Format, (const BYTE *)m.pData + (SIZE_T)y * m.RowPitch, dst + (SIZE_T)y * pitch, w);
+    ID3D11DeviceContext_Unmap(s->ctx11, (ID3D11Resource *)s->staging11, 0);
+    return S_OK;
+  }
+  if (s->kind == SC_D3D10) {
+    D3D10_MAPPED_TEXTURE2D m;
+    ID3D10Device_CopyResource(s->d10, (ID3D10Resource *)s->staging10, (ID3D10Resource *)buffer);
+    HRESULT hr = ID3D10Texture2D_Map(s->staging10, 0, D3D10_MAP_READ, 0, &m);
+    if (FAILED(hr)) return hr;
+    if (m.RowPitch < w * format_bytes(s->desc.Format)) { ID3D10Texture2D_Unmap(s->staging10, 0); return E_FAIL; }
+    for (UINT y = 0; y < h; ++y) row_to_bgra(s->desc.Format, (const BYTE *)m.pData + (SIZE_T)y * m.RowPitch, dst + (SIZE_T)y * pitch, w);
+    ID3D10Texture2D_Unmap(s->staging10, 0);
+    return S_OK;
+  }
+  /* (Direct3D 12: the buffer - in the PRESENT state the program left it in - copied into the readback buffer by a list of the queue's own type, the fence waited for) */
+  HRESULT hr = ID3D12CommandAllocator_Reset(s->alloc12);
+  if (SUCCEEDED(hr)) hr = ID3D12GraphicsCommandList_Reset(s->list12, s->alloc12, NULL);
+  if (FAILED(hr)) return hr;
+  D3D12_RESOURCE_BARRIER b;
+  memset(&b, 0, sizeof b);
+  b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  b.Transition.pResource = (ID3D12Resource *)buffer;
+  b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+  b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  ID3D12GraphicsCommandList_ResourceBarrier(s->list12, 1, &b);
+  D3D12_TEXTURE_COPY_LOCATION to, from;
+  memset(&to, 0, sizeof to);
+  memset(&from, 0, sizeof from);
+  to.pResource = s->readback12;
+  to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  to.PlacedFootprint = s->footprint12;
+  from.pResource = (ID3D12Resource *)buffer;
+  from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  from.SubresourceIndex = 0;
+  ID3D12GraphicsCommandList_CopyTextureRegion(s->list12, &to, 0, 0, 0, &from, NULL);
+  b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+  ID3D12GraphicsCommandList_ResourceBarrier(s->list12, 1, &b);
+  hr = ID3D12GraphicsCommandList_Close(s->list12);
+  if (FAILED(hr)) return hr;
+  ID3D12CommandList *lists[1] = {(ID3D12CommandList *)s->list12};
+  ID3D12CommandQueue_ExecuteCommandLists(s->queue12, 1, lists);
+  hr = ID3D12CommandQueue_Signal(s->queue12, s->fence12, ++s->fence_value);
+  if (FAILED(hr)) return hr;
+  fallback12_wait(s);
+  void *data = NULL;
+  const D3D12_RANGE read = {0, (SIZE_T)s->readback_bytes};
+  hr = ID3D12Resource_Map(s->readback12, 0, &read, &data);
+  if (FAILED(hr) || !data) return FAILED(hr) ? hr : E_FAIL;
+  const UINT row_pitch = s->footprint12.Footprint.RowPitch;
+  if (row_pitch < w * format_bytes(s->desc.Format) || (UINT64)row_pitch * h > s->readback_bytes - s->footprint12.Offset + row_pitch) hr = E_FAIL;
+  for (UINT y = 0; SUCCEEDED(hr) && y < h; ++y)
+    row_to_bgra(s->desc.Format, (const BYTE *)data + s->footprint12.Offset + (SIZE_T)y * row_pitch, dst + (SIZE_T)y * pitch, w);
+  const D3D12_RANGE none = {0, 0};
+  ID3D12Resource_Unmap(s->readback12, 0, &none);
+  return hr;
+}
+
+/* What the fallback keeps of the runtime: its device (and immediate context), or the queue, its device, a list of the queue's type, a fence. */
+static HRESULT fallback_start(SwapChain *s, IUnknown *device) {
+  if (SUCCEEDED(device->lpVtbl->QueryInterface(device, &IID_ID3D12CommandQueue, (void **)&s->queue12)) && s->queue12) {
+    s->kind = SC_D3D12;
+    D3D12_COMMAND_QUEUE_DESC qd = ID3D12CommandQueue_GetDesc(s->queue12);
+    HRESULT hr = ID3D12CommandQueue_GetDevice(s->queue12, &IID_ID3D12Device, (void **)&s->dev12);
+    if (SUCCEEDED(hr)) hr = ID3D12Device_CreateCommandAllocator(s->dev12, qd.Type, &IID_ID3D12CommandAllocator, (void **)&s->alloc12);
+    if (SUCCEEDED(hr)) hr = ID3D12Device_CreateCommandList(s->dev12, 0, qd.Type, s->alloc12, NULL, &IID_ID3D12GraphicsCommandList, (void **)&s->list12);
+    if (SUCCEEDED(hr)) hr = ID3D12GraphicsCommandList_Close(s->list12);
+    if (SUCCEEDED(hr)) hr = ID3D12Device_CreateFence(s->dev12, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void **)&s->fence12);
+    if (SUCCEEDED(hr)) {
+      s->fence_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+      if (!s->fence_event) hr = E_OUTOFMEMORY;
+    }
+    return hr;
+  }
+  if (SUCCEEDED(device->lpVtbl->QueryInterface(device, &IID_ID3D11Device, (void **)&s->d11)) && s->d11) {
+    s->kind = SC_D3D11;
+    ID3D11Device_GetImmediateContext(s->d11, &s->ctx11);
+    return s->ctx11 ? S_OK : E_FAIL;
+  }
+  if (SUCCEEDED(device->lpVtbl->QueryInterface(device, &IID_ID3D10Device, (void **)&s->d10)) && s->d10) {
+    s->kind = SC_D3D10;
+    return S_OK;
+  }
+  return DXGI_ERROR_INVALID_CALL;      /* (no device a swap chain can be made with) */
+}
+
 static HRESULT make_buffers(SwapChain *s) {
+  if (s->kind == SC_D3D12) fallback12_wait(s);      /* (a copy of a buffer that goes may still run) */
   release_buffers(s);
-  const HRESULT hr = s->presenter->lpVtbl->CreateBackBuffers(s->presenter, s->desc.BufferCount, s->desc.Width, s->desc.Height, s->desc.Format, s->desc.BufferUsage, s->buffers);
+  const HRESULT hr = s->kind == SC_PRESENTER ? s->presenter->lpVtbl->CreateBackBuffers(s->presenter, s->desc.BufferCount, s->desc.Width, s->desc.Height, s->desc.Format,
+                                                                                       s->desc.BufferUsage, s->buffers)
+                                             : fallback_buffers(s);
   if (FAILED(hr)) release_buffers(s);
   s->current = 0;
   return hr;
@@ -566,8 +812,6 @@ static HRESULT make_buffers(SwapChain *s) {
 static HRESULT swap_chain_create(Factory *f, IUnknown *device, HWND window, const DXGI_SWAP_CHAIN_DESC1 *desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fullscreen, IDXGISwapChain1 **out) {
   extern const IDXGISwapChain3Vtbl sc_vtbl;
   DXGI_SWAP_CHAIN_DESC1 d = *desc;
-  ITcosPresenter *presenter = NULL;
-  if (FAILED(device->lpVtbl->QueryInterface(device, &IID_ITcosPresenter, (void **)&presenter))) return DXGI_ERROR_INVALID_CALL;
   if (d.Width == 0 || d.Height == 0) {
     RECT r = {0, 0, 0, 0};
     if (window && GetClientRect(window, &r)) { d.Width = (UINT)(r.right - r.left); d.Height = (UINT)(r.bottom - r.top); }
@@ -575,24 +819,34 @@ static HRESULT swap_chain_create(Factory *f, IUnknown *device, HWND window, cons
     if (d.Height == 0) d.Height = 8;
   }
   if (d.BufferCount == 0) d.BufferCount = 1;
-  if (d.BufferCount > MAX_BUFFERS || d.Width > 16384 || d.Height > 16384 || !is_swap_format(d.Format) || d.SampleDesc.Count > 1 || d.Stereo) {
-    presenter->lpVtbl->Release(presenter);
-    return DXGI_ERROR_INVALID_CALL;
-  }
+  if (d.BufferCount > MAX_BUFFERS || d.Width > 16384 || d.Height > 16384 || !is_swap_format(d.Format) || d.SampleDesc.Count > 1 || d.Stereo) return DXGI_ERROR_INVALID_CALL;
+  ID3D12CommandQueue *q = NULL;      /* (a Direct3D 12 swap chain: the index of its buffer moves on) */
+  const BOOL on_queue = SUCCEEDED(device->lpVtbl->QueryInterface(device, &IID_ID3D12CommandQueue, (void **)&q)) && q;
+  if (q) ID3D12CommandQueue_Release(q);
+  /* (Direct3D 12 presents with the flip effects only; a flip effect needs two buffers at least - Windows' answers, Wine's test_swapchain_backbuffer_index) */
+  const BOOL flip = d.SwapEffect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL || d.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD;
+  if ((on_queue && !flip) || (flip && d.BufferCount < 2)) return DXGI_ERROR_INVALID_CALL;
   SwapChain *s = mem_alloc(sizeof *s);
-  if (!s) { presenter->lpVtbl->Release(presenter); return E_OUTOFMEMORY; }
+  if (!s) return E_OUTOFMEMORY;
   dx_init(OBJ(s), &sc_vtbl, g_swapchain_iids, swap_chain_destroy);
   s->factory = f;
   dx_AddRef(OBJ(f));
   s->device = device;
   device->lpVtbl->AddRef(device);
-  s->presenter = presenter;
+  s->on_queue = on_queue;
+  /* (this system's runtime - or a proxy that hands its ITcosPresenter on - makes the buffers itself; any other through its public interfaces) */
+  HRESULT hr = S_OK;
+  if (SUCCEEDED(device->lpVtbl->QueryInterface(device, &IID_ITcosPresenter, (void **)&s->presenter)) && s->presenter) s->kind = SC_PRESENTER;
+  else {
+    s->presenter = NULL;
+    hr = fallback_start(s, device);
+  }
   s->window = window;
   s->desc = d;
   if (fullscreen) s->fullscreen = *fullscreen;
   else s->fullscreen.Windowed = TRUE;
   s->latency = 3;
-  const HRESULT hr = make_buffers(s);
+  if (SUCCEEDED(hr)) hr = make_buffers(s);
   if (FAILED(hr)) { dx_Release(OBJ(s)); return hr; }
   *out = (IDXGISwapChain1 *)s;
   return S_OK;
@@ -616,7 +870,8 @@ static HRESULT show(SwapChain *s, IUnknown *buffer) {
     s->pixels_size = s->pixels ? bytes : 0;
     if (!s->pixels) return E_OUTOFMEMORY;
   }
-  const HRESULT hr = s->presenter->lpVtbl->ReadBackBuffer(s->presenter, buffer, s->pixels, s->desc.Width * 4);
+  const HRESULT hr = s->kind == SC_PRESENTER ? s->presenter->lpVtbl->ReadBackBuffer(s->presenter, buffer, s->pixels, s->desc.Width * 4)
+                                             : fallback_read(s, buffer, s->pixels, s->desc.Width * 4);
   if (FAILED(hr) || !s->window) return hr;
   HDC dc = GetDC(s->window);
   if (!dc) return S_OK;      /* (a window the display cannot give a context: nothing to show it on) */
@@ -637,12 +892,14 @@ static HRESULT STDMETHODCALLTYPE sc_Present(SwapChain *This, UINT interval, UINT
   if (interval > 4 || (flags & ~(DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_SEQUENCE | DXGI_PRESENT_RESTART | DXGI_PRESENT_DO_NOT_WAIT | DXGI_PRESENT_ALLOW_TEARING | DXGI_PRESENT_RESTRICT_TO_OUTPUT)))
     return DXGI_ERROR_INVALID_CALL;
   if (flags & DXGI_PRESENT_TEST) return S_OK;
-  IUnknown *front = This->buffers[flip_model(This) ? This->current : 0];
+  /* (Direct3D 12 draws into buffer GetCurrentBackBufferIndex, which moves on; Direct3D 10 and 11 always into buffer 0 - Windows renames the buffers behind it) */
+  const BOOL rotate = This->on_queue && flip_model(This);
+  IUnknown *front = This->buffers[rotate ? This->current : 0];
   if (!front) return DXGI_ERROR_INVALID_CALL;
   const HRESULT hr = show(This, front);
   if (FAILED(hr)) return hr;
   This->present_count++;
-  if (flip_model(This)) This->current = (This->current + 1) % This->desc.BufferCount;
+  if (rotate) This->current = (This->current + 1) % This->desc.BufferCount;
   if (interval) Sleep(0);
   return S_OK;
 }

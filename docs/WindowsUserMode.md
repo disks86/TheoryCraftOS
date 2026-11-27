@@ -664,8 +664,13 @@ functions named `<prefix>_<Method>` in the sources (run it after adding a method
 
 - **dxgi.dll**: `CreateDXGIFactory/1/2` and the interfaces up to `IDXGIFactory6`, `IDXGIAdapter4`, `IDXGIOutput6` and `IDXGISwapChain3`. Adapters are the kernel's (name, memory and capabilities
   from `D3DKMTQueryAdapterInfo`; the CPU renderer is reported as the software adapter), one output per adapter that has a display, its modes from the kernel's list at 60 Hz. A swap chain is made
-  with the device it is given (a Direct3D 12 command queue; it asks the queue for `ITcosPresenter`, `src/Windows/tcosdx.h`, which makes the buffers and hands over their pixels) and presents by
-  `SetDIBitsToDevice` on the window; flip model buffers rotate. The `D3DKMT*` exports are forwarders to gdi32.dll (`dxgi.def`).
+  with the device it is given (a Direct3D 12 command queue, a Direct3D 11 or 10 device; it asks it for `ITcosPresenter`, `src/Windows/tcosdx.h`, which makes the buffers and hands over their
+  pixels) and presents by `SetDIBitsToDevice` on the window. A device of any other runtime (DXVK, vkd3d-proton, a program's own) gets the **fallback swap chain**: the buffers are made with its
+  public `CreateTexture2D` / `CreateCommittedResource` (format, count, the bind flags of `BufferUsage`, `GDI_COMPATIBLE`), and `Present` copies the buffer to memory with public calls only
+  (Direct3D 11 and 10: `CopyResource` into a staging texture and `Map`; Direct3D 12: a command list of the queue's type on the swap chain's queue - barrier PRESENT -> COPY_SOURCE,
+  `CopyTextureRegion` into a readback buffer, barrier back - and a fence wait), then shows it the same way; `ResizeBuffers`, `GetBuffer`, the full-screen state and the statistics are the same
+  code for both. A Direct3D 12 swap chain takes the flip effects only and its `GetCurrentBackBufferIndex` moves on at each `Present`; a Direct3D 10/11 one always draws into and shows buffer 0
+  (Windows renames its buffers), whatever its effect; a flip effect needs two buffers (Wine's `test_swapchain_backbuffer_index`). The `D3DKMT*` exports are forwarders to gdi32.dll (`dxgi.def`).
   Not done: exclusive full screen (`DXGI_ERROR_NOT_CURRENTLY_AVAILABLE`), output duplication, gamma, HDR, frame statistics, `IDXGIDevice` and the surface interfaces (no Direct3D 10/11
   runtime exists), tearing, the debug interfaces.
 - **d3d12.dll**: `D3D12CreateDevice` (feature level 11_0), `D3D12SerializeRootSignature` and the versioned one, the device, command queues, allocators and lists, fences (with events), committed,
@@ -699,6 +704,49 @@ functions named `<prefix>_<Method>` in the sources (run it after adding a method
 - **Tests.** `tests/emulated_dx.sh` builds the host emulator with the kernel's Direct3D under it (win32k + `dxgk::Kernel` with the CPU renderer) and runs `tests/windows/d3d12test.c`, the real
   DLLs end to end: adapters and outputs, a triangle with a root signature and pipeline state read back, a textured quad (descriptor table, static sampler), depth testing with an index buffer and a
   root constant buffer view, a compute shader, copies, fences and events, the swap chain, the serializer and device queries (570 checks: with queries, indirect execution, a bundle, tiled buffers and mip-chain textures, predication, stream output, the address modes of a sampler, mipmaps, vertex formats, depth-only passes and multisampling). `tests/d3d12_qemu.sh` runs the same program on the real kernel in QEMU with `virtio-gpu-gl`, where the kernel's Direct3D draws through virglrenderer on the host's GPU: the same 570 checks pass there (`docs/Direct3DKernelMode.md`, "Direct3D 12 on the 3D hardware"). Not run on other GPUs or by Wine's tests.
+
+### Objects that are not the library's own (all Direct3D DLLs)
+
+A pointer a program hands to dxgi.dll, d3d12.dll, d3d11.dll, d3d10*.dll, d3d9.dll, d3d8.dll or ddraw.dll is not always an object of that library: a proxy (ReShade, an overlay, a frame
+limiter) hands out wrappers of the runtime's objects, and a foreign runtime (DXVK, vkd3d-proton, a program's own Direct3D 12 core) has objects of its own layout. The design rule,
+`src/Windows/tcos_object.h`:
+
+- Every object of these libraries answers `QueryInterface(IID_ITcosObject)` (`{7c0e5a10-2d5e-4a5d-9a7e-54434f530102}`) with its canonical interface pointer, the object itself, AddRef'd
+  (`dx_QueryInterface` in `dxcommon.h`, the d3d9 and d3d11 children, the d3d11 device and context). A proxy that forwards the IIDs it does not know - as ReShade does - hands back the object
+  it wraps; a foreign object answers `E_NOINTERFACE`.
+- Wherever a library needs the internals of an object it did not just make itself (its own struct, a private export of the runtime below), it checks the vtable first, then asks
+  `IID_ITcosObject` and checks the vtable of what came back (`tcos_own`, `tcos_own_any`), and otherwise fails with what Windows answers for an invalid argument there (`E_INVALIDARG` for
+  Direct3D 12/11 interop, `D3DERR_INVALIDCALL` for Direct3D 9, `DXGI_ERROR_INVALID_CALL` for dxgi), never reading the object's memory. So a proxy's wrapper works wherever the object
+  itself would, and an object of another runtime is refused cleanly.
+- The private exports (`TcosD3D12*` in `tcosdx.h`, `TcosD3D9*`) take only their library's objects and return a failure for anything else (`E_INVALIDARG` / `D3DERR_INVALIDCALL`, a count
+  of 0); the callers check it. `TcosD3D12Object(object, riid, out)` hands a runtime above d3d12.dll's own object behind a program's pointer: `D3D11On12CreateDevice` takes the program's
+  device and queue with it (and the queue must be the device's), `CreateWrappedResource` the resource (of the same device), so every call d3d11.dll makes afterwards is to d3d12.dll's objects.
+- Inside a library the `*_of` helpers that turn an interface a program passes into the library's struct (d3d9's surfaces, textures, buffers, declarations, shaders, swap chains; d3d11's
+  fences, context states, command lists, queries, video objects, class linkages; d3d12's command lists, fences and the resources `ReadBackBuffer` and `CreateSharedHandle` take) see
+  through a proxy's wrapper this way; what they bind is the object itself.
+- ddraw.dll uses d3d9.dll's own extensions (a lockable D24S8 depth buffer, the colour-key kill stage state) only through d3d9.dll's private exports `TcosD3D9CreateLockableDepthStencil`
+  and `TcosD3D9SetStageKeyKill`, and only when the Direct3D 9 device answers `IID_ITcosObject` with itself; on any other Direct3D 9 it falls back to what Direct3D 9 itself can do
+  (`docs/DirectDraw.md`). The public `CreateDepthStencilSurfaceEx` refuses d3d9.dll's usage bit and `SetTextureStageState` ignores its stage state 33, as Windows does for values it
+  does not have.
+- Tests: `tests/windows/d3dproxytest.c` (64-bit `tests/d3d12_qemu.sh d3dproxytest`, 32-bit `tests/wow64_qemu.sh d3dproxytest`) wraps the runtimes' objects in pass-through COM wrappers
+  (runtime-made thunks that forward every method), proxies and foreign ones, and checks all of the above with pixels read back.
+
+### The Agility SDK (d3d12.dll `agility.inc`)
+
+`D3D12GetInterface` answers `CLSID_D3D12SDKConfiguration` (`ID3D12SDKConfiguration`, `ID3D12SDKConfiguration1`: `SetSDKVersion`, `CreateDeviceFactory`, `FreeUnusedSDKs`) and
+`CLSID_D3D12DeviceFactory` (`ID3D12DeviceFactory`: `InitializeFromGlobalState`, `ApplyToGlobalState`, `SetFlags`/`GetFlags`, `GetConfigurationInterface`, `EnableExperimentalFeatures`,
+`CreateDevice`), and every device answers `ID3D12DeviceConfiguration` (`GetDesc`, `GetEnabledExperimentalFeatures`, `SerializeVersionedRootSignature`,
+`CreateVersionedRootSignatureDeserializer`). On Windows d3d12.dll loads its core, D3D12Core.dll, from the system or from the folder a program names (`D3D12SDKVersion` /
+`D3D12SDKPath` exports, `SetSDKVersion`), and the core needs the display driver's WDDM user-mode part, which this system does not have: here this library is the one core, and a
+program's D3D12Core.dll is never loaded. It implements SDK versions up to 614 (Agility SDK 1.614: `ID3D12Device14`, `ID3D12GraphicsCommandList10`, root signature 1.2; each version's
+optional features are answered by `CheckFeatureSupport` as the adapter has them): a program's `D3D12SDKVersion` up to that is the version its devices report, a newer one runs on this
+core and reports 614; `SetSDKVersion` / `CreateDeviceFactory` with a newer version answer `D3D12_ERROR_INVALID_REDIST` (0x887E0003), with version 0 or no path `E_INVALIDARG`, and
+`SetSDKVersion` to another version once a device lives `DXGI_ERROR_INVALID_CALL`. Devices are per-adapter singletons for the factories: the first device on an adapter (of
+`D3D12CreateDevice` or of a factory) is the adapter's; a factory hands it out again with `ALLOW_RETURNING_EXISTING_DEVICE` (same SDK version, a level high enough) or
+`ALLOW_RETURNING_INCOMPATIBLE_EXISTING_DEVICE`, makes a device that is not a singleton with `DISALLOW_STORING_NEW_DEVICE_AS_SINGLETON`, and otherwise answers
+`DXGI_ERROR_ALREADY_EXISTS`. `D3D12CreateDevice` itself still makes a new device each time (Windows returns the adapter's existing one): an open gap. `CLSID_D3D12Debug` and
+`CLSID_D3D12Tools` (the SDK layers) answer `DXGI_ERROR_SDK_COMPONENT_MISSING`, experimental features `E_NOINTERFACE` (no developer mode), `CLSID_D3D12DeviceRemovedExtendedData`
+`E_NOINTERFACE` (no DRED: open gap); `ID3D12DeviceConfiguration1` is not there (open gap).
 
 ## dwmapi.dll
 

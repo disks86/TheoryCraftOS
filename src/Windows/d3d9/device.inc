@@ -781,3 +781,23 @@ EXPORT HRESULT WINAPI Direct3DCreate9Ex(UINT sdk_version, IDirect3D9Ex **out) {
   *out = (IDirect3D9Ex *)direct3d_make(1);
   return *out ? D3D_OK : E_OUTOFMEMORY;
 }
+
+/* ---- ddraw.dll's private calls ---------------------------------------------------------------------------------------------------------------------------- */
+/* What DirectDraw's Direct3D (ddraw.dll, src/Windows/ddraw/d3d.inc) needs beyond Direct3D 9, on a device of this library only: the device itself or what a proxy's
+ * wrapper of it holds (tcos_object.h). Any other device - another Direct3D 9's - is D3DERR_INVALIDCALL and left alone; ddraw.dll then does without (alpha test for
+ * colour keys, depth buffers it cannot lock). */
+/* A depth buffer of any format the program may lock (TCOS_USAGE_LOCKABLE_DEPTH): CreateDepthStencilSurface's arguments. */
+EXPORT HRESULT WINAPI TcosD3D9CreateLockableDepthStencil(IDirect3DDevice9 *device, UINT width, UINT height, D3DFORMAT format, D3DMULTISAMPLE_TYPE samples, DWORD quality,
+                                                        BOOL discard, IDirect3DSurface9 **out) {
+  (void)discard;
+  Dev *d = (Dev *)tcos_own(device, &dev_vtbl);
+  if (!d || !out) return D3DERR_INVALIDCALL;
+  return depth_surface_ex(d, width, height, format, samples, quality, out, NULL, TCOS_USAGE_LOCKABLE_DEPTH);
+}
+/* TCOS_TSS_KEY_KILL of a stage: a texel of alpha 0 of its texture takes the pixel away (recorded into a state block as the other stage states are). */
+EXPORT HRESULT WINAPI TcosD3D9SetStageKeyKill(IDirect3DDevice9 *device, DWORD stage, BOOL kill) {
+  Dev *d = (Dev *)tcos_own(device, &dev_vtbl);
+  if (!d || stage >= STAGES) return D3DERR_INVALIDCALL;
+  stage_state_set(d, stage, TCOS_TSS_KEY_KILL, kill ? TRUE : FALSE);
+  return D3D_OK;
+}

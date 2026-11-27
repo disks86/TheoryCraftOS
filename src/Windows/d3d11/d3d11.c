@@ -1543,12 +1543,19 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
       if (!KMT_OK(st)) { dx_Release(OBJ(t)); return E_OUTOFMEMORY; }
     }
     /* (Direct3D 12 knows a cube only by its views, so the kernel has to be told now; a legacy share is one Direct3D 12 itself does not make) */
-    if (cube || global_shared) TcosD3D12ResourceOptions(d->d12, (cube ? TCOS_RESOURCE_CUBE : 0u) | (global_shared ? TCOS_RESOURCE_GLOBAL_SHARE : 0u));
+    if ((cube || global_shared) && FAILED(TcosD3D12ResourceOptions(d->d12, (cube ? TCOS_RESOURCE_CUBE : 0u) | (global_shared ? TCOS_RESOURCE_GLOBAL_SHARE : 0u)))) {
+      dx_Release(OBJ(t));
+      return E_INVALIDARG;      /* (not d3d12.dll's device below: a cube or a legacy share cannot be told to it) */
+    }
     if (nt_shared || global_shared) {
       /* (what a device that opens it makes of it: the program's description, which the Direct3D 12 one - formats kept wider, one level of a target - does not say) */
       BYTE blob[TEX_SHARE_BYTES];
       tex_share_blob(&t->desc, slices ? 1 : made_kind == 2 ? 2 : 0, slices, mutex_global, blob);
-      TcosD3D12ShareExtra(d->d12, blob, sizeof blob);
+      if (FAILED(TcosD3D12ShareExtra(d->d12, blob, sizeof blob))) {
+        if (cube || global_shared) TcosD3D12ResourceOptions(d->d12, 0);
+        dx_Release(OBJ(t));
+        return E_INVALIDARG;
+      }
     }
     HRESULT hr;
     if (tiled) {
@@ -2847,7 +2854,7 @@ static HRESULT STDMETHODCALLTYPE dev_CreateSamplerState(Dev *d, const D3D11_SAMP
   /* (the MINIMUM_ / MAXIMUM_ filters: where the device has them - MinMaxFiltering, D3D11_FEATURE_D3D11_OPTIONS1, the kernel's kFeature2SamplerReductions) */
   if (((UINT)desc->Filter >> 7 & 3u) >= 2) {
     UINT features2 = 0;
-    TcosD3D12DeviceFeatures(d->d12, NULL, &features2);
+    if (FAILED(TcosD3D12DeviceFeatures(d->d12, NULL, &features2))) features2 = 0;
     if (!(features2 & (1u << 19))) return E_INVALIDARG;      /* (graphics::kFeature2SamplerReductions) */
   }
   D3D11_SAMPLER_DESC key = *desc;

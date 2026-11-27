@@ -373,12 +373,13 @@ extern const ID3D11VideoProcessorOutputViewVtbl pov_vtbl;
 extern const ID3D11VideoDevice2Vtbl vdev_vtbl;
 extern const ID3D11VideoContext3Vtbl vctx_vtbl;
 
-static VideoDecoder *vdec_of(ID3D11VideoDecoder *p) { return p && ((DxObj *)p)->lpVtbl == (const void *)&vdec_vtbl ? (VideoDecoder *)p : NULL; }
-static VideoEnum *venum_of(ID3D11VideoProcessorEnumerator *p) { return p && ((DxObj *)p)->lpVtbl == (const void *)&venum_vtbl ? (VideoEnum *)p : NULL; }
-static VideoProcessor *vproc_of(ID3D11VideoProcessor *p) { return p && ((DxObj *)p)->lpVtbl == (const void *)&vproc_vtbl ? (VideoProcessor *)p : NULL; }
+/* (this library's objects, or what a proxy's wrapper of one holds: tcos_object.h) */
+static VideoDecoder *vdec_of(ID3D11VideoDecoder *p) { return (VideoDecoder *)tcos_own(p, &vdec_vtbl); }
+static VideoEnum *venum_of(ID3D11VideoProcessorEnumerator *p) { return (VideoEnum *)tcos_own(p, &venum_vtbl); }
+static VideoProcessor *vproc_of(ID3D11VideoProcessor *p) { return (VideoProcessor *)tcos_own(p, &vproc_vtbl); }
 static VideoView *vview_of(void *p, UINT kind) {
   static const void *const tables[3] = {&dov_vtbl, &piv_vtbl, &pov_vtbl};
-  return p && ((DxObj *)p)->lpVtbl == tables[kind] ? (VideoView *)p : NULL;
+  return kind < 3 ? (VideoView *)tcos_own(p, tables[kind]) : NULL;
 }
 static Dev *dev_of_video(ID3D11VideoDevice2 *p) { return (Dev *)((BYTE *)p - offsetof(Dev, video)); }
 static Ctx *ctx_of_video(ID3D11VideoContext3 *p) { return (Ctx *)((BYTE *)p - offsetof(Ctx, video)); }

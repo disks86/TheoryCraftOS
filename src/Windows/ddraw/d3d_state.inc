@@ -436,12 +436,37 @@ static void bind_textures(D3dDevice *dev) {
   dev->dirty.texture = 0;
   /* (keyed texels are alpha 0 and no other texel of a keyed texture is: the pixel stage takes them away by the texel itself, before the stages and
    * the alpha test - Windows discards them whatever alpha the stages make, Wine's test_colorkey_precision and test_ck_rgba) */
-  for (UINT st = 0; st < D3D_STAGES; ++st) {
-    const UINT bit = 1u << st;
-    if (dev->bound_key_kill != ~0u && (dev->bound_key_kill & bit) == (kill & bit)) continue;
-    D3D_CALL(d->dev, SetTextureStageState, st, D9_TSS_KEY_KILL, (kill & bit) ? TRUE : FALSE);
+  if (d->set_key_kill) {      /* (d3d9.dll's own device: its TCOS_TSS_KEY_KILL, d3d.inc d3_dd) */
+    for (UINT st = 0; st < D3D_STAGES; ++st) {
+      const UINT bit = 1u << st;
+      if (dev->bound_key_kill != ~0u && (dev->bound_key_kill & bit) == (kill & bit)) continue;
+      d->set_key_kill(d->dev, st, (kill & bit) ? TRUE : FALSE);
+    }
+    dev->bound_key_kill = kill;
+  } else {
+    /* (another Direct3D 9: the keyed texels are alpha 0 and no other texel of a keyed texture is, so the alpha test - alpha greater than 0 - takes them away, after the
+     * stages rather than before them: right unless a stage makes the alpha of a keyed texel more than 0. While the program has an alpha test of its own, that one
+     * stands, as the program set it) */
+    const BOOL want = kill != 0 && !dev->st.rs[D3DRENDERSTATE_ALPHATESTENABLE];
+    if (want) {
+      D3D_CALL(d->dev, SetRenderState, D9_RS_ALPHATESTENABLE, TRUE);
+      D3D_CALL(d->dev, SetRenderState, D9_RS_ALPHAFUNC, D9_RS_CMP_GREATER);
+      D3D_CALL(d->dev, SetRenderState, D9_RS_ALPHAREF, 0);
+      dev->key_alpha_test = TRUE;
+    } else if (dev->key_alpha_test) {      /* (the program's alpha test back) */
+      static const UINT states[] = {D3DRENDERSTATE_ALPHATESTENABLE, D3DRENDERSTATE_ALPHAFUNC, D3DRENDERSTATE_ALPHAREF};
+      DlStateContext ctx;
+      zero(&ctx, sizeof ctx);
+      ctx.wrap0 = dev->st.rs[D3DRENDERSTATE_WRAP0];
+      ctx.texture = 2;
+      ctx.depth_bits = 24;
+      for (UINT i = 0; i < sizeof states / sizeof states[0]; ++i) {
+        DlStateOps ops;
+        if (dl_render_state(dev->version < 7 ? 3 : 7, states[i], dev->st.rs[states[i]], &ctx, &ops) == DL_OK) ops_apply(dev, &ops);
+      }
+      dev->key_alpha_test = FALSE;
+    }
   }
-  dev->bound_key_kill = kill;
   /* (MODULATE takes the texture's alpha only if it has one: stage 0 again when that changed) */
   if (dev->legacy_blend && stage0_kind(dev) != before) MASK_SET(dev->dirty.rs, D3DRENDERSTATE_TEXTUREMAPBLEND);
 }

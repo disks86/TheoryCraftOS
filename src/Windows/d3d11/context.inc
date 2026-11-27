@@ -189,8 +189,8 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
   const Shader *gs = c->gs && !c->gs->so_only ? c->gs : NULL;
   const UINT ps_base = c->vs->registers, gs_base = ps_base + (c->ps ? c->ps->registers : 0), hs_base = gs_base + (gs ? gs->registers : 0),
              ds_base = hs_base + (c->hs ? c->hs->registers : 0);
-  TcosD3D12PipelineOptions(d->d12, ps_base, 0);
-  TcosD3D12StageConstantBases(d->d12, gs_base, hs_base, ds_base);
+  /* (d->d12 is d3d12.dll's own, made sure of when the device was made: a failure here is no device of it, and no pipeline) */
+  if (FAILED(TcosD3D12PipelineOptions(d->d12, ps_base, 0)) || FAILED(TcosD3D12StageConstantBases(d->d12, gs_base, hs_base, ds_base))) return NULL;
   if (FAILED(ID3D12Device_CreateGraphicsPipelineState(d->d12, &pd, &IID_ID3D12PipelineState, (void **)&state)) || !state) return NULL;
 
   Pipeline *slot = d->pipeline_count < PIPELINES ? &d->pipelines[d->pipeline_count++] : oldest;
@@ -981,7 +981,7 @@ static HRESULT STDMETHODCALLTYPE ctx_QueryInterface(Ctx *c, REFIID riid, void **
   *out = NULL;
   void *face = NULL;
   if (guid_eq(riid, &IID_IUnknown) || guid_eq(riid, &IID_ID3D11DeviceChild) || guid_eq(riid, &IID_ID3D11DeviceContext) || guid_eq(riid, &IID_ID3D11DeviceContext1) ||
-      guid_eq(riid, &IID_ID3D11DeviceContext2) || guid_eq(riid, &IID_ID3D11DeviceContext3) || guid_eq(riid, &IID_ID3D11DeviceContext4))
+      guid_eq(riid, &IID_ID3D11DeviceContext2) || guid_eq(riid, &IID_ID3D11DeviceContext3) || guid_eq(riid, &IID_ID3D11DeviceContext4) || guid_eq(riid, &IID_ITcosObject))
     face = c;
   else if (guid_eq(riid, &IID_ID3D11Multithread) && !c->deferred) face = &c->multithread;      /* (the immediate context's only) */
   else if (guid_eq(riid, &IID_ID3DUserDefinedAnnotation)) face = &c->annotation;

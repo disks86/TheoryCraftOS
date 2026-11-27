@@ -603,12 +603,15 @@ static HRESULT tex_make_kind(Dev *d, UINT kind, UINT width, UINT height, UINT sl
                               {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, depth ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL : target ? D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET : D3D12_RESOURCE_FLAG_NONE};
     /* (Direct3D 12 knows a cube only by its views; the kernel has to know it now. A shared one gets a global share handle, the legacy kind Direct3D 9 hands out,
      * and carries its description for the device that opens it) */
-    if (kind == 3 || (flags & TEX_SHARED)) TcosD3D12ResourceOptions(d->d12, (kind == 3 ? TCOS_RESOURCE_CUBE : 0u) | ((flags & TEX_SHARED) ? TCOS_RESOURCE_GLOBAL_SHARE : 0u));
-    if (flags & TEX_SHARED) {
+    BOOL told = TRUE;      /* (d->d12 is the device this library made with d3d12.dll; should it not be its, nothing is made) */
+    if (kind == 3 || (flags & TEX_SHARED))
+      told = SUCCEEDED(TcosD3D12ResourceOptions(d->d12, (kind == 3 ? TCOS_RESOURCE_CUBE : 0u) | ((flags & TEX_SHARED) ? TCOS_RESOURCE_GLOBAL_SHARE : 0u)));
+    if (told && (flags & TEX_SHARED)) {
       const DWORD blob[8] = {0x54333944u /* "D93T" */, kind, width, height, kind == 1 ? slices : 1, levels, (DWORD)format, usage};
-      TcosD3D12ShareExtra(d->d12, blob, sizeof blob);
+      told = SUCCEEDED(TcosD3D12ShareExtra(d->d12, blob, sizeof blob));
     }
-    const HRESULT hr = ID3D12Device_CreateCommittedResource(d->d12, &props, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&t->res);
+    const HRESULT hr = told ? ID3D12Device_CreateCommittedResource(d->d12, &props, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&t->res)
+                             : D3DERR_INVALIDCALL;
     if (FAILED(hr) || !t->res) {
       t->res = NULL;
       if (implicit) obj_free(OBJ(t)); else { obj_free(OBJ(t)); dx_Release(OBJ(d)); }

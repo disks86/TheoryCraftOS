@@ -70,6 +70,6 @@ status=0
 # (d3d11test says "all N checks passed" and ends with 42, and does not name its device)
 grep -a -q -E "^$program: ([0-9]* checks, 0 failed|all [0-9]* checks passed)" "$build/debugcon.log" || status=1
 grep -a -q -E "autorun: ended, result 0, exit code 0x0*(2a)? " "$build/debugcon.log" || status=1
-if { [ "$gpu" = virgl ] || [ "$gpu" = venus ]; } && [ "$program" != d3d11test ] && [ "$program" != d3d10test ] && [ "$program" != d3d11videotest ] && [ "$program" != d3d9test ] && [ "$program" != d3d8test ] && [ "$program" != ddrawtest ] && [ "$program" != d3dimtest ] && [ "$program" != d3dsharetest ] && [ "$program" != opengltest ]; then grep -a -q "^device: hardware" "$build/debugcon.log" || { echo "the program did not draw on the 3D hardware"; status=1; }; fi
+if { [ "$gpu" = virgl ] || [ "$gpu" = venus ]; } && [ "$program" != d3d11test ] && [ "$program" != d3d10test ] && [ "$program" != d3d11videotest ] && [ "$program" != d3d9test ] && [ "$program" != d3d8test ] && [ "$program" != ddrawtest ] && [ "$program" != d3dimtest ] && [ "$program" != d3dsharetest ] && [ "$program" != opengltest ] && [ "$program" != d3dproxytest ]; then grep -a -q "^device: hardware" "$build/debugcon.log" || { echo "the program did not draw on the 3D hardware"; status=1; }; fi
 [ $status -eq 0 ] && echo "d3d12 qemu ($gpu): passed" || echo "d3d12 qemu ($gpu): FAILED"
 exit $status

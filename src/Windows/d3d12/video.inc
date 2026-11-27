@@ -297,6 +297,11 @@ static HRESULT STDMETHODCALLTYPE dev_QueryInterface(Dev *This, REFIID riid, void
     *out = &This->video;
     return S_OK;
   }
+  if (out && riid && guid_eq(riid, &IID_ID3D12DeviceConfiguration)) {      /* (agility.inc) */
+    dx_AddRef(OBJ(This));
+    *out = &This->config;
+    return S_OK;
+  }
   return dx_QueryInterface(OBJ(This), riid, out);
 }
 static HRESULT STDMETHODCALLTYPE vdev_QueryInterface(ID3D12VideoDevice3 *v, REFIID riid, void **out) { return dev_QueryInterface(dev_of_video(v), riid, out); }

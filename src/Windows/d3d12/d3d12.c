@@ -128,48 +128,77 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 #include "library.inc"
 
 #include "vtbl.inc"
+#include "agility.inc"
 
 /* ---- the entry points -------------------------------------------------------------------------------------------------------------------------------------------------------- */
 
-/* (src/Windows/tcosdx.h) */
-EXPORT void WINAPI TcosD3D12PipelineOptions(ID3D12Device *device, UINT pixel_constant_base, UINT shader_kind) {
-  Dev *dev = (Dev *)device;
-  if (!dev) return;
-  dev->next_pixel_base = pixel_constant_base;
-  dev->next_shader_kind = shader_kind;
+/* (src/Windows/tcosdx.h) The private exports take only this library's own objects: a proxy's wrapper is seen through (IID_ITcosObject, tcos_object.h), anything else - a
+ * foreign runtime's object - is refused with E_INVALIDARG (a count of 0) and never touched. */
+static Dev *own_dev(const void *p) { return (Dev *)tcos_own(p, &dev_vtbl); }
+static Resource *own_res(const void *p) { return (Resource *)tcos_own(p, &res_vtbl); }
+static CmdList *own_list(const void *p) { return (CmdList *)tcos_own(p, &list_vtbl); }
+static QHeap *own_qheap(const void *p) { return (QHeap *)tcos_own(p, &qheap_vtbl); }
+
+/* (src/Windows/tcosdx.h) This library's own object behind `object` - the object itself, or the one a proxy's wrapper holds (IID_ITcosObject) - as interface `riid`
+ * (AddRef'd): what the runtimes above take a program's Direct3D 12 objects with (d3d11.dll's D3D11On12CreateDevice and CreateWrappedResource), so that every
+ * call they make afterwards goes to an object of this library. E_INVALIDARG for an object of another runtime (no QueryInterface but IID_ITcosObject is asked of it),
+ * E_NOINTERFACE when this library's object has no such interface. */
+EXPORT HRESULT WINAPI TcosD3D12Object(IUnknown *object, REFIID riid, void **out) {
+  static const void *const kinds[] = {&dev_vtbl, &queue_vtbl, &alloc_vtbl, &list_vtbl, &fence_vtbl, &res_vtbl, &heap_vtbl, &dheap_vtbl, &rs_vtbl, &pso_vtbl, &qheap_vtbl,
+                                      &sig_vtbl, &plib_vtbl, &scache_vtbl, &ltrack_vtbl, &vdev_vtbl, &vdec_vtbl, &vdheap_vtbl, &vproc_vtbl, &vdlist_vtbl, &vplist_vtbl,
+                                      &vme_vtbl, &vmvh_vtbl, &venc_vtbl, &veheap_vtbl, &velist_vtbl};
+  if (out) *out = NULL;
+  if (!object || !riid || !out) return E_INVALIDARG;
+  IUnknown *own = (IUnknown *)tcos_own_any(object, kinds, sizeof kinds / sizeof kinds[0]);
+  if (!own) return E_INVALIDARG;
+  return own->lpVtbl->QueryInterface(own, riid, out);
 }
 
-EXPORT void WINAPI TcosD3D12StageConstantBases(ID3D12Device *device, UINT geometry, UINT hull, UINT domain) {
-  Dev *dev = (Dev *)device;
-  if (!dev) return;
+EXPORT HRESULT WINAPI TcosD3D12PipelineOptions(ID3D12Device *device, UINT pixel_constant_base, UINT shader_kind) {
+  Dev *dev = own_dev(device);
+  if (!dev) return E_INVALIDARG;
+  dev->next_pixel_base = pixel_constant_base;
+  dev->next_shader_kind = shader_kind;
+  return S_OK;
+}
+
+EXPORT HRESULT WINAPI TcosD3D12StageConstantBases(ID3D12Device *device, UINT geometry, UINT hull, UINT domain) {
+  Dev *dev = own_dev(device);
+  if (!dev) return E_INVALIDARG;
   dev->next_stage_base[0] = geometry;
   dev->next_stage_base[1] = hull;
   dev->next_stage_base[2] = domain;
+  return S_OK;
 }
-EXPORT void WINAPI TcosD3D12DeviceFeatures(ID3D12Device *device, UINT *features, UINT *features2) {
-  Dev *dev = (Dev *)device;
+EXPORT HRESULT WINAPI TcosD3D12DeviceFeatures(ID3D12Device *device, UINT *features, UINT *features2) {
+  const Dev *dev = own_dev(device);
   if (features) *features = dev ? dev->caps.features : 0;
   if (features2) *features2 = dev ? dev->caps.features2 : 0;
+  return dev ? S_OK : E_INVALIDARG;
 }
-/* The third word of the kernel device's features (graphics::DeviceFeature3, DEV_FEATURE3_*). */
+/* The third word of the kernel device's features (graphics::DeviceFeature3, DEV_FEATURE3_*); 0 (none) for an object that is not a device of this library. */
 EXPORT UINT WINAPI TcosD3D12DeviceFeatures3(ID3D12Device *device) {
-  const Dev *dev = (const Dev *)device;
+  const Dev *dev = own_dev(device);
   return dev ? dev->caps.features3 : 0;
 }
-EXPORT void WINAPI TcosD3D12ResourceOptions(ID3D12Device *device, UINT flags) {
-  Dev *dev = (Dev *)device;
-  if (dev) dev->next_resource_flags = flags;
+EXPORT HRESULT WINAPI TcosD3D12ResourceOptions(ID3D12Device *device, UINT flags) {
+  Dev *dev = own_dev(device);
+  if (!dev) return E_INVALIDARG;
+  dev->next_resource_flags = flags;
+  return S_OK;
 }
 /* (src/Windows/tcosdx.h) What the next resource made D3D12_HEAP_FLAG_SHARED carries for the runtime above it (up to 64 bytes: d3d11.dll's description of its
  * texture), and what a resource - made shared, or opened from a shared handle - carries: its size (0: none), up to `capacity` bytes copied. */
-EXPORT void WINAPI TcosD3D12ShareExtra(ID3D12Device *device, const void *data, UINT size) {
-  Dev *dev = (Dev *)device;
-  if (!dev) return;
-  dev->next_share_extra_size = data && size <= sizeof dev->next_share_extra ? size : 0;
+EXPORT HRESULT WINAPI TcosD3D12ShareExtra(ID3D12Device *device, const void *data, UINT size) {
+  Dev *dev = own_dev(device);
+  if (!dev) return E_INVALIDARG;
+  if (data && size > sizeof dev->next_share_extra) return E_INVALIDARG;
+  dev->next_share_extra_size = data ? size : 0;
   if (dev->next_share_extra_size) memcpy(dev->next_share_extra, data, size);
+  return S_OK;
 }
 EXPORT UINT WINAPI TcosD3D12SharedExtra(ID3D12Resource *resource, void *out, UINT capacity) {
-  Resource *r = (Resource *)resource;
+  const Resource *r = own_res(resource);
   if (!r) return 0;
   if (out) memcpy(out, r->share_extra, r->share_extra_size < capacity ? r->share_extra_size : capacity);
   return r->share_extra_size;
@@ -177,65 +206,33 @@ EXPORT UINT WINAPI TcosD3D12SharedExtra(ID3D12Resource *resource, void *out, UIN
 /* (src/Windows/tcosdx.h) The win32k resource of a resource made shared or opened from a shared handle (0: neither): what D3DKMTShareObjects shares, which d3d11.dll
  * shares itself together with the texture's keyed mutex. */
 EXPORT UINT WINAPI TcosD3D12SharedResource(ID3D12Resource *resource) {
-  extern const ID3D12Resource2Vtbl res_vtbl;
-  Resource *r = (Resource *)resource;
-  return r && r->d.o.lpVtbl == (const void *)&res_vtbl ? r->kresource : 0;
+  const Resource *r = own_res(resource);
+  return r ? r->kresource : 0;
 }
 EXPORT UINT WINAPI TcosD3D12GlobalShare(ID3D12Resource *resource) {
-  extern const ID3D12Resource2Vtbl res_vtbl;
-  Resource *r = (Resource *)resource;
-  return r && r->d.o.lpVtbl == (const void *)&res_vtbl ? r->global_share : 0;
+  const Resource *r = own_res(resource);
+  return r ? r->global_share : 0;
 }
 EXPORT HRESULT WINAPI TcosD3D12OpenShared(ID3D12Device *device, HANDLE handle, int global, REFIID riid, void **out) {
   if (out) *out = NULL;
-  if (!device || !handle || !riid || !out) return E_INVALIDARG;
+  Dev *dev = own_dev(device);
+  if (!dev || !handle || !riid || !out) return E_INVALIDARG;
   IUnknown *made = NULL;
-  const HRESULT hr = open_shared((Dev *)device, (UINT64)(UINT_PTR)handle, global ? SHARED_GLOBAL : SHARED_NT, &made);
+  const HRESULT hr = open_shared(dev, (UINT64)(UINT_PTR)handle, global ? SHARED_GLOBAL : SHARED_NT, &made);
   if (FAILED(hr)) return hr;
   return query_out(made, riid, out);
 }
-EXPORT void WINAPI TcosD3D12BeginQueryKind(ID3D12GraphicsCommandList *list, ID3D12QueryHeap *heap, UINT index, UINT kind) {
-  if (list) list_begin_query_kind((CmdList *)list, (QHeap *)heap, index, kind);
+EXPORT HRESULT WINAPI TcosD3D12BeginQueryKind(ID3D12GraphicsCommandList *list, ID3D12QueryHeap *heap, UINT index, UINT kind) {
+  CmdList *l = own_list(list);
+  QHeap *h = own_qheap(heap);
+  if (!l || !h) return E_INVALIDARG;
+  list_begin_query_kind(l, h, index, kind);
+  return S_OK;
 }
 
+/* (agility.inc device_make: a new device each time - the adapter's first is its singleton, which a device factory may hand out again) */
 EXPORT HRESULT WINAPI D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL minimum, REFIID riid, void **out) {
-  LUID luid = {0, 0};
-  NTSTATUS st = 0;
-  /* (a value that names no feature level is not one; a level the adapter lacks - device.inc dev_feature_level: 11_1 on the CPU renderer, 11_0 on virgl and Venus, nothing above
-   * 11_1 anywhere - is refused below as the adapter not supporting it) */
-  switch ((UINT)minimum) {
-    case 0: case D3D_FEATURE_LEVEL_1_0_CORE: case D3D_FEATURE_LEVEL_9_1: case D3D_FEATURE_LEVEL_9_2: case D3D_FEATURE_LEVEL_9_3: case D3D_FEATURE_LEVEL_10_0: case D3D_FEATURE_LEVEL_10_1:
-    case D3D_FEATURE_LEVEL_11_0: case D3D_FEATURE_LEVEL_11_1: case D3D_FEATURE_LEVEL_12_0: case D3D_FEATURE_LEVEL_12_1: case D3D_FEATURE_LEVEL_12_2: break;
-    default: return E_INVALIDARG;
-  }
-  if (adapter) {
-    IDXGIAdapter *a = NULL;
-    DXGI_ADAPTER_DESC desc;
-    if (FAILED(adapter->lpVtbl->QueryInterface(adapter, &IID_IDXGIAdapter, (void **)&a))) return E_INVALIDARG;
-    const HRESULT hr = IDXGIAdapter_GetDesc(a, &desc);
-    IDXGIAdapter_Release(a);
-    if (FAILED(hr)) return hr;
-    luid = desc.AdapterLuid;
-  } else {
-    KmtAdapter list[16];
-    const UINT n = kmt_enum_adapters(list, 16, NULL);
-    if (n == 0) return DXGI_ERROR_UNSUPPORTED;
-    luid = list[0].luid;
-    for (UINT i = 0; i < n; ++i) kmt_close_adapter(list[i].handle);
-  }
-  if (out) *out = NULL;
-  Dev *d = dev_create(luid, &st);
-  if (!d) return KMT_OK(st) ? E_OUTOFMEMORY : DXGI_ERROR_UNSUPPORTED;
-  /* (a program that asks for a feature level the adapter does not have gets what Direct3D 12 says: the adapter does not support it) */
-  if (minimum != 0 && dev_feature_level(d) < minimum) {
-    dx_Release(OBJ(d));
-    return DXGI_ERROR_UNSUPPORTED;
-  }
-  if (!out) {      /* (the question "could a device be made?") */
-    dx_Release(OBJ(d));
-    return S_FALSE;
-  }
-  return query_out((IUnknown *)d, riid, out);
+  return device_make(adapter, minimum, sdk_version_of_process(), ~0u, riid, out);
 }
 
 EXPORT HRESULT WINAPI D3D12GetDebugInterface(REFIID riid, void **out) {
@@ -243,7 +240,8 @@ EXPORT HRESULT WINAPI D3D12GetDebugInterface(REFIID riid, void **out) {
   return DXGI_ERROR_SDK_COMPONENT_MISSING;
 }
 EXPORT HRESULT WINAPI D3D12EnableExperimentalFeatures(UINT count, const IID *iids, void *configuration, UINT *sizes) { return count == 0 ? S_OK : E_NOINTERFACE; }
-EXPORT HRESULT WINAPI D3D12GetInterface(REFCLSID clsid, REFIID riid, void **out) { if (out) *out = NULL; return E_NOINTERFACE; }
+/* The Agility SDK's classes (agility.inc): CLSID_D3D12SDKConfiguration, CLSID_D3D12DeviceFactory; the SDK layers' are missing. */
+EXPORT HRESULT WINAPI D3D12GetInterface(REFCLSID clsid, REFIID riid, void **out) { return configuration_interface(clsid, riid, out); }
 
 BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved) {
   (void)module;

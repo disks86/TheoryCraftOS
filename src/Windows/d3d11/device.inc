@@ -25,7 +25,7 @@ static HRESULT STDMETHODCALLTYPE dev_QueryInterface(Dev *d, REFIID riid, void **
   if (!out) return E_POINTER;
   *out = NULL;
   if (guid_eq(riid, &IID_IUnknown) || guid_eq(riid, &IID_ID3D11Device) || guid_eq(riid, &IID_ID3D11Device1) || guid_eq(riid, &IID_ID3D11Device2) || guid_eq(riid, &IID_ID3D11Device3) ||
-      guid_eq(riid, &IID_ID3D11Device4) || guid_eq(riid, &IID_ID3D11Device5))
+      guid_eq(riid, &IID_ID3D11Device4) || guid_eq(riid, &IID_ID3D11Device5) || guid_eq(riid, &IID_ITcosObject))      /* (tcos_object.h: the device itself) */
     *out = d;
   else if (guid_eq(riid, &IID_IDXGIObject) || guid_eq(riid, &IID_IDXGIDevice) || guid_eq(riid, &IID_IDXGIDevice1) || guid_eq(riid, &IID_IDXGIDevice2) ||
            guid_eq(riid, &IID_IDXGIDevice3)) *out = &d->dxgi;      /* (DXGI 1.2: ANGLE needs it to present to another process's window) */
@@ -294,7 +294,7 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *d, D3D11_FEATURE f
       ((D3D11_FEATURE_DATA_D3D11_OPTIONS1 *)data)->TiledResourcesTier = dev_tiled_tier(d);
       {
         UINT features2 = 0;
-        TcosD3D12DeviceFeatures(d->d12, NULL, &features2);
+        if (FAILED(TcosD3D12DeviceFeatures(d->d12, NULL, &features2))) features2 = 0;      /* (none: not d3d12.dll's device) */
         ((D3D11_FEATURE_DATA_D3D11_OPTIONS1 *)data)->MinMaxFiltering = (features2 & (1u << 19)) ? TRUE : FALSE;
       }
       return S_OK;

@@ -333,17 +333,21 @@ static HRESULT STDMETHODCALLTYPE dev_GetSamplerState(Dev *d, DWORD sampler, D3DS
   *value = slot < SAMPLERS && (UINT)type < SAMPLER_STATES ? d->state.sampler[slot][type] : 0;
   return D3D_OK;
 }
-static HRESULT STDMETHODCALLTYPE dev_SetTextureStageState(Dev *d, DWORD stage, D3DTEXTURESTAGESTATETYPE type, DWORD value) {
-  if (stage >= STAGES || (UINT)type >= STAGE_STATES || type == 0) return D3D_OK;
+static void stage_state_set(Dev *d, DWORD stage, UINT type, DWORD value) {
   StateMask *m;
   State *s = state_for_set(d, &m);
   s->stage[stage][type] = value;
   if (m) m->stage[stage] |= 1ull << type;
+}
+/* (a type Direct3D 9 does not have is ignored - TCOS_TSS_KEY_KILL too, which is ddraw.dll's through TcosD3D9SetStageKeyKill) */
+static HRESULT STDMETHODCALLTYPE dev_SetTextureStageState(Dev *d, DWORD stage, D3DTEXTURESTAGESTATETYPE type, DWORD value) {
+  if (stage >= STAGES || (UINT)type >= STAGE_STATES || type == 0 || (UINT)type == TCOS_TSS_KEY_KILL) return D3D_OK;
+  stage_state_set(d, stage, (UINT)type, value);
   return D3D_OK;
 }
 static HRESULT STDMETHODCALLTYPE dev_GetTextureStageState(Dev *d, DWORD stage, D3DTEXTURESTAGESTATETYPE type, DWORD *value) {
   if (!value) return D3DERR_INVALIDCALL;
-  *value = stage < STAGES && (UINT)type < STAGE_STATES ? d->state.stage[stage][type] : 0;
+  *value = stage < STAGES && (UINT)type < STAGE_STATES && (UINT)type != TCOS_TSS_KEY_KILL ? d->state.stage[stage][type] : 0;
   return D3D_OK;
 }
 
@@ -530,7 +534,8 @@ static HRESULT STDMETHODCALLTYPE dev_GetFVF(Dev *d, DWORD *fvf) {
   *fvf = d->state.fvf;
   return D3D_OK;
 }
-static Decl *decl_of(IDirect3DVertexDeclaration9 *decl) { return decl && ((DxObj *)decl)->lpVtbl == (const void *)&decl_vtbl ? (Decl *)decl : NULL; }
+/* (the objects a program sets: this library's own, or what a proxy's wrapper of one holds - tcos_object.h; anything else is no object of the device) */
+static Decl *decl_of(IDirect3DVertexDeclaration9 *decl) { return (Decl *)tcos_own(decl, &decl_vtbl); }
 static HRESULT STDMETHODCALLTYPE dev_SetVertexDeclaration(Dev *d, IDirect3DVertexDeclaration9 *decl) {
   Decl *x = decl_of(decl);
   if (decl && !x) return D3DERR_INVALIDCALL;
@@ -547,8 +552,8 @@ static HRESULT STDMETHODCALLTYPE dev_GetVertexDeclaration(Dev *d, IDirect3DVerte
   if (*decl) child_AddRef(&d->state.decl->c);
   return D3D_OK;
 }
-static Buffer *vb_of(void *p) { return p && ((DxObj *)p)->lpVtbl == (const void *)&vb_vtbl ? p : NULL; }
-static Buffer *ib_of(void *p) { return p && ((DxObj *)p)->lpVtbl == (const void *)&ib_vtbl ? p : NULL; }
+static Buffer *vb_of(void *p) { return (Buffer *)tcos_own(p, &vb_vtbl); }
+static Buffer *ib_of(void *p) { return (Buffer *)tcos_own(p, &ib_vtbl); }
 static HRESULT STDMETHODCALLTYPE dev_SetStreamSource(Dev *d, UINT stream, IDirect3DVertexBuffer9 *buffer, UINT offset, UINT stride) {
   Buffer *b = vb_of(buffer);
   if (stream >= STREAMS || (buffer && !b) || (offset & 3)) return D3DERR_INVALIDCALL;
@@ -605,9 +610,8 @@ static HRESULT STDMETHODCALLTYPE dev_GetIndices(Dev *d, IDirect3DIndexBuffer9 **
   return D3D_OK;
 }
 static Tex *texture_of(void *p) {
-  if (!p) return NULL;
-  const void *v = ((DxObj *)p)->lpVtbl;
-  return v == (const void *)&tex_vtbl || v == (const void *)&cube_vtbl || v == (const void *)&vol_vtbl ? p : NULL;
+  static const void *const kinds[] = {&tex_vtbl, &cube_vtbl, &vol_vtbl};
+  return (Tex *)tcos_own_any(p, kinds, 3);
 }
 static HRESULT STDMETHODCALLTYPE dev_SetTexture(Dev *d, DWORD stage, IDirect3DBaseTexture9 *texture) {
   const UINT slot = sampler_slot(stage);
@@ -703,10 +707,18 @@ static HRESULT shader_make_ex(Dev *d, const DWORD *code, BOOL vertex, int implic
 static HRESULT shader_make(Dev *d, const DWORD *code, BOOL vertex, Shader **out) { return shader_make_ex(d, code, vertex, 0, out); }
 static HRESULT STDMETHODCALLTYPE dev_CreateVertexShader(Dev *d, const DWORD *code, IDirect3DVertexShader9 **shader) { return shader_make(d, code, TRUE, (Shader **)shader); }
 static HRESULT STDMETHODCALLTYPE dev_CreatePixelShader(Dev *d, const DWORD *code, IDirect3DPixelShader9 **shader) { return shader_make(d, code, FALSE, (Shader **)shader); }
-/* (a shader is known by its own mark, not its vtable: Direct3D 9 takes one whose vtable a program changed) */
-static BOOL shader_is(const void *p, int vertex) { return p && ((const Shader *)p)->magic == SHADER_MAGIC && ((const Shader *)p)->vertex == vertex; }
-static HRESULT STDMETHODCALLTYPE dev_SetVertexShader(Dev *d, IDirect3DVertexShader9 *shader) {
-  if (shader && (!shader_is(shader, 1) || ((Shader *)shader)->c.dev != d)) return D3DERR_INVALIDCALL;
+/* (a shader is known by its own mark, not its vtable: Direct3D 9 takes one whose vtable a program changed. The mark is read only of an object of this library: one
+ * with its vtable, or what IID_ITcosObject gives - the object behind a proxy's wrapper, or one whose vtable was changed; tcos_object.h. Another runtime's object
+ * answers no IID_ITcosObject and is not read) */
+static Shader *shader_of(const void *p, int vertex) {
+  if (!p) return NULL;
+  const void *v = ((const DxObj *)p)->lpVtbl;
+  const Shader *s = v == (const void *)&vs_vtbl || v == (const void *)&ps_vtbl ? p : (const Shader *)tcos_canonical(p);
+  return s && s->magic == SHADER_MAGIC && s->vertex == vertex ? (Shader *)s : NULL;
+}
+static HRESULT STDMETHODCALLTYPE dev_SetVertexShader(Dev *d, IDirect3DVertexShader9 *given) {
+  Shader *shader = shader_of(given, 1);
+  if (given && (!shader || shader->c.dev != d)) return D3DERR_INVALIDCALL;
   StateMask *m;
   State *s = state_for_set(d, &m);
   bind(&s->vs, shader);
@@ -719,8 +731,9 @@ static HRESULT STDMETHODCALLTYPE dev_GetVertexShader(Dev *d, IDirect3DVertexShad
   if (*shader) child_AddRef(&d->state.vs->c);
   return D3D_OK;
 }
-static HRESULT STDMETHODCALLTYPE dev_SetPixelShader(Dev *d, IDirect3DPixelShader9 *shader) {
-  if (shader && (!shader_is(shader, 0) || ((Shader *)shader)->c.dev != d)) return D3DERR_INVALIDCALL;
+static HRESULT STDMETHODCALLTYPE dev_SetPixelShader(Dev *d, IDirect3DPixelShader9 *given) {
+  Shader *shader = shader_of(given, 0);
+  if (given && (!shader || shader->c.dev != d)) return D3DERR_INVALIDCALL;
   StateMask *m;
   State *s = state_for_set(d, &m);
   bind(&s->ps, shader);

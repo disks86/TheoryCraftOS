@@ -137,7 +137,7 @@ static BOOL display_set(const D3DDISPLAYMODEEX *mode) {
 
 /* ---- swap chains ------------------------------------------------------------------------------------------------------------------------------------ */
 
-static SwapChain *chain_of(void *p) { return p && ((DxObj *)p)->lpVtbl == (const void *)&chain_vtbl ? p : NULL; }
+static SwapChain *chain_of(void *p) { return (SwapChain *)tcos_own(p, &chain_vtbl); }      /* (tcos_object.h) */
 static void chain_free_buffers(SwapChain *c) {
   for (UINT i = 0; i < MAX_BACK_BUFFERS; ++i) {
     if (c->surface[i]) { obj_free(OBJ(c->surface[i])); c->surface[i] = NULL; }

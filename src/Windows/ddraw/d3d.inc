@@ -58,8 +58,6 @@
 #define D9_TS_TEXTURE0 16u
 #define D9_TS_WORLD 256u
 #define D9_RS_ALPHATESTENABLE 15u
-#define D9_USAGE_LOCKABLE_DEPTH 0x40000000u /* d3d9.dll's own usage (TCOS_USAGE_LOCKABLE_DEPTH): a depth buffer of any format that Lock reads and writes */
-#define D9_TSS_KEY_KILL 33u            /* d3d9.dll's own stage state (TCOS_TSS_KEY_KILL): a texel of alpha 0 takes the pixel away */
 #define D9_RS_ALPHAREF 24u
 #define D9_RS_ALPHAFUNC 25u
 #define D9_RS_CMP_GREATER 5u
@@ -192,6 +190,11 @@ typedef struct D3dDD {
   BYTE *scratch[4];
   SIZE_T scratch_size[4];
   DWORD tex_stamp;               /* changes when a texture copy is made again (the devices bind it again) */
+  /* d3d9.dll's private calls (its device.inc), found when the device is this system's d3d9.dll's own (d3_dd: IID_ITcosObject gives the device itself back, and the
+   * module has the exports). NULL for another Direct3D 9 - a proxy d3d9.dll whose wrappers are not seen through, or another runtime -: colour keys are then the
+   * alpha test of the alpha-0 texels, and a depth buffer with stencil is not locked. */
+  HRESULT(WINAPI *create_lockable_depth)(IDirect3DDevice9 *, UINT, UINT, D3DFORMAT, D3DMULTISAMPLE_TYPE, DWORD, BOOL, IDirect3DSurface9 **);
+  HRESULT(WINAPI *set_key_kill)(IDirect3DDevice9 *, DWORD, BOOL);
 } D3dDD;
 
 /* A light of Direct3D 7 (SetLight / LightEnable, by index). */
@@ -276,6 +279,7 @@ struct D3dDevice {
   DWORD bound_stamp[D3D_STAGES];  /* the texture copies Direct3D 9 has bound (D3dDD.tex_stamp when bound) */
   D3dRes *bound_res[D3D_STAGES];
   UINT bound_key_kill;           /* bit n: stage n's TCOS_TSS_KEY_KILL is set in Direct3D 9 (~0: not known) */
+  BOOL key_alpha_test;           /* without d3d9.dll's key kill: the alpha test stands in for it (bind_textures), and the program's own is put back after */
   IDirect3DQuery9 *occlusion;    /* D3DRENDERSTATE_ZVISIBLE */
   /* Direct3D 1: the processed vertices of execute buffers (D3DTLVERTEX) and their clip-space forms */
   BYTE *tl;
@@ -493,6 +497,15 @@ static D3dDD *d3_dd(DDraw *dd) {
   }
   D3D_CALL(d->dev, GetDeviceCaps, &d->caps9);
   d3_caps_from9(&d->caps9, &d->caps);
+  /* (d3d9.dll's own extensions only on a device that is its own: one that answers IID_ITcosObject with itself - not a wrapper, not another runtime's - and a
+   * module that has the private exports, which check the device again; src/Windows/tcos_object.h) */
+  d->create_lockable_depth = NULL;
+  d->set_key_kill = NULL;
+  if (tcos_canonical(d->dev) == (IUnknown *)d->dev) {
+    d->create_lockable_depth = (HRESULT(WINAPI *)(IDirect3DDevice9 *, UINT, UINT, D3DFORMAT, D3DMULTISAMPLE_TYPE, DWORD, BOOL, IDirect3DSurface9 **))(void *)GetProcAddress(
+        d->module, "TcosD3D9CreateLockableDepthStencil");
+    d->set_key_kill = (HRESULT(WINAPI *)(IDirect3DDevice9 *, DWORD, BOOL))(void *)GetProcAddress(d->module, "TcosD3D9SetStageKeyKill");
+  }
   return d;
 }
 
@@ -828,14 +841,10 @@ static D3dRes *depth_res(D3dDD *d, Surface *s) {
     r->height = s->desc.dwHeight;
     r->levels = 1;
     r->format = dd_format(s->fmt)->g ? D3DFMT_D24S8 : D3DFMT_D32F_LOCKABLE;
-    /* (with stencil: a D24S8 that d3d9.dll's own usage makes lockable, so that Lock reads what was drawn - IDirect3DDevice9Ex::CreateDepthStencilSurfaceEx,
-     * which every device of d3d9.dll has, after the 119 methods of IDirect3DDevice9 and 12 more of 9Ex; a plain D24S8 if that is refused) */
-    if (r->format == D3DFMT_D24S8) {
-      typedef HRESULT(STDMETHODCALLTYPE * CreateDepthEx)(IDirect3DDevice9 *, UINT, UINT, D3DFORMAT, D3DMULTISAMPLE_TYPE, DWORD, WINBOOL, IDirect3DSurface9 **, HANDLE *, DWORD);
-      CreateDepthEx create;
-      memcpy(&create, (void *const *)d->dev->lpVtbl + sizeof(IDirect3DDevice9Vtbl) / sizeof(void *) + 12, sizeof create);
-      r->depth_lockable = SUCCEEDED(create(d->dev, r->width, r->height, r->format, D3DMULTISAMPLE_NONE, 0, FALSE, &r->surface, NULL, D9_USAGE_LOCKABLE_DEPTH));
-    }
+    /* (with stencil: a D24S8 that d3d9.dll makes lockable, so that Lock reads what was drawn - its private TcosD3D9CreateLockableDepthStencil (TCOS_USAGE_LOCKABLE_DEPTH),
+     * on its own device only; a plain D24S8, which Lock does not read back, on another Direct3D 9 or if that is refused) */
+    if (r->format == D3DFMT_D24S8 && d->create_lockable_depth)
+      r->depth_lockable = SUCCEEDED(d->create_lockable_depth(d->dev, r->width, r->height, r->format, D3DMULTISAMPLE_NONE, 0, FALSE, &r->surface));
     if (!r->depth_lockable && FAILED(D3D_CALL(d->dev, CreateDepthStencilSurface, r->width, r->height, r->format, D3DMULTISAMPLE_NONE, 0, FALSE, &r->surface, NULL))) {
       res_free(r);
       return NULL;

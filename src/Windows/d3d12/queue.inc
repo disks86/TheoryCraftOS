@@ -222,11 +222,20 @@ static void run_chunk(Queue *q, const Chunk *c) {
   chunk_fan_out(q, c);
 }
 
+/* (the queue's methods take the lists, fences and buffers of this library: a proxy's wrapper of one is seen through, tcos_object.h; a foreign object is not run) */
+extern const ID3D12GraphicsCommandList10Vtbl list_vtbl;
+extern const ID3D12Fence1Vtbl fence_vtbl;
+extern const ID3D12Resource2Vtbl res_vtbl;
+extern const ID3D12VideoDecodeCommandList3Vtbl vdlist_vtbl;
+extern const ID3D12VideoProcessCommandList3Vtbl vplist_vtbl;
+extern const ID3D12VideoEncodeCommandList4Vtbl velist_vtbl;
 static void STDMETHODCALLTYPE queue_ExecuteCommandLists(Queue *This, UINT count, ID3D12CommandList *const *lists) {
+  if (count && !lists) return;
   EnterCriticalSection(&This->lock);
   res_push_all();
   for (UINT i = 0; i < count; ++i) {
-    CmdList *l = (CmdList *)lists[i];
+    static const void *const kinds[] = {&list_vtbl, &vdlist_vtbl, &vplist_vtbl, &velist_vtbl};
+    CmdList *l = (CmdList *)tcos_own_any(lists[i], kinds, 4);
     if (!l || !l->closed) continue;
     for (UINT k = 0; k < l->nheaps_used; ++k) dheap_sync(l->heaps_used[k]);
     for (UINT k = 0; k < l->nchunks; ++k) {
@@ -249,12 +258,14 @@ static void STDMETHODCALLTYPE queue_ExecuteCommandLists(Queue *This, UINT count,
 }
 
 static HRESULT STDMETHODCALLTYPE queue_Signal(Queue *This, ID3D12Fence *fence, UINT64 value) {
-  if (!fence) return E_INVALIDARG;
-  return hr_from(kmt_signal_gpu(This->ctx.handle, ((Fence *)fence)->sync, value));
+  const Fence *f = (const Fence *)tcos_own(fence, &fence_vtbl);
+  if (!f) return E_INVALIDARG;
+  return hr_from(kmt_signal_gpu(This->ctx.handle, f->sync, value));
 }
 static HRESULT STDMETHODCALLTYPE queue_Wait(Queue *This, ID3D12Fence *fence, UINT64 value) {
-  if (!fence) return E_INVALIDARG;
-  return hr_from(kmt_wait_gpu(This->ctx.handle, ((Fence *)fence)->sync, value));
+  const Fence *f = (const Fence *)tcos_own(fence, &fence_vtbl);
+  if (!f) return E_INVALIDARG;
+  return hr_from(kmt_wait_gpu(This->ctx.handle, f->sync, value));
 }
 static HRESULT STDMETHODCALLTYPE queue_GetTimestampFrequency(Queue *This, UINT64 *frequency) {
   if (!frequency) return E_INVALIDARG;
@@ -317,9 +328,9 @@ static UINT half_to_byte(UINT h) {
 
 static HRESULT STDMETHODCALLTYPE pres_ReadBackBuffer(ITcosPresenter *This, IUnknown *buffer, void *dst, UINT pitch) {
   Queue *q = queue_of_presenter(This);
-  Resource *r = (Resource *)buffer;
+  const Resource *r = (const Resource *)tcos_own(buffer, &res_vtbl);
   void *data = NULL;
-  if (!r || !r->fmt || !KMT_OK(kmt_lock(q->d.dev->kdev, r->alloc, 0, KMT_LOCK_READ_ONLY, &data))) return E_FAIL;
+  if (!r || !dst || !r->fmt || !KMT_OK(kmt_lock(q->d.dev->kdev, r->alloc, 0, KMT_LOCK_READ_ONLY, &data))) return E_FAIL;
   const UINT w = (UINT)r->desc.Width, h = r->desc.Height;
   for (UINT y = 0; y < h; ++y) {
     BYTE *out = (BYTE *)dst + (SIZE_T)y * pitch;

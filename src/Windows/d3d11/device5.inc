@@ -38,7 +38,7 @@ typedef struct Fence11 {
 extern const ID3D11FenceVtbl fence_vtbl;
 static const GUID *const g_fence_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11Fence, NULL};
 
-static Fence11 *fence_of(ID3D11Fence *f) { return f && ((DxObj *)f)->lpVtbl == (const void *)&fence_vtbl ? (Fence11 *)f : NULL; }
+static Fence11 *fence_of(ID3D11Fence *f) { return (Fence11 *)tcos_own(f, &fence_vtbl); }      /* (this library's, or what a proxy's wrapper holds: tcos_object.h) */
 static void fence_destroy(DxObj *o) {
   Fence11 *f = (Fence11 *)o;
   if (f->f) ID3D12Fence_Release(f->f);

@@ -151,7 +151,7 @@ static HRESULT STDMETHODCALLTYPE dev_CreateDeviceContextState(Dev *d, UINT flags
 }
 static CtxState *cstate_of(ID3DDeviceContextState *p) {
   extern const ID3DDeviceContextStateVtbl cstate_vtbl;
-  return p && ((DxObj *)p)->lpVtbl == (const void *)&cstate_vtbl ? (CtxState *)p : NULL;
+  return (CtxState *)tcos_own(p, &cstate_vtbl);      /* (tcos_object.h) */
 }
 static void STDMETHODCALLTYPE ctx_SwapDeviceContextState(Ctx *c, ID3DDeviceContextState *state, ID3DDeviceContextState **previous) {
   CtxState *s = cstate_of(state);

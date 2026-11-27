@@ -496,6 +496,8 @@ struct VnPhysical {
   VkExtensionProperties *extensions;       /* what is offered */
   uint32_t extension_count;
   VkPhysicalDeviceDriverProperties host_driver;
+  uint8_t luid[VK_LUID_SIZE];   /* the kernel adapter's LUID (vn_adapter_luid): what Direct3D 12 and DXGI name the same GPU by */
+  bool luid_valid;
 };
 
 typedef struct VnQueue {
@@ -731,6 +733,35 @@ static bool vn_extension_allowed(const char *name) {
   return false;
 }
 
+/* The LUID of the kernel's adapter this device is (VkPhysicalDeviceIDProperties::deviceLUID): the host's LUID names a GPU of the host, which nothing in this system
+ * knows; the device is the virtio-gpu, which the kernel has as an accelerated adapter - the one DXGI and Direct3D 12 enumerate with this LUID. So a program's DXVK or
+ * vkd3d-proton finds the Vulkan device of a DXGI adapter by its LUID, as on Windows. The adapter: the first accelerated one of the virtio-gpu's PCI vendor (0x1AF4), else
+ * the first accelerated one, else the first. Without the kernel's adapters (the kernel's own Vulkan, VN_NO_PRESENT) the host's answer stands. */
+static void vn_adapter_luid(VnPhysical *pd) {
+  pd->luid_valid = false;
+#if !VN_NO_PRESENT
+  Instance kernel;
+  memset(&kernel, 0, sizeof kernel);
+  load_adapters(&kernel);
+  const PhysDev *pick = NULL;
+  for (int pass = 0; pass < 3 && !pick; ++pass)
+    for (uint32_t i = 0; i < kernel.npd && !pick; ++i) {
+      const Caps *c = &kernel.pd[i].caps;
+      if (pass == 0 ? (c->flags & CAP_ACCELERATED) && c->vendor_id == 0x1AF4u : pass == 1 ? (c->flags & CAP_ACCELERATED) != 0 : true) pick = &kernel.pd[i];
+    }
+  if (pick) {
+    memcpy(pd->luid, &pick->luid, VK_LUID_SIZE);
+    pd->luid_valid = true;
+  }
+  for (uint32_t i = 0; i < kernel.npd; ++i) {
+    uint8_t a[4];
+    put32(a, 0, kernel.pd[i].adapter);
+    kmt(TCOS_DXG_CLOSE_ADAPTER, a);
+  }
+  vk_free(kernel.pd);
+#endif
+}
+
 /* What a physical device offers: the host's extensions this backend can forward, and VK_KHR_swapchain (presentation is this driver's own). */
 static bool vn_physical_setup(VnPhysical *pd) {
   VkPhysicalDevice h = (VkPhysicalDevice)pd;
@@ -768,6 +799,7 @@ static bool vn_physical_setup(VnPhysical *pd) {
 #endif
   pd->extension_count = k;
   vk_free(host);
+  vn_adapter_luid(pd);
   return true;
 }
 
@@ -877,6 +909,16 @@ static void VKAPI_CALL vn_vkGetPhysicalDeviceProperties2(VkPhysicalDevice physic
     } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES) {
       VkPhysicalDeviceVulkan12Properties *d = (VkPhysicalDeviceVulkan12Properties *)s;
       vn_adjust_driver(pd, &d->driverID, d->driverName, d->driverInfo, &d->conformanceVersion);
+    } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES && pd->luid_valid) {      /* (vn_adapter_luid) */
+      VkPhysicalDeviceIDProperties *d = (VkPhysicalDeviceIDProperties *)s;
+      memcpy(d->deviceLUID, pd->luid, VK_LUID_SIZE);
+      d->deviceNodeMask = 1;
+      d->deviceLUIDValid = VK_TRUE;
+    } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES && pd->luid_valid) {
+      VkPhysicalDeviceVulkan11Properties *d = (VkPhysicalDeviceVulkan11Properties *)s;
+      memcpy(d->deviceLUID, pd->luid, VK_LUID_SIZE);
+      d->deviceNodeMask = 1;
+      d->deviceLUIDValid = VK_TRUE;
     }
   }
 }

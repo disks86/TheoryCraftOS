@@ -18,9 +18,20 @@
 
 /* d3d12.dll: the device (ID3D12Device) and the factory functions. Included by d3d12.c after the other parts. */
 
+/* The devices alive (Dev.next_live): the adapters' singletons a device factory may hand out again (agility.inc). */
+static SRWLOCK g_devices_lock = SRWLOCK_INIT;
+static Dev *g_devices;
+/* The Agility SDK version of the process (agility.inc sdk_version_of_process): 0 until it is first asked for. */
+static UINT g_sdk_version;
+static UINT sdk_version_of_process(void);
+
 /* The private fence handles and the like are in the other parts; the device is made here. */
 static void dev_destroy(DxObj *o) {
   Dev *d = (Dev *)o;
+  AcquireSRWLockExclusive(&g_devices_lock);
+  for (Dev **p = &g_devices; *p; p = &(*p)->next_live)
+    if (*p == d) { *p = d->next_live; break; }
+  ReleaseSRWLockExclusive(&g_devices_lock);
   mem_free(d->shared);      /* (empty: every pipeline has gone, and each gave its shaders back) */
   if (d->null_target) kmt_destroy_allocation(d->kdev, d->null_target);
   for (UINT i = 0; i < d->companion_count; ++i) kmt_destroy_allocation(d->kdev, d->companions[i].color);
@@ -51,6 +62,10 @@ static HRESULT STDMETHODCALLTYPE dev_CreateSharedHandle(Dev *This, ID3D12DeviceC
   if (handle) *handle = NULL;
   if (!object || !handle) return E_INVALIDARG;
   if (access != GENERIC_ALL) return E_INVALIDARG;      /* (the one value Direct3D 12 takes) */
+  /* (a proxy's wrapper of one of this library's objects is seen through; a foreign object is no object of this device: tcos_object.h) */
+  static const void *const kinds[] = {&res_vtbl, &heap_vtbl, &fence_vtbl};
+  object = (ID3D12DeviceChild *)tcos_own_any(object, kinds, 3);
+  if (!object) return E_INVALIDARG;
   const void *vtbl = ((IUnknown *)object)->lpVtbl;
   UINT shared = 0;
   if (vtbl == &res_vtbl) shared = ((Resource *)object)->kresource;
@@ -702,8 +717,11 @@ static Dev *dev_create(LUID luid, NTSTATUS *status_out) {
   dx_init(OBJ(d), &dev_vtbl, g_device_iids, dev_destroy);
   {
     extern const ID3D12VideoDevice4Vtbl vdev_vtbl;
+    extern const ID3D12DeviceConfigurationVtbl devconfig_vtbl;
     d->video.lpVtbl = &vdev_vtbl;
+    d->config.lpVtbl = &devconfig_vtbl;
   }
+  d->sdk_version = sdk_version_of_process();
   d->luid = luid;
   NTSTATUS st = kmt_open_adapter(luid, &d->adapter);
   if (KMT_OK(st)) st = kmt_create_device(d->adapter, &d->kdev);
@@ -715,6 +733,10 @@ static Dev *dev_create(LUID luid, NTSTATUS *status_out) {
     dx_Release(OBJ(d));
     return NULL;
   }
+  AcquireSRWLockExclusive(&g_devices_lock);
+  d->next_live = g_devices;
+  g_devices = d;
+  ReleaseSRWLockExclusive(&g_devices_lock);
   *status_out = st;
   return d;
 }

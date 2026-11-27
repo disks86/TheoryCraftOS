@@ -26,6 +26,7 @@
 #include <windows.h>
 #include <winternl.h>
 #include <unknwn.h>
+#include "tcos_object.h"
 
 #define EXPORT __declspec(dllexport)
 
@@ -835,7 +836,7 @@ static void dx_init(DxObj *o, const void *vtbl, const GUID *const *iids, void (*
 static HRESULT STDMETHODCALLTYPE dx_QueryInterface(DxObj *o, REFIID riid, void **out) {
   if (!out) return E_POINTER;
   *out = NULL;
-  if (guid_eq(riid, &IID_IUnknown)) goto found;
+  if (guid_eq(riid, &IID_IUnknown) || guid_eq(riid, &IID_ITcosObject)) goto found;      /* (IID_ITcosObject: the object itself, tcos_object.h) */
   for (const GUID *const *i = o->iids; i && *i; ++i)
     if (guid_eq(riid, *i)) goto found;
   dx_no_interface("(an object)", riid);

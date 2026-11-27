@@ -1199,12 +1199,17 @@ static void test_bump_and_depth_locks(void) {
   if (bump) IDirect3DTexture9_Release(bump);
   if (x8) IDirect3DTexture9_Release(x8);
   if (colours) IDirect3DTexture9_Release(colours);
-  /* depth buffers: D24S8 locks only when made with TCOS_USAGE_LOCKABLE_DEPTH, depth in the low 24 bits and stencil above; what was written comes back */
+  /* depth buffers: D24S8 locks only when made with TCOS_USAGE_LOCKABLE_DEPTH (d3d9.dll's private TcosD3D9CreateLockableDepthStencil, ddraw.dll's), depth in the low 24 bits
+   * and stencil above; what was written comes back */
   IDirect3DSurface9 *plain = NULL, *lockable = NULL, *d16 = NULL;
-  IDirect3DDevice9Ex *ex = (IDirect3DDevice9Ex *)g_device;
+  typedef HRESULT(WINAPI * LockableDepth)(IDirect3DDevice9 *, UINT, UINT, D3DFORMAT, D3DMULTISAMPLE_TYPE, DWORD, BOOL, IDirect3DSurface9 **);
+  LockableDepth make_lockable = (LockableDepth)(void *)GetProcAddress(GetModuleHandleA("d3d9.dll"), "TcosD3D9CreateLockableDepthStencil");
   IDirect3DDevice9_CreateDepthStencilSurface(g_device, 8, 8, D3DFMT_D24S8, D3DMULTISAMPLE_NONE, 0, FALSE, &plain, NULL);
-  ex->lpVtbl->CreateDepthStencilSurfaceEx(ex, SIZE, SIZE, D3DFMT_D24S8, D3DMULTISAMPLE_NONE, 0, FALSE, &lockable, NULL, 0x40000000u);
-  ex->lpVtbl->CreateDepthStencilSurfaceEx(ex, 8, 8, D3DFMT_D16, D3DMULTISAMPLE_NONE, 0, FALSE, &d16, NULL, 0x40000000u);
+  check(make_lockable != NULL, "d3d9.dll's lockable depth buffers");
+  if (make_lockable) {
+    make_lockable(g_device, SIZE, SIZE, D3DFMT_D24S8, D3DMULTISAMPLE_NONE, 0, FALSE, &lockable);
+    make_lockable(g_device, 8, 8, D3DFMT_D16, D3DMULTISAMPLE_NONE, 0, FALSE, &d16);
+  }
   check(plain && IDirect3DSurface9_LockRect(plain, &locked, NULL, 0) == D3DERR_INVALIDCALL, "a D24S8 depth buffer cannot be locked");
   DWORD back24 = 0;
   WORD back16 = 0;

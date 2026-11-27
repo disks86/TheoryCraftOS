@@ -186,13 +186,19 @@ static HRESULT STDMETHODCALLTYPE dev_CreateOffscreenPlainSurfaceEx(Dev *d, UINT 
   if ((usage & ~(DWORD)EX_SURFACE_USAGES) || pool == D3DPOOL_MANAGED || pool == D3DPOOL_SCRATCH || format_is_depth(format)) return D3DERR_INVALIDCALL;
   return surface_create(d, width, height, usage, format, pool, shared && pool == D3DPOOL_DEFAULT ? 0 : TEX_MEMORY, D3DMULTISAMPLE_NONE, 0, shared, out);
 }
-static HRESULT STDMETHODCALLTYPE dev_CreateDepthStencilSurfaceEx(Dev *d, UINT width, UINT height, D3DFORMAT format, D3DMULTISAMPLE_TYPE samples, DWORD quality, BOOL discard,
-                                                                 IDirect3DSurface9 **out, HANDLE *shared, DWORD usage) {
-  (void)discard;
+/* (TCOS_USAGE_LOCKABLE_DEPTH: only from TcosD3D9CreateLockableDepthStencil, device.inc) */
+static HRESULT depth_surface_ex(Dev *d, UINT width, UINT height, D3DFORMAT format, D3DMULTISAMPLE_TYPE samples, DWORD quality, IDirect3DSurface9 **out, HANDLE *shared,
+                                DWORD usage) {
   /* (a call refused for its arguments leaves *out as it was, as Windows does) */
   if (!format_is_depth(format) || (usage & ~(DWORD)(EX_SURFACE_USAGES | TCOS_USAGE_LOCKABLE_DEPTH))) return D3DERR_INVALIDCALL;
   const BOOL lockable = (usage & TCOS_USAGE_LOCKABLE_DEPTH) != 0;
   if (lockable && (format == D3DFMT_D24FS8 || samples != D3DMULTISAMPLE_NONE)) return D3DERR_INVALIDCALL;      /* (tex_depth_copy: no float-24 depth, no samples) */
   return surface_create(d, width, height, D3DUSAGE_DEPTHSTENCIL | (usage & ~(DWORD)TCOS_USAGE_LOCKABLE_DEPTH), format, D3DPOOL_DEFAULT, lockable ? TEX_LOCKABLE : 0, samples,
                         quality, shared, out);
+}
+static HRESULT STDMETHODCALLTYPE dev_CreateDepthStencilSurfaceEx(Dev *d, UINT width, UINT height, D3DFORMAT format, D3DMULTISAMPLE_TYPE samples, DWORD quality, BOOL discard,
+                                                                 IDirect3DSurface9 **out, HANDLE *shared, DWORD usage) {
+  (void)discard;
+  if (usage & ~(DWORD)EX_SURFACE_USAGES) return D3DERR_INVALIDCALL;      /* (a usage Windows does not have - this library's own included) */
+  return depth_surface_ex(d, width, height, format, samples, quality, out, shared, usage);
 }

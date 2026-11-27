@@ -78,6 +78,11 @@ What the backend does:
   signals the program's semaphore or fence with an empty submission. Present copies the image on the host into a buffer the guest maps (waiting for the program's
   semaphores), then the guest copies it into the Direct3D swapchain's image and presents that. So every surface kind works (Win32, Wayland, X11, headless) with one
   copy of each frame through guest memory.
+* **The device's LUID.** `VkPhysicalDeviceIDProperties` / `VkPhysicalDeviceVulkan11Properties` report `deviceLUID` = the LUID of the kernel's adapter the device is (the
+  virtio-gpu: the first accelerated adapter of PCI vendor 0x1AF4, else the first accelerated one, else the first; `vn_adapter_luid`), `deviceLUIDValid` and node mask 1 - not the
+  host's, which names a GPU nothing in the guest knows. DXGI's adapters and Direct3D 12's devices have the same LUID, so a program's bundled DXVK or vkd3d-proton (its own dxgi.dll
+  over Vulkan, or this system's dxgi.dll) matches a DXGI adapter to its Vulkan device as on Windows. The Direct3D backend is Vulkan 1.0 without
+  `VK_KHR_get_physical_device_properties2`, so it has no `deviceLUID` to report; the kernel's own Vulkan (`VN_NO_PRESENT`) keeps the host's.
 
 ## The kernel's 3D device on Venus
 

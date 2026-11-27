@@ -24,8 +24,7 @@
  * are Direct3D 12 copies, and copies to and from memory go through the CPU. */
 
 static Surface *surface_of(IDirect3DSurface9 *surface) {
-  if (!surface || ((DxObj *)surface)->lpVtbl != (const void *)&surf_vtbl) return NULL;
-  return (Surface *)surface;
+  return (Surface *)tcos_own(surface, &surf_vtbl);      /* (this library's, or a proxy's wrapper of one: tcos_object.h) */
 }
 
 /* ---- the device's own draws ------------------------------------------------------------------------------------------------------------------------- */

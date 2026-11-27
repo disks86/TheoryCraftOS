@@ -228,8 +228,8 @@ static void measure_draw(Dev *d) {
 
 static Query *query_of(ID3D11Asynchronous *a) {
   extern const ID3D11PredicateVtbl pred_vtbl;
-  if (!a || (((DxObj *)a)->lpVtbl != (const void *)&query_vtbl && ((DxObj *)a)->lpVtbl != (const void *)&pred_vtbl)) return NULL;      /* (this library makes no counters) */
-  return (Query *)a;
+  static const void *const kinds[] = {&query_vtbl, &pred_vtbl};
+  return (Query *)tcos_own_any(a, kinds, 2);      /* (this library makes no counters; tcos_object.h) */
 }
 static void query_deactivate(Dev *d, Query *q) {
   for (UINT i = 0; i < d->active_count; ++i)

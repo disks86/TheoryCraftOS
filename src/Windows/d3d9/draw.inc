@@ -428,7 +428,8 @@ static ID3D12PipelineState *pipeline_get(Dev *d, const Shader *vs, const Shader 
   pd.PrimitiveTopologyType = (D3D12_PRIMITIVE_TOPOLOGY_TYPE)key.topology;
   pd.SampleDesc.Count = 1;
   ID3D12PipelineState *state = NULL;
-  TcosD3D12PipelineOptions(d->d12, vs ? vs->registers : VERTEX_REGISTERS, 0);      /* (the pixel shader's constants come after the vertex shader's) */
+  /* (the pixel shader's constants come after the vertex shader's. d->d12 is the device this library made with d3d12.dll: a failure is no pipeline) */
+  if (FAILED(TcosD3D12PipelineOptions(d->d12, vs ? vs->registers : VERTEX_REGISTERS, 0))) return NULL;
   if (FAILED(ID3D12Device_CreateGraphicsPipelineState(d->d12, &pd, &IID_ID3D12PipelineState, (void **)&state)) || !state) {
     /* (the system has only so many shaders at a time: without the pipelines that are kept there may be room) */
     if (!d->pipeline_count) return NULL;
@@ -437,7 +438,7 @@ static ID3D12PipelineState *pipeline_get(Dev *d, const Shader *vs, const Shader 
     d->pipeline_count = 0;
     oldest = &d->pipelines[0];
     state = NULL;
-    TcosD3D12PipelineOptions(d->d12, vs ? vs->registers : VERTEX_REGISTERS, 0);
+    if (FAILED(TcosD3D12PipelineOptions(d->d12, vs ? vs->registers : VERTEX_REGISTERS, 0))) return NULL;
     if (FAILED(ID3D12Device_CreateGraphicsPipelineState(d->d12, &pd, &IID_ID3D12PipelineState, (void **)&state)) || !state) return NULL;
   }
   const BOOL full = d->pipeline_count >= PIPELINES;

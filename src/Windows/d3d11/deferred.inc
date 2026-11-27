@@ -328,7 +328,7 @@ static void commands_run(Ctx *c, const Command *commands, UINT count) {
 
 static CmdList *cmdlist_of(ID3D11CommandList *l) {
   extern const ID3D11CommandListVtbl cmdlist_vtbl;
-  return l && ((DxObj *)l)->lpVtbl == (const void *)&cmdlist_vtbl ? (CmdList *)l : NULL;
+  return (CmdList *)tcos_own(l, &cmdlist_vtbl);      /* (tcos_object.h) */
 }
 static void STDMETHODCALLTYPE ctx_ExecuteCommandList(Ctx *c, ID3D11CommandList *list, BOOL restore) {
   CmdList *l = cmdlist_of(list);

@@ -38,7 +38,15 @@ static HRESULT STDMETHODCALLTYPE on12_CreateWrappedResource(ID3D11On12Device1 *p
   if (out) *out = NULL;
   if (!resource12 || !flags || !out) return E_INVALIDARG;
   ID3D12Resource *res = NULL;
-  if (FAILED(IUnknown_QueryInterface(resource12, &IID_ID3D12Resource, (void **)&res)) || !res) return E_INVALIDARG;
+  /* (d3d12.dll's resource - seen through a proxy's wrapper - of this device's Direct3D 12 device: another runtime's resource, or one of another device, is
+   * E_INVALIDARG) */
+  if (FAILED(TcosD3D12Object(resource12, &IID_ID3D12Resource, (void **)&res)) || !res) return E_INVALIDARG;
+  {
+    ID3D12Device *of_res = NULL;
+    const BOOL same = SUCCEEDED(ID3D12Resource_GetDevice(res, &IID_ID3D12Device, (void **)&of_res)) && of_res == d->d12;
+    if (of_res) ID3D12Device_Release(of_res);
+    if (!same) { ID3D12Resource_Release(res); return E_INVALIDARG; }
+  }
   const D3D12_RESOURCE_DESC rd = ID3D12Resource_GetDesc(res);
   D3D12_HEAP_PROPERTIES heap;
   D3D12_HEAP_FLAGS heap_flags;
@@ -224,8 +232,16 @@ EXPORT HRESULT WINAPI D3D11On12CreateDevice(IUnknown *device12, UINT flags, cons
   if (flags & D3D11_CREATE_DEVICE_DEBUG) return DXGI_ERROR_SDK_COMPONENT_MISSING;
   ID3D12Device *d12 = NULL;
   ID3D12CommandQueue *queue = NULL;
-  if (FAILED(IUnknown_QueryInterface(device12, &IID_ID3D12Device, (void **)&d12)) || !d12) return E_INVALIDARG;
-  if (!queues[0] || FAILED(IUnknown_QueryInterface(queues[0], &IID_ID3D12CommandQueue, (void **)&queue)) || !queue) { ID3D12Device_Release(d12); return E_INVALIDARG; }
+  /* (the device and queue d3d12.dll made: a proxy's wrappers of them - ReShade's - are seen through, so that every call this device makes below goes to d3d12.dll's
+   * objects, whose private calls it uses; another runtime's Direct3D 12 device is no device this one can be made on: E_INVALIDARG, as for an object that is no device) */
+  if (FAILED(TcosD3D12Object(device12, &IID_ID3D12Device, (void **)&d12)) || !d12) return E_INVALIDARG;
+  if (!queues[0] || FAILED(TcosD3D12Object(queues[0], &IID_ID3D12CommandQueue, (void **)&queue)) || !queue) { ID3D12Device_Release(d12); return E_INVALIDARG; }
+  {
+    ID3D12Device *of_queue = NULL;      /* (the queue must be the device's) */
+    const BOOL same = SUCCEEDED(ID3D12CommandQueue_GetDevice(queue, &IID_ID3D12Device, (void **)&of_queue)) && of_queue == d12;
+    if (of_queue) ID3D12Device_Release(of_queue);
+    if (!same) { ID3D12CommandQueue_Release(queue); ID3D12Device_Release(d12); return E_INVALIDARG; }
+  }
   /* (no levels: the Direct3D 12 device's own - the highest it has) */
   D3D_FEATURE_LEVEL own = D3D_FEATURE_LEVEL_11_0;
   if (!levels || !level_count) {

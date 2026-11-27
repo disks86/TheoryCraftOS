@@ -118,7 +118,8 @@ static HRESULT shader_link(Shader *s, ID3D11ClassLinkage *linkage) {
   if (!link) return E_OUTOFMEMORY;
   const int r = dl_read_interfaces(s->code, s->bytes, &link->info);
   if (r != DL_OK) { mem_free(link); return E_INVALIDARG; }
-  if (linkage && ((DxObj *)linkage)->lpVtbl == (const void *)&link_vtbl && link->info.instance_count) linkage_add((Linkage *)linkage, &link->info);
+  Linkage *own_linkage = (Linkage *)tcos_own(linkage, &link_vtbl);      /* (tcos_object.h) */
+  if (own_linkage && link->info.instance_count) linkage_add(own_linkage, &link->info);
   if (!link->info.slot_count) { mem_free(link); return S_OK; }
   s->link = link;
   return S_OK;

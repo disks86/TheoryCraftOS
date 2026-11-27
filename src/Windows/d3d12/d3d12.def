@@ -31,3 +31,4 @@ TcosD3D12OpenShared
 TcosD3D12BeginQueryKind
 TcosD3D12DeviceFeatures
 TcosD3D12DeviceFeatures3
+TcosD3D12Object

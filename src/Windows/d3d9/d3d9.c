@@ -103,11 +103,13 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 #define SAMPLER_STATES 14u             /* D3DSAMP_ADDRESSU (1) .. D3DSAMP_DMAPOFFSET (13) */
 #define STAGE_STATES 34u               /* D3DTSS_COLOROP (1) .. D3DTSS_CONSTANT (32), and TCOS_TSS_KEY_KILL */
 /* A stage state of this d3d9.dll's own, for ddraw.dll's Direct3D: a texel of alpha 0 of the stage's texture takes the pixel away in the fixed-function
- * pixel stage (a colour-keyed texture: ddraw.dll gives keyed texels alpha 0 and the others at least 1), whatever the stage then does with the alpha. */
+ * pixel stage (a colour-keyed texture: ddraw.dll gives keyed texels alpha 0 and the others at least 1), whatever the stage then does with the alpha.
+ * Set only through the private export TcosD3D9SetStageKeyKill (device.inc): IDirect3DDevice9::SetTextureStageState ignores type 33 as Windows ignores a type it
+ * does not have, so a program never reaches it. */
 #define TCOS_TSS_KEY_KILL 33u
-/* A usage of this d3d9.dll's own, for ddraw.dll's Direct3D (IDirect3DDevice9Ex::CreateDepthStencilSurfaceEx, on any device): a depth buffer the program
- * may lock whatever its format (DirectDraw's depth buffers are memory a program locks; Direct3D 9 locks only the D*_LOCKABLE formats). The layouts of
- * the formats are in tex_depth_copy. */
+/* A usage of this d3d9.dll's own, for ddraw.dll's Direct3D: a depth buffer the program may lock whatever its format (DirectDraw's depth buffers are memory a
+ * program locks; Direct3D 9 locks only the D*_LOCKABLE formats). The layouts of the formats are in tex_depth_copy. Only the private export
+ * TcosD3D9CreateLockableDepthStencil takes it: IDirect3DDevice9Ex::CreateDepthStencilSurfaceEx refuses it as Windows refuses a usage it does not have. */
 #define TCOS_USAGE_LOCKABLE_DEPTH 0x40000000u
 #define MAX_LEVELS 13u                 /* of a texture of 4096 pixels */
 #define MAX_SUBS (MAX_LEVELS * 6u)     /* the subresources of a texture: face * levels + level */
@@ -493,7 +495,7 @@ static ULONG STDMETHODCALLTYPE child_Release(Child *c) {
 static HRESULT STDMETHODCALLTYPE child_QueryInterface(Child *c, REFIID riid, void **out) {
   if (!out) return E_POINTER;
   *out = NULL;
-  int found = guid_eq(riid, &IID_IUnknown);
+  int found = guid_eq(riid, &IID_IUnknown) || guid_eq(riid, &IID_ITcosObject);      /* (tcos_object.h: the object itself) */
   for (const GUID *const *i = c->o.iids; !found && i && *i; ++i) found = guid_eq(riid, *i);
   if (!found) return E_NOINTERFACE;
   child_AddRef(c);

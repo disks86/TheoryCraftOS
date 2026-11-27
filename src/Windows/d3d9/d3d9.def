@@ -17,3 +17,5 @@ DebugSetMute @35
 Direct3D9EnableMaximizedWindowedModeShim @36
 Direct3DCreate9 @37
 Direct3DCreate9Ex @38
+TcosD3D9CreateLockableDepthStencil
+TcosD3D9SetStageKeyKill

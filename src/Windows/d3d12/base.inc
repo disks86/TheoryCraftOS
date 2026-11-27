@@ -351,6 +351,10 @@ struct Dev {
   struct ShaderCache *caches;      /* the shader cache sessions open (library.inc), for ShaderCacheControl */
   SRWLOCK cache_lock;
   ID3D12VideoDevice4 video;        /* the same object as ID3D12VideoDevice .. 4 (video.inc) */
+  ID3D12DeviceConfiguration config;  /* ... and as ID3D12DeviceConfiguration (agility.inc) */
+  UINT sdk_version;                /* the Agility SDK version it was made for (agility.inc) */
+  BOOL singleton;                  /* the adapter's singleton device: what a device factory may hand out again (agility.inc) */
+  struct Dev *next_live;           /* the devices alive (agility.inc g_devices) */
 };
 #define DEV_FEATURE_STREAM_OUTPUT (1u << 21)      /* graphics::kFeatureStreamOutput in KmtCaps.features */
 #define DEV_FEATURE_COMPUTE (1u << 10)            /* graphics::kFeatureCompute: storage buffers (KA_UAV), which shader resource views of buffers are too */
