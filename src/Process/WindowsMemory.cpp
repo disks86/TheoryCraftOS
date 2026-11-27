@@ -140,7 +140,7 @@ uint32_t vm_allocate(Process& target, uint64_t* base_io, uint64_t* size_io, uint
     return kStatusSuccess;
   }
   constexpr uint32_t kMemWriteWatch = 0x200000;      // (kernel32 remembers which regions were asked to be watched: the pages are reported as written)
-  if (!(type & (kMemCommit | kMemReserve)) || (type & ~uint32_t{kMemCommit | kMemReserve | kMemWriteWatch | 0x100000 /*MEM_TOP_DOWN: the search direction is ours to choose*/})) return kStatusInvalidParameter;
+  if (!(type & (kMemCommit | kMemReserve)) || (type & ~uint32_t{kMemCommit | kMemReserve | kMemWriteWatch | 0x100000 /*MEM_TOP_DOWN: from the top down (a 32-bit program's; a 64-bit one's is ours to choose)*/})) return kStatusInvalidParameter;
   if ((type & kMemWriteWatch) && !(type & kMemReserve)) return kStatusInvalidParameter;      // MEM_WRITE_WATCH goes with MEM_RESERVE
   if (!page_protection(protect, &prot)) return kStatusInvalidPageProtection;
   if (!space) return kStatusNoMemory;
@@ -173,16 +173,22 @@ uint32_t vm_allocate(Process& target, uint64_t* base_io, uint64_t* size_io, uint
     }
   } else {
     uint64_t at = 0;
-    const uint64_t hint = (target.mmap_cursor() + kAllocationGranularity - 1) & ~(kAllocationGranularity - 1);
-    for (uint64_t probe = hint, attempt = 0;; ++attempt) {      // reservations begin on the allocation granularity: a free place that starts on it
-      if (attempt >= 256 || !space->find_free(rounded, probe, &at)) return kStatusNoMemory;
-      const uint64_t aligned = (at + kAllocationGranularity - 1) & ~(kAllocationGranularity - 1);
-      if (aligned == at) break;
-      probe = aligned;
+    if (space->is_32bit()) {
+      // A 32-bit program: the lowest free place, or with MEM_TOP_DOWN the highest, as Windows chooses - a cursor that only moves up leaves the holes that frees make
+      // behind it, and a long-running program walks to the top of its 2 GiB and fails while most of them are free.
+      if (!space->find_free_windows32(rounded, (type & 0x100000) != 0, &at)) return kStatusNoMemory;
+    } else {
+      const uint64_t hint = (target.mmap_cursor() + kAllocationGranularity - 1) & ~(kAllocationGranularity - 1);
+      for (uint64_t probe = hint, attempt = 0;; ++attempt) {      // reservations begin on the allocation granularity: a free place that starts on it
+        if (attempt >= 256 || !space->find_free(rounded, probe, &at)) return kStatusNoMemory;
+        const uint64_t aligned = (at + kAllocationGranularity - 1) & ~(kAllocationGranularity - 1);
+        if (aligned == at) break;
+        probe = aligned;
+      }
     }
     if (!space->map(at, rounded, prot)) return kStatusNoMemory;
     set_private_attributes(*space, at, rounded, protect, type);
-    target.set_mmap_cursor(at + rounded);
+    if (!space->is_32bit()) target.set_mmap_cursor(at + rounded);
     base = at;
   }
   *base_io = base;

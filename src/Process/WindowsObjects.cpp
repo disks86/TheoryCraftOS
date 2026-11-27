@@ -1477,11 +1477,15 @@ uint32_t map_image_view(Process& p, const SyscallRequest& r, uint32_t section_id
     chosen = pe.image_base();
     if (chosen == 0 || chosen % 65536 != 0 || chosen >= AddressSpace::kUserTop || !space->find_free(rounded, chosen, &chosen) || chosen != pe.image_base()) {
       uint64_t hint = 0x00007FF500000000ull, at = 0;
-      for (uint32_t attempt = 0; attempt < 64; ++attempt) {      // a place that is free and on a 64 KiB boundary
-        if (!space->find_free(rounded, hint, &at)) return kNoResources;
-        const uint64_t aligned = (at + 0xFFFF) & ~uint64_t{0xFFFF};
-        if (aligned == at) break;
-        hint = aligned;
+      if (space->is_32bit()) {      // (a 32-bit program's moved image from the top down, as Windows places them: the middle of its 2 GiB stays free)
+        if (!space->find_free_windows32(rounded, true, &at)) return kNoResources;
+      } else {
+        for (uint32_t attempt = 0; attempt < 64; ++attempt) {      // a place that is free and on a 64 KiB boundary
+          if (!space->find_free(rounded, hint, &at)) return kNoResources;
+          const uint64_t aligned = (at + 0xFFFF) & ~uint64_t{0xFFFF};
+          if (aligned == at) break;
+          hint = aligned;
+        }
       }
       if (at % 65536 != 0) return kNoResources;
       chosen = at;
@@ -1598,11 +1602,15 @@ uint32_t map_view_in(Process& target, uint32_t id, uint64_t offset, uint64_t* ba
   if (!AddressSpace::round_up(view, &bytes)) return kInvalidParameter;
   if (base == 0) {      // views begin on the allocation granularity (64 KiB), as on Windows: programs round a view's address down to it to unmap the view
     uint64_t hint = 0x00007FF500000000ull;
-    for (uint32_t attempt = 0;; ++attempt) {
-      if (attempt >= 256 || !space->find_free(bytes, hint, &base)) return kNoResources;
-      const uint64_t aligned = (base + 0xFFFF) & ~uint64_t{0xFFFF};
-      if (aligned == base) break;
-      hint = aligned;
+    if (space->is_32bit()) {      // (a 32-bit program's view at the lowest free place, as Windows maps them)
+      if (!space->find_free_windows32(bytes, false, &base)) return kNoResources;
+    } else {
+      for (uint32_t attempt = 0;; ++attempt) {
+        if (attempt >= 256 || !space->find_free(bytes, hint, &base)) return kNoResources;
+        const uint64_t aligned = (base + 0xFFFF) & ~uint64_t{0xFFFF};
+        if (aligned == base) break;
+        hint = aligned;
+      }
     }
   } else if (base % 4096 != 0) {
     return kInvalidParameter;

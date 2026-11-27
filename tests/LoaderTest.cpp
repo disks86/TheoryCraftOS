@@ -112,7 +112,27 @@ static void test_address_space() {
     CHECK(low.find_free(0x10000, 0x00007FF000000000ull, &where) && where == AddressSpace::kLowHint32);
     CHECK(low.map(where, 0x10000, kProtRead | kProtWrite));
     CHECK(low.find_free(0x10000, 0x00007FF800000000ull, &where) && where == AddressSpace::kLowHint32 + 0x10000);
-    CHECK(low.find_free(0x1000, 0x7FFE0000, &where) && where == 0x7FFE1000 && low.find_free(0xF000, 0x7FFE0000, &where) && !low.find_free(0x10000, 0x7FFE0000, &where));
+    CHECK(low.find_free(0x1000, 0x7FFE0000, &where) && where == 0x7FFE1000 && low.find_free(0xF000, 0x7FFE0000, &where));
+    CHECK(low.find_free(0x10000, 0x7FFE0000, &where) && where == 0x1000);      // (no room above the hint: the search starts again at the bottom)
+    // Windows' places in a 32-bit program: the lowest 64 KiB-aligned one at or above 64 KiB, or the highest; reserved ranges are kept away from.
+    CHECK(low.find_free_windows32(0x1000, false, &where) && where == 0x10000);
+    CHECK(low.find_free_windows32(0x3F0001, false, &where) && where == 0x410000);      // (does not fit below the image at 0x400000)
+    CHECK(low.find_free_windows32(0x1000, true, &where) && where == 0x7FFD0000);      // (the highest aligned start whose page ends below 0x7FFE0000)
+    CHECK(low.find_free_windows32(0x20000, true, &where) && where == 0x7FFC0000);
+    CHECK(low.find_free_in(0x1000, 0x500000, 0x600000, 0x10000, false, &where) && where == 0x500000);
+    CHECK(low.find_free_in(0x1000, 0x500000, 0x600000, 0x10000, true, &where) && where == 0x5F0000);
+    CHECK(!low.find_free_in(0x1000, 0x400000, 0x402000, 0x10000, false, &where));      // (all of it the image)
+    CHECK(!low.find_free_in(0x1000, 0x10000, 0x20000, 0x3000, false, &where));          // (not a power of two)
+    CHECK(!low.find_free_windows32(0x80000000ull, false, &where));
+    {
+      static const AddressRange kHoles[] = {{0x10000, 0x30000}, {0x7FF00000, 0x10000}};
+      low.set_reserved(ArrayView<const AddressRange>(kHoles, 2));
+      CHECK(low.find_free_windows32(0x1000, false, &where) && where == 0x40000);
+      CHECK(low.find_free_windows32(0x1000, true, &where) && where == 0x7FFD0000);
+      CHECK(low.find_free_in(0x1000, 0x7FF00000, 0x7FF20000, 0x10000, true, &where) && where == 0x7FF10000);
+      CHECK(low.find_free_in(0x20000, 0x7FEF0000, 0x7FF20000, 0x10000, true, &where) == false);
+      low.set_reserved(ArrayView<const AddressRange>());
+    }
     CHECK(!low.find_free(0x80000000ull, 0, &where));
     CHECK(low.resize(AddressSpace::kLowHint32, 0x20000) && !low.resize(0x7FFE0000, 0x20000));
     uint8_t byte = 7;

@@ -111,7 +111,7 @@ uint32_t map(Process& p, graphics::virtgpu::Session& session, uint64_t offset, u
   graphics::virtgpu::BufferRef buffer = session.buffer_at(offset, rounded);
   if (!buffer) return kInvalidParameter;
   uint64_t at = 0;
-  if (!space->find_free(rounded, p.mmap_cursor(), &at)) return kNoMemory;
+  if (space->is_32bit() ? !space->find_free_windows32(rounded, false, &at) : !space->find_free(rounded, p.mmap_cursor(), &at)) return kNoMemory;
   if (!space->map_shared(at, rounded, kProtRead | kProtWrite, buffer->storage(), buffer.get(), buffer->cpu_cache())) return kConflictingAddresses;
   *address = at;
   return kSuccess;

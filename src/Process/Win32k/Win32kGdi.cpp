@@ -310,7 +310,7 @@ bool allocate_dib_memory(Process& process, Bitmap& b, uint64_t bytes) {
     if (!st->dib_memory->allocate(process, bytes, &address)) return false;
   } else if (AddressSpace* space = process.address_space()) {
     uint64_t rounded = 0;
-    if (!AddressSpace::round_up(bytes, &rounded) || !space->find_free(rounded, 0x20000000ull, &address) || !space->map(address, rounded, kProtRead | kProtWrite)) return false;
+    if (!AddressSpace::round_up(bytes, &rounded) || (space->is_32bit() ? !space->find_free_windows32(rounded, false, &address) : !space->find_free(rounded, 0x20000000ull, &address)) || !space->map(address, rounded, kProtRead | kProtWrite)) return false;
   } else {
     return false;
   }

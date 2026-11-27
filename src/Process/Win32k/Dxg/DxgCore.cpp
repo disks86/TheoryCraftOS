@@ -399,7 +399,8 @@ bool map_user_region(Call& call, uint64_t size, uint64_t* base) {
   uint64_t rounded = 0;
   if (!space || size == 0 || !AddressSpace::round_up(size, &rounded)) return false;
   uint64_t at = 0;
-  if (!space->find_free(rounded, call.process().mmap_cursor(), &at)) return false;
+  // (a 32-bit program's at the lowest free place, as its own allocations: see vm_alloc)
+  if (space->is_32bit() ? !space->find_free_windows32(rounded, false, &at) : !space->find_free(rounded, call.process().mmap_cursor(), &at)) return false;
   if (!space->map(at, rounded, kProtRead | kProtWrite)) return false;
   *base = at;
   return true;

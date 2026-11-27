@@ -119,7 +119,15 @@ class AddressSpace final : public IUserMemory {
   bool unmap(uint64_t address, uint64_t size);
   // The lowest page-aligned address at or above `hint` where `size` bytes fit between regions and below the top. A hint at or above a lowered top
   // counts as kLowHint32.
+  // (When nothing fits between the hint and the top, the search starts again from the bottom: a hole below the hint is better than no room.)
   bool find_free(uint64_t size, uint64_t hint, uint64_t* out) const;
+  // A free place for `size` bytes (rounded up to pages) that starts on a multiple of `alignment` (a power of two, at least a page) inside [low, high) and below the top:
+  // the lowest one, or with `top_down` the highest. Keeps away from the reserved ranges.
+  bool find_free_in(uint64_t size, uint64_t low, uint64_t high, uint64_t alignment, bool top_down, uint64_t* out) const;
+  // Where Windows puts memory it chooses the place of in a 32-bit program, which runs out of addresses long before memory: allocations and views from the bottom
+  // up (the lowest 64 KiB-aligned place at or above 64 KiB), MEM_TOP_DOWN ones and moved images from the top down, so the middle stays one large free range.
+  bool find_free_windows32(uint64_t size, bool top_down, uint64_t* out) const { return find_free_in(size, kWindowsLowest, top_, kWindowsGranularity, top_down, out); }
+  static constexpr uint64_t kWindowsLowest = 0x10000, kWindowsGranularity = 0x10000;
   // Changes the permissions of a range, cutting regions at its ends. Every page of the range must be mapped, or nothing changes.
   bool protect(uint64_t address, uint64_t size, uint8_t protection);
   // Makes the region that starts at `base` exactly `size` bytes (rounded up to pages) long: new pages are zero, a size of 0 removes it. Fails if the pages

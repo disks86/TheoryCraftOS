@@ -503,8 +503,14 @@ bool AddressSpace::find_free(uint64_t size, uint64_t hint, uint64_t* out) const 
   uint64_t candidate = round_down(hint);
   if (candidate >= top_ && top_ < kUserTop) candidate = kLowHint32;      // (a place asked for where a 64-bit program has room: anywhere, then)
   if (candidate < kPageSize) candidate = kPageSize;      // never hand out page zero
+  bool wrapped = candidate == kPageSize;
   for (;;) {
-    if (candidate > top_ - rounded) return false;
+    if (candidate > top_ - rounded) {
+      if (wrapped) return false;
+      wrapped = true;      // (nothing above the hint: the holes below it)
+      candidate = kPageSize;
+      continue;
+    }
     uint64_t after = 0;
     const uint64_t i = first_ending_after(candidate);
     if (i < regions_.count() && regions_[i]->base < candidate + rounded) {
@@ -516,6 +522,74 @@ bool AddressSpace::find_free(uint64_t size, uint64_t hint, uint64_t* out) const 
       return true;
     }
   }
+}
+
+bool AddressSpace::find_free_in(uint64_t size, uint64_t low, uint64_t high, uint64_t alignment, bool top_down, uint64_t* out) const {
+  uint64_t rounded = 0;
+  if (size == 0 || alignment < kPageSize || (alignment & (alignment - 1)) != 0 || !round_up(size, &rounded)) return false;
+  if (high > top_) high = top_;
+  if (low < kPageSize) low = kPageSize;      // never hand out page zero
+  if (low >= high || rounded > high - low) return false;
+  const auto align_up = [alignment](uint64_t v, uint64_t* r) {
+    if (v > ~uint64_t{0} - (alignment - 1)) return false;
+    *r = (v + alignment - 1) & ~(alignment - 1);
+    return true;
+  };
+  // A free range [start, end) of the gaps between the regions, clipped to [low, high): the lowest or the highest aligned place in it that misses the reserved ranges.
+  const auto place_in = [&](uint64_t start, uint64_t end, uint64_t* at) {
+    if (start < low) start = low;
+    if (end > high) end = high;
+    if (start >= end || end - start < rounded) return false;
+    if (!top_down) {
+      uint64_t candidate = 0;
+      if (!align_up(start, &candidate)) return false;
+      while (candidate <= end - rounded) {
+        uint64_t after = 0;
+        if (!overlaps_reserved(candidate, candidate + rounded, &after)) {
+          *at = candidate;
+          return true;
+        }
+        if (!align_up(after, &candidate)) return false;
+      }
+      return false;
+    }
+    uint64_t candidate = (end - rounded) & ~(alignment - 1);
+    while (candidate >= start) {
+      // (the lowest reserved range the candidate touches: the next try ends below it)
+      uint64_t lowest = ~uint64_t{0};
+      for (const AddressRange& r : reserved_)
+        if (r.size != 0 && candidate < r.base + r.size && candidate + rounded > r.base && r.base < lowest) lowest = r.base;
+      if (lowest == ~uint64_t{0}) {
+        *at = candidate;
+        return true;
+      }
+      if (lowest < rounded) return false;
+      const uint64_t below = (lowest - rounded) & ~(alignment - 1);
+      if (below >= candidate) return false;
+      candidate = below;
+    }
+    return false;
+  };
+  const uint64_t count = regions_.count();
+  if (!top_down) {
+    uint64_t gap_start = 0;
+    for (uint64_t i = first_ending_after(low); i <= count; ++i) {
+      const uint64_t gap_end = i < count ? regions_[i]->base : top_;
+      if (gap_start >= high) break;
+      if (place_in(gap_start, gap_end, out)) return true;
+      if (i < count) gap_start = regions_[i]->base + regions_[i]->size;
+    }
+    return false;
+  }
+  uint64_t gap_end = top_;
+  for (uint64_t i = count;; --i) {
+    const uint64_t gap_start = i > 0 ? regions_[i - 1]->base + regions_[i - 1]->size : 0;
+    if (gap_end <= low) break;
+    if (place_in(gap_start, gap_end, out)) return true;
+    if (i == 0) break;
+    gap_end = regions_[i - 1]->base;
+  }
+  return false;
 }
 
 bool AddressSpace::check(uint64_t address, uint64_t size, uint8_t protection) const {

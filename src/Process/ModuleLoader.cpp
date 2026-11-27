@@ -592,13 +592,17 @@ LoadStatus ensure_loaded(Context& c, StringView canonical, const Module* importe
   bool relocate = false;
   if (base == 0 || base % 0x10000 != 0 || !c.space.find_free(size, base, &base) || base != pe.image_base()) {
     uint64_t at = 0, hint = c.next_base;
-    for (uint32_t attempt = 0;; ++attempt) {      // a free place that starts on a 64 KiB boundary (the holes between libraries do not)
-      if (attempt >= 256 || !c.space.find_free(size, hint, &at)) { say(c, "no room for ", canonical); return LoadStatus::OutOfMemory; }
-      base = (at + 0xFFFF) & ~uint64_t{0xFFFF};
-      if (base == at) break;
-      hint = base;
+    if (c.space.is_32bit()) {      // (a 32-bit program's moved library from the top down, as Windows places them: the middle of its 2 GiB stays free)
+      if (!c.space.find_free_windows32(size, true, &base)) { say(c, "no room for ", canonical); return LoadStatus::OutOfMemory; }
+    } else {
+      for (uint32_t attempt = 0;; ++attempt) {      // a free place that starts on a 64 KiB boundary (the holes between libraries do not)
+        if (attempt >= 256 || !c.space.find_free(size, hint, &at)) { say(c, "no room for ", canonical); return LoadStatus::OutOfMemory; }
+        base = (at + 0xFFFF) & ~uint64_t{0xFFFF};
+        if (base == at) break;
+        hint = base;
+      }
+      c.next_base = base + ((size + 0xFFFF) & ~uint64_t{0xFFFF});
     }
-    c.next_base = base + ((size + 0xFFFF) & ~uint64_t{0xFFFF});
     relocate = true;
   }
   // A DLL linked with dynamic base (0x40) lists every address that has to change; one that lists none needs none. Without the flag, a missing list means it cannot move.
