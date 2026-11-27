@@ -24,7 +24,8 @@
 # Usage: tests/heaven_qemu.sh [opengl|direct3d9|direct3d11]
 #   MINUTES (default 25) QEMU's time limit; WIDTH x HEIGHT (default 1280x720); TESSELLATION (DISABLED, MODERATE, NORMAL, EXTREME; default NORMAL,
 #   which Direct3D 9 does not have); QUALITY (LOW, MEDIUM, HIGH, ULTRA; default HIGH); GPU_BACKEND (AUTO, VENUS, VIRGL; default AUTO) with
-#   VENUS=on to give the device Venus; BENCHMARK=0 to run the demo without the benchmark (it does not quit; MINUTES ends it).
+#   STD=1 for the standard VGA card (no 3D device: the CPU renderer draws); VENUS=on to give the device Venus; BENCHMARK=0 to run the demo without the benchmark (it does not quit; MINUTES ends it); PROFILE=<n>: after the
+#   n-th screenshot a 60-second sampling profile (scripts/qemu-profile.py) into $work/profile.txt.
 # Uses its own build folder (build-heaven-qemu, BUILD= to change); screenshots and logs go in WORK (default $TMPDIR/tcos-heaven-<api>).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -59,7 +60,10 @@ cmake --build "$build" --target vars >/dev/null
 # The engine's log of the last run would be read as this one's.
 "$build/tools/primary_image" "$build/primary.img" "file:/Windows/Users/Default/Heaven/log.html=/dev/null" >/dev/null 2>&1 || true
 # (the run-gl target's command without its QMP socket and window: egl-headless, a VNC socket to read the screen and a monitor socket)
-read -r -a words <<< "$(ninja -C "$build" -t commands run-gl | tail -1 | sed -E 's/^cd [^&]* && //; s/-audiodev [a-z]+,/-audiodev none,/')"
+# (STD=1: the standard VGA card - no 3D device, so Direct3D and OpenGL draw on the CPU renderer: a reference for what the GPU path should show)
+target=run-gl
+[ "${STD:-0}" = 1 ] && target=run-std
+read -r -a words <<< "$(ninja -C "$build" -t commands $target | tail -1 | sed -E 's/^cd [^&]* && //; s/-audiodev [a-z]+,/-audiodev none,/')"
 args=(); skip=0
 for a in "${words[@]}"; do
   if [ $skip = 1 ]; then skip=0; elif [ "$a" = -qmp ]; then skip=1; else
@@ -85,6 +89,10 @@ while kill -0 $qemu_pid 2>/dev/null; do
   sleep "$shot" || true
   n=$((n + 1))
   python3 -I scripts/vnc-screenshot.py "$vnc" "$work/shot-$(printf %03d $n).png" 2>/dev/null || true
+  # PROFILE=<minute>: a sampling profile of the CPUs for 60 seconds from that minute on, into $work/profile.txt (scripts/qemu-profile.py)
+  if [ -n "${PROFILE:-}" ] && [ "$n" = "$PROFILE" ]; then
+    python3 -I scripts/qemu-profile.py "$monitor" 60 "$build/BOOTX64.efi" "$build/debugcon.log" "$build/windows" "$build/windows32" > "$work/profile.txt" 2>&1 || true
+  fi
   # (the autorun reports the program's end; the engine has quit once cmd.exe has)
   grep -a -q "autorun: ended" "$build/debugcon.log" 2>/dev/null && { sleep 5; break; }
 done

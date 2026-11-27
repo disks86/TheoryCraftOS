@@ -1956,6 +1956,7 @@ static HRESULT dsv_normalize(const Tex *t, const D3D11_DEPTH_STENCIL_VIEW_DESC *
     return S_OK;
   }
   *out = *in;
+  if (in->Flags & ~(UINT)(D3D11_DSV_READ_ONLY_DEPTH | D3D11_DSV_READ_ONLY_STENCIL)) return E_INVALIDARG;      /* (the two read-only flags are all there are) */
   if (in->Format == DXGI_FORMAT_UNKNOWN) {
     if (format_is_typeless(t->desc.Format)) return E_INVALIDARG;
     out->Format = t->desc.Format;

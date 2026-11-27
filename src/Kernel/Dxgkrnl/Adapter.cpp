@@ -1564,37 +1564,40 @@ class Adapter::StreamRunner {
   NtStatus copy_buffer_image(ByteReader& p) {
     const uint32_t direction = p.le32(), ii = p.le32(), level = p.le32(), layer = p.le32(), x = p.le32(), y = p.le32(), w = p.le32(), h = p.le32(), bi = p.le32(), boff = p.le32(), pitch = p.le32();
     const uint32_t narrow_word = p.at_end() ? 0 : p.le32();      // (the optional twelfth word)
-    if (!exact(p) || in_pass_ || direction > 1 || w == 0 || h == 0 || narrow_word > static_cast<uint32_t>(NarrowLayout::R1)) return kBad;
+    if (!exact(p) || in_pass_ || direction > 1 || w == 0 || h == 0 || narrow_word > static_cast<uint32_t>(NarrowLayout::R1)) return refuse(__LINE__);
     const NarrowLayout narrow = static_cast<NarrowLayout>(narrow_word);
     Allocation* image = alloc(ii);
     Allocation* buffer = alloc(bi);
-    if (!image || !image->is_image() || image->desc().samples != 1 || !copyable_buffer(buffer)) return kBad;
-    if (!use(image, direction == 0 ? state::kCopyDest : state::kCopySource) || !use(buffer, direction == 0 ? state::kCopySource : state::kCopyDest)) return kBad;
+    if (!image || !image->is_image() || image->desc().samples != 1 || !copyable_buffer(buffer)) return refuse(__LINE__);
+    if (!use(image, direction == 0 ? state::kCopyDest : state::kCopySource) || !use(buffer, direction == 0 ? state::kCopySource : state::kCopyDest)) return refuse(__LINE__);
     // (a depth buffer: a plane in one of the depth layouts, by the device; the depth layouts are a depth buffer's)
     if (image->is_depth()) return copy_depth_buffer_image(direction, image, level, layer, x, y, w, h, buffer, boff, pitch, narrow);
-    if (is_depth_layout(narrow)) return kBad;
+    if (is_depth_layout(narrow)) return refuse(__LINE__);
     // (a layer of a level: an array's slice or a volume's slice at that level)
-    if (level >= image->mip_levels() || layer >= image->level_layers(level)) return kBad;
+    if (level >= image->mip_levels() || layer >= image->level_layers(level)) return refuse(__LINE__);
     const uint32_t level_w = graphics::mip_extent(image->desc().width, level);
     const uint32_t level_h = graphics::mip_extent(image->desc().height, level);
     // (a block-compressed image is copied in whole blocks: the rectangle starts on a block and ends on one or at the level's edge; its rows are rows of blocks)
     const Format format = image->desc().format;
     const uint32_t unit = is_compressed(format) ? 4 : 1;
-    if (uint64_t{x} + w > level_w || uint64_t{y} + h > level_h || x % unit || y % unit || ((x + w) % unit && x + w != level_w) || ((y + h) % unit && y + h != level_h)) return kBad;
+    // (the level's blocks cover its texels rounded up to whole blocks: a 2 x 2 or 1 x 1 level of a compressed image is one block, which a copy may write whole -
+    // Direct3D's LockRect and CopyTextureRegion of such a level take the 4 x 4 block)
+    const uint64_t padded_w = (uint64_t{level_w} + unit - 1) / unit * unit, padded_h = (uint64_t{level_h} + unit - 1) / unit * unit;
+    if (uint64_t{x} + w > padded_w || uint64_t{y} + h > padded_h || x % unit || y % unit || ((x + w) % unit && x + w != level_w) || ((y + h) % unit && y + h != level_h)) return refuse(__LINE__);
     // (a narrow buffer: of an 8-bit four-channel image, or of A16B16G16R16)
     if (narrow == NarrowLayout::R1) {
-      if (format != Format::R8Unorm && format != Format::A8B8G8R8 && format != Format::X8B8G8R8) return kBad;
+      if (format != Format::R8Unorm && format != Format::A8B8G8R8 && format != Format::X8B8G8R8) return refuse(__LINE__);
     } else if (narrow != NarrowLayout::None) {
       const bool eight = narrow == NarrowLayout::R8 || narrow == NarrowLayout::R8G8;
-      if (eight ? (format != Format::A8B8G8R8 && format != Format::X8B8G8R8) : (format != Format::A16B16G16R16 && format != Format::A16B16G16R16Sint)) return kBad;
+      if (eight ? (format != Format::A8B8G8R8 && format != Format::X8B8G8R8) : (format != Format::A16B16G16R16 && format != Format::A16B16G16R16Sint)) return refuse(__LINE__);
     }
     const uint64_t row_bytes = image_row_bytes(format, w), level_row_bytes = image_row_bytes(format, level_w), x_bytes = image_row_bytes(format, x);
     const uint64_t buffer_row_bytes = narrow == NarrowLayout::None ? row_bytes : narrow == NarrowLayout::R1 ? (uint64_t{w} + 7) / 8 : uint64_t{w} * narrow_pixel_bytes(narrow);
     const uint32_t rows = image_rows(format, h), first_row = y / unit;
-    if (pitch < buffer_row_bytes) return kBad;
-    if (uint64_t{boff} + uint64_t{pitch} * (rows - 1) + buffer_row_bytes > buffer->desc().size) return kBad;
+    if (pitch < buffer_row_bytes) return refuse(__LINE__);
+    if (uint64_t{boff} + uint64_t{pitch} * (rows - 1) + buffer_row_bytes > buffer->desc().size) return refuse(__LINE__);
     uint64_t level_offset = 0, level_bytes = 0;
-    if (!image->subresource_range(level, layer, &level_offset, &level_bytes)) return kBad;
+    if (!image->subresource_range(level, layer, &level_offset, &level_bytes)) return refuse(__LINE__);
     if (!exec_) return status::kSuccess;
     NtStatus s = flush();
     if (s != status::kSuccess) return s;

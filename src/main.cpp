@@ -980,7 +980,9 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
   dxgk::set_system_kernel(&dxg_kernel);
 #ifdef TCOS_TRACE_SERVICE_FAILURES
   network::g_tcp_debug_log = [](const char* line) { console::puts(line); console::puts("\n"); };      // (and every TCP connection's state now and then)
-  // (with the failing services of Windows programs: a Direct3D command stream that is refused, and at which command)
+#endif
+  // A Direct3D command stream the kernel refuses loses its context (the program's device is removed, as a Windows TDR): which command, and where it was refused, goes
+  // to the log - a program that does not check its device goes on drawing nothing.
   dxgk::set_stream_trace([](uint32_t op, uint32_t status, uint32_t commands_before, uint32_t line) {
     console::puts("direct3d stream refused: command ");
     console::put_dec(static_cast<int64_t>(op));
@@ -992,7 +994,6 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
     console::put_dec(static_cast<int64_t>(line));
     console::puts(")\n");
   });
-#endif
   process::win32k::install_dxg();      // (the NtGdiDdDDI* services of win32u.dll reach the kernel-mode Direct3D driver)
   // The system's fonts for DirectWrite (dwrite.dll reaches them with NtTcosFont); lives as long as the system does.
   static font::SystemFontService system_fonts(shared_allocator);

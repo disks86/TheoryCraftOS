@@ -5709,6 +5709,31 @@ void test_d3d12_copies_and_escapes() {
     if (bad == 3) w.copy_buffer_to_image(0, 0, 0, 0, 0, 4, 4, 1, 0, 16);
     CHECK(e.render(w, {img, e.buffer(kAllocVertexBuffer, 32)}) == status::kInvalidParameter);
   }
+  // the small levels of a block-compressed image are one block each: a copy writes the whole 4 x 4 block of the 2 x 2 and 1 x 1 levels (Direct3D 9's LockRect of
+  // such a level, Direct3D 12's CopyTextureRegion of it); a rectangle past the block is still refused
+  {
+    Handle bc = e.alloc(kTexture, Format::Bc1, 8, 8, 4);      // (levels 8, 4, 2, 1)
+    Handle blocks = e.buffer(kAllocVertexBuffer, 64), out = e.buffer(kAllocVertexBuffer, 64);
+    std::vector<uint8_t> block(64, 0);
+    for (uint32_t i = 0; i < 8; ++i) block[i] = static_cast<uint8_t>(0xC0 + i);
+    CHECK(e.write(blocks, bytes_of(block)));
+    for (uint32_t level = 2; level < 4; ++level) {
+      {
+        CommandWriter w(e.allocator);
+        w.copy_buffer_to_image(0, level, 0, 0, 0, 4, 4, 1, 0, 8);
+        CHECK(e.render(w, {bc, blocks}) == status::kSuccess);
+      }
+      {
+        CommandWriter w(e.allocator);
+        w.copy_image_to_buffer(0, level, 0, 0, 0, 4, 4, 1, 8 * level, 8);
+        CHECK(e.render(w, {bc, out}) == status::kSuccess);
+      }
+      CHECK(read(out, 8 * level) == 0xC0 && read(out, 8 * level + 7) == 0xC7);
+      CommandWriter w(e.allocator);
+      w.copy_buffer_to_image(0, level, 0, 4, 0, 4, 4, 1, 0, 8);      // (a second block: the level has one)
+      CHECK(e.render(w, {bc, blocks}) == status::kInvalidParameter);
+    }
+  }
   // narrow layouts: R8 and R8G8 rows into an A8B8G8R8 image become (r, g or 0, 0, 255), and come out as the first channels; R16G16 of an A16B16G16R16 image the same in 16 bits
   {
     Handle wide8 = e.alloc(kTexture, Format::A8B8G8R8, 4, 2);
