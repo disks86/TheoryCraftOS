@@ -3663,8 +3663,9 @@ void test_texture_kinds() {
   };
   CHECK(draw_with(volume_pipe, volume) == status::kSuccess);
   CHECK(draw_with(plain_pipe, plain) == status::kSuccess);
-  CHECK(draw_with(volume_pipe, plain) == status::kInvalidParameter);
-  CHECK(draw_with(plain_pipe, volume) == status::kInvalidParameter);
+  // (a texture of another kind than the shader declares: the draw is left out - Direct3D leaves what it reads undefined - and the context goes on)
+  CHECK(draw_with(volume_pipe, plain) == status::kSuccess);
+  CHECK(draw_with(plain_pipe, volume) == status::kSuccess);
 
   // A device without the feature refuses the allocations and the shaders that need it.
   FakeScreen screen(8, 6);
@@ -4197,7 +4198,7 @@ void test_depth_textures_kernel() {
             program->texture_register(2) == 0 && program->sampler_register(2) == 2);
       String text(allocator);
       CHECK(program->emit_tgsi(&text) == status::kSuccess);   // (the comparisons from the constants after the program's own: ShaderModuleDesc::sampler_constants)
-      CHECK(text.view().find("DCL CONST[256..271]") != StringView::npos && text.view().find("CONST[257].zzzz") != StringView::npos);
+      CHECK(text.view().find("DCL CONST[960..975]") != StringView::npos && text.view().find("CONST[961].zzzz") != StringView::npos);   // (graphics::kSamplerCompareRegister: after the 960 rows of push constants)
     }
     UniquePointer<D3d9Program> pairs;
     CHECK(D3d9Program::compile_dxbc(allocator, ConstByteView(pair.data(), pair.size()), &pairs) == status::kSuccess);
@@ -9239,7 +9240,7 @@ void test_dxbc_constant_buffers() {
       d.code = view_of(blob);
       CHECK(kernel.create_shader(kPid, dev, d, &h) == status::kSuccess);
       AdapterCaps caps;
-      CHECK(kernel.query_adapter_caps(kPid, adapter, &caps) == status::kSuccess && caps.max_push_constant_bytes == 4096);
+      CHECK(kernel.query_adapter_caps(kPid, adapter, &caps) == status::kSuccess && caps.max_push_constant_bytes == graphics::kMaxPushConstantBytes);
       kernel.close_process(kPid);
     }
   }
@@ -10807,10 +10808,10 @@ void test_mipmapped_layers() {
   View slice;
   slice.given = true, slice.first_layer = 2, slice.layer_count = 1;
   CHECK(draw(slice_pipe, small, 0.5f, 0.5f, 0, 1, slice) == status::kSuccess && e.pixel(target, 3, 3) == colour(0, 2));
-  CHECK(draw(slice_pipe, small, 0.5f, 0.5f, 0, 1) == status::kInvalidParameter);
+  CHECK(draw(slice_pipe, small, 0.5f, 0.5f, 0, 1) == status::kSuccess);   // (left out: the array is not a 2D texture)
   View two;
   two.given = true, two.layer_count = 2;
-  CHECK(draw(slice_pipe, small, 0.5f, 0.5f, 0, 1, two) == status::kInvalidParameter);   // (two layers are not a 2D texture)
+  CHECK(draw(slice_pipe, small, 0.5f, 0.5f, 0, 1, two) == status::kSuccess);   // (two layers are not a 2D texture: left out)
   // Views the image does not have.
   View past;
   past.given = true, past.base_level = 3;
@@ -10825,7 +10826,7 @@ void test_mipmapped_layers() {
   View cube_view;
   cube_view.given = true, cube_view.first_layer = 2, cube_view.layer_count = 6;
   CHECK(draw(cube_pipe, six, 0.1f, 0.1f, 1.0f, 1, cube_view) == status::kSuccess && e.pixel(target, 3, 3) == colour(0, 2 + 4));
-  CHECK(draw(cube_pipe, six, 0.1f, 0.1f, 1.0f, 1) == status::kInvalidParameter);   // (eight layers are not a cube)
+  CHECK(draw(cube_pipe, six, 0.1f, 0.1f, 1.0f, 1) == status::kSuccess);   // (eight layers are not a cube: left out)
   // A cube array of two cubes, two levels: (0.55, 0.5, 1) * 2 - 1 points at +Z, alpha 0.1 names cube 1: layer 10; and the same through SampleLevel 1.
   const Handle cubes = make(TextureKind::TextureCubeArray, 12, 4, 4, 2);
   fill_levels(cubes, 2, 4, 4, [](uint32_t) { return 12u; });

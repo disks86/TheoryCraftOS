@@ -32,8 +32,17 @@ namespace dxgk {
 
 namespace {
 StreamTrace g_stream_trace = nullptr;
+PipelineTrace g_pipeline_trace = nullptr;
+TextureKindTrace g_texture_kind_trace = nullptr;
 }
 void set_stream_trace(StreamTrace trace) { g_stream_trace = trace; }
+void set_pipeline_trace(PipelineTrace trace) { g_pipeline_trace = trace; }
+void set_texture_kind_trace(TextureKindTrace trace) { g_texture_kind_trace = trace; }
+// (a pipeline the adapter refuses: its line goes to the trace)
+NtStatus pipeline_refused(NtStatus status, uint32_t line) {
+  if (g_pipeline_trace) g_pipeline_trace(status, line);
+  return status;
+}
 
 namespace {
 
@@ -189,6 +198,9 @@ class Adapter::StreamRunner {
 
  private:
   static constexpr NtStatus kBad = status::kInvalidParameter;
+  // (a refusal's line from kDeviceLineBase on is the device's: IGraphicsDevice::last_submit_failure plus this)
+  static constexpr uint32_t kDeviceLineBase = 1000000;
+  bool skip_draw_ = false;   // (fit_textures: the draw or dispatch being checked is left out)
   static constexpr uint32_t kPipelineStatistics1Values = graphics::kPipelineStatisticCount + 3;   // (and the amplification and mesh shader invocations and mesh primitives: none)
   static constexpr uint32_t kMaxStreamQueryValues = kPipelineStatistics1Values;
   struct StreamQuery {
@@ -238,7 +250,9 @@ class Adapter::StreamRunner {
     if (in_pass_) return kBad;   // a pass left open
     for (const StreamQuery& q : queries_.view())
       if (q.open) return kBad;   // a query left open
-    return exec_ ? flush() : status::kSuccess;
+    const NtStatus s = exec_ ? flush() : status::kSuccess;
+    if (s != status::kSuccess && g_stream_trace) g_stream_trace(0xFFFF, s, commands, refused_line_);   // (the run of the commands failed at the end)
+    return s;
   }
 
   // The device command buffer being recorded (made when the first command needs it).
@@ -263,6 +277,7 @@ class Adapter::StreamRunner {
       if (q.open && q.segment) end_segment(q);
     const bool ended = cb_->end();
     bool done = ended && adapter_.device_.submit(cb_);
+    if (!done) refused_line_ = ended ? kDeviceLineBase + adapter_.device_.last_submit_failure() : __LINE__;   // (the device's own reason, or: the command buffer refused a command)
     if (done) done = collect_segments();
     if (done) done = store_query_results();
     adapter_.device_.destroy_command_buffer(cb_);
@@ -322,7 +337,7 @@ class Adapter::StreamRunner {
       using graphics::QueryKind;
       if (q.kind == kQueryKindSoStatistics) {
         uint64_t written = 0, needed = 0;
-        if (!cb_->query_value(q.first_slot, 0, &written) || !cb_->query_value(q.first_slot + 1, 0, &needed)) return false;
+        if (!cb_->query_value(q.first_slot, 0, &written) || !cb_->query_value(q.first_slot + 1, 0, &needed)) return (refused_line_ = __LINE__, false);
         q.sums[0] += written;
         q.sums[1] += needed;
         continue;
@@ -330,7 +345,7 @@ class Adapter::StreamRunner {
       const uint32_t values = q.kind == kQueryKindPipelineStatistics1 ? graphics::kPipelineStatisticCount : query_values(q.kind);
       for (uint32_t k = 0; k < values; ++k) {
         uint64_t v = 0;
-        if (!cb_->query_value(q.first_slot, k, &v)) return false;
+        if (!cb_->query_value(q.first_slot, k, &v)) return (refused_line_ = __LINE__, false);
         // (a time is the last segment's - the time the query ended -, a frequency the same in every one; counts, predicates and the disjoint flag add up)
         if (q.kind == static_cast<uint32_t>(QueryKind::Timestamp) || q.kind == static_cast<uint32_t>(QueryKind::TimestampFrequency)) q.sums[k] = v;
         else q.sums[k] += v;
@@ -346,7 +361,7 @@ class Adapter::StreamRunner {
       q.written = true;
       const uint32_t values = query_values(q.kind);
       ByteView where;
-      if (!q.allocation->writable_backing().try_subview(q.offset, uint64_t{values} * 8, &where)) return false;
+      if (!q.allocation->writable_backing().try_subview(q.offset, uint64_t{values} * 8, &where)) return (refused_line_ = __LINE__, false);
       const bool predicate = q.kind == static_cast<uint32_t>(graphics::QueryKind::OcclusionPredicate) || q.kind == static_cast<uint32_t>(graphics::QueryKind::TimestampDisjoint);
       // (the vertices and vertex shader runs of strips and fans, as Direct3D counts them)
       auto adjust = [&](uint32_t k) {
@@ -428,8 +443,13 @@ class Adapter::StreamRunner {
         continue;
       }
       view.kind = declared;
-      // (unbound, or a volume where the shader reads a 2D texture, ...)
-      if (views ? !graphics::texture_view_fits(a->texture_kind(), a->layers(), a->mip_levels(), view) : a->texture_kind() != declared) return refuse(__LINE__);
+      // (a view of another kind than the shader declares - a volume where it reads a 2D texture, ...: what it reads is undefined in Direct3D, and the draw is still made
+      // there. Here the draw is left out - the device cannot sample through a view that does not fit - and the program's context goes on.)
+      if (views ? !graphics::texture_view_fits(a->texture_kind(), a->layers(), a->mip_levels(), view) : a->texture_kind() != declared) {
+        if (g_texture_kind_trace) g_texture_kind_trace(u, static_cast<uint32_t>(declared), static_cast<uint32_t>(a->texture_kind()), a->layers());
+        skip_draw_ = true;
+        return status::kSuccess;
+      }
       if (!exec_ || !views || device_view_kind_[u] == declared) continue;
       const NtStatus s = ensure_cb();
       if (s != status::kSuccess) return s;
@@ -833,6 +853,10 @@ class Adapter::StreamRunner {
     for (uint32_t slot = 0; slot < graphics::kMaxStorageBuffers; ++slot)
       if (compute_->storage_mask().test(slot) && !uav_bound_[slot]) return kBad;
     if (const NtStatus fitted = fit_textures(*compute_, compute_->texture_mask())) return fitted;   // (the textures the shader reads: bound, and of the kind it declared)
+    if (skip_draw_) {   // (... or the dispatch is left out)
+      skip_draw_ = false;
+      return status::kSuccess;
+    }
     if (!images_fit(*compute_)) return refuse(__LINE__);   // (the storage images it declares: bound, and of what it declared)
     if (both_planes(compute_->texture_mask())) return refuse(__LINE__);   // (a depth buffer's two planes at once)
     if (x == 0 || y == 0 || z == 0 || !exec_) return status::kSuccess;
@@ -1157,6 +1181,11 @@ class Adapter::StreamRunner {
     refused_line_ = line;
     return kBad;
   }
+  // (the device could not do what the stream asked: the line goes to the refusal's trace)
+  NtStatus device_state_failure(uint32_t line) {
+    refused_line_ = line;
+    return status::kInvalidDeviceState;
+  }
   uint32_t refused_line_ = 0;
 
   NtStatus draw(ByteReader& p, bool indexed, bool instanced) {
@@ -1179,6 +1208,10 @@ class Adapter::StreamRunner {
     if (is_adjacency(topology_) && !pipeline_->has_geometry()) return refuse(__LINE__);   // (only a geometry shader takes the neighbours)
     if (pipeline_->has_tessellation() && (patch_points(topology_) != pipeline_->tess_input_points() || pipeline_->has_geometry())) return refuse(__LINE__);
     if (const NtStatus fitted = fit_textures(*pipeline_, pipeline_->texture_count() >= 32 ? ~0u : (1u << pipeline_->texture_count()) - 1)) return fitted;   // (bound, and of the kinds the shaders declare)
+    if (skip_draw_) {   // (a texture that does not fit the kind declared: this draw is left out)
+      skip_draw_ = false;
+      return status::kSuccess;
+    }
     if (both_planes(pipeline_->declared_units())) return refuse(__LINE__);   // (a depth buffer's two planes at once, read by the shaders)
     if (pipeline_->color_target_count() > pass_target_count_) return refuse(__LINE__);
     for (uint32_t slot = 0; slot < graphics::kMaxStorageBuffers; ++slot)
@@ -1533,11 +1566,11 @@ class Adapter::StreamRunner {
     if (dst == src && doff < soff + uint64_t{bytes} && soff < doff + uint64_t{bytes}) return kBad;
     if (!exec_) return status::kSuccess;
     NtStatus s = flush();
-    if (s != status::kSuccess) return s;
-    if (!mm_.read_back(*src) || !mm_.read_back(*dst)) return status::kInvalidDeviceState;
+    if (s != status::kSuccess) return s;   // (flush gives its own reason)
+    if (!mm_.read_back(*src) || !mm_.read_back(*dst)) return device_state_failure(__LINE__);
     ByteView to;
     ConstByteView from;
-    if (!dst->writable_backing().try_subview(doff, bytes, &to) || !src->backing().try_subview(soff, bytes, &from)) return status::kInvalidDeviceState;
+    if (!dst->writable_backing().try_subview(doff, bytes, &to) || !src->backing().try_subview(soff, bytes, &from)) return device_state_failure(__LINE__);
     to.copy_from(from);
     mm_.note_cpu_write(*dst);
     return status::kSuccess;
@@ -3247,11 +3280,11 @@ NtStatus Adapter::create_compute_pipeline(const SharedPointer<ShaderObject>& sha
 
 NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<ShaderObject>& vertex, const SharedPointer<ShaderObject>& fragment, SharedPointer<PipelineObject>* out,
                                   const SharedPointer<ShaderObject>& geometry, const SharedPointer<ShaderObject>& hull, const SharedPointer<ShaderObject>& domain) {
-  if (!vertex || !fragment || vertex->stage() != graphics::ShaderStage::Vertex || fragment->stage() != graphics::ShaderStage::Fragment) return status::kInvalidParameter;
+  if (!vertex || !fragment || vertex->stage() != graphics::ShaderStage::Vertex || fragment->stage() != graphics::ShaderStage::Fragment) return pipeline_refused(status::kInvalidParameter, __LINE__);
   if (d.vertex_stride > kMaxVertexStride || d.attribute_count > caps_.max_vertex_attributes || d.varying_count > caps_.max_varyings || d.texture_count > caps_.max_texture_units)
-    return status::kInvalidParameter;
+    return pipeline_refused(status::kInvalidParameter, __LINE__);
   for (uint32_t s = 1; s < graphics::kMaxVertexBuffers; ++s)
-    if (d.slot_strides[s] > kMaxVertexStride) return status::kInvalidParameter;
+    if (d.slot_strides[s] > kMaxVertexStride) return pipeline_refused(status::kInvalidParameter, __LINE__);
   // The pipeline has the texture units its shaders read, when they say which: a description may count more (a root signature with a table of textures
   // for shaders that sample none of them, or fewer), and a device takes no units for a pixel shader that samples nothing.
   uint32_t texture_count = d.texture_count;
@@ -3269,12 +3302,12 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   uint32_t vertex_slots = 0, instance_slots = 0, slot_rates[graphics::kMaxVertexBuffers] = {}, slot_extents[graphics::kMaxVertexBuffers] = {};
   for (uint32_t i = 0; i < d.attribute_count; ++i) {
     const graphics::VertexAttribute& a = d.attributes[i];
-    if (a.location >= caps_.max_vertex_attributes || a.slot >= caps_.max_vertex_buffers || static_cast<uint32_t>(a.format) >= graphics::kVertexFormatCount) return status::kInvalidParameter;
-    if (static_cast<uint32_t>(a.format) > static_cast<uint32_t>(graphics::VertexFormat::Float4) && !(caps_.features & graphics::kFeatureVertexFormats)) return status::kNotSupported;
+    if (a.location >= caps_.max_vertex_attributes || a.slot >= caps_.max_vertex_buffers || static_cast<uint32_t>(a.format) >= graphics::kVertexFormatCount) return pipeline_refused(status::kInvalidParameter, __LINE__);
+    if (static_cast<uint32_t>(a.format) > static_cast<uint32_t>(graphics::VertexFormat::Float4) && !(caps_.features & graphics::kFeatureVertexFormats)) return pipeline_refused(status::kNotSupported, __LINE__);
     const uint32_t stride = a.slot == 0 ? d.vertex_stride : d.slot_strides[a.slot];
     // (an attribute lies within its element; at stride 0 - every vertex reading the same element, kFeature3ZeroStride - within the largest one)
     const uint32_t room = stride ? stride : (caps_.features3 & graphics::kFeature3ZeroStride) ? kMaxVertexStride : 0;
-    if (room == 0 || a.offset > room || graphics::vertex_format_bytes(a.format) > room - a.offset) return status::kInvalidParameter;
+    if (room == 0 || a.offset > room || graphics::vertex_format_bytes(a.format) > room - a.offset) return pipeline_refused(status::kInvalidParameter, __LINE__);
     const uint32_t end = a.offset + graphics::vertex_format_bytes(a.format);
     if (end > slot_extents[a.slot]) slot_extents[a.slot] = end;
     (a.per_instance ? instance_slots : vertex_slots) |= 1u << a.slot;
@@ -3283,77 +3316,77 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   const graphics::StencilState& st = d.stencil;
   if (static_cast<uint32_t>(d.cull_mode) > 2 || static_cast<uint32_t>(d.front_face) > 1 || static_cast<uint32_t>(st.compare) > 7 || static_cast<uint32_t>(st.fail_op) > 7 ||
       static_cast<uint32_t>(st.depth_fail_op) > 7 || static_cast<uint32_t>(st.pass_op) > 7)
-    return status::kInvalidParameter;
-  if (st.enable && !caps_.stencil) return status::kNotSupported;
+    return pipeline_refused(status::kInvalidParameter, __LINE__);
+  if (st.enable && !caps_.stencil) return pipeline_refused(status::kNotSupported, __LINE__);
   // The state beyond the base interface, for the devices that have it.
   const graphics::BlendState& bs = d.blend;
   constexpr uint32_t kLastFactor = graphics::kBlendFactorCount - 1;
   if (static_cast<uint32_t>(d.depth_compare) > 7 || static_cast<uint32_t>(bs.src_color) > kLastFactor || static_cast<uint32_t>(bs.dst_color) > kLastFactor ||
       static_cast<uint32_t>(bs.src_alpha) > kLastFactor || static_cast<uint32_t>(bs.dst_alpha) > kLastFactor || static_cast<uint32_t>(bs.color_op) > 4 ||
       static_cast<uint32_t>(bs.alpha_op) > 4 || bs.write_mask > 0xF)
-    return status::kInvalidParameter;
+    return pipeline_refused(status::kInvalidParameter, __LINE__);
   for (const graphics::BlendState& t : d.target_blend)
     if (static_cast<uint32_t>(t.src_color) > kLastFactor || static_cast<uint32_t>(t.dst_color) > kLastFactor || static_cast<uint32_t>(t.src_alpha) > kLastFactor ||
         static_cast<uint32_t>(t.dst_alpha) > kLastFactor || static_cast<uint32_t>(t.color_op) > 4 || static_cast<uint32_t>(t.alpha_op) > 4 || t.write_mask > 0xF)
-      return status::kInvalidParameter;
+      return pipeline_refused(status::kInvalidParameter, __LINE__);
   // (the constant factors: a device that has them, DeviceInfo::blend_constant)
   bool constant_factors = bs.custom && bs.uses_constant();
   if (d.independent_blend)
     for (const graphics::BlendState& t : d.target_blend) constant_factors = constant_factors || (t.custom && t.uses_constant());
-  if (constant_factors && !caps_.blend_constant) return status::kNotSupported;
+  if (constant_factors && !caps_.blend_constant) return pipeline_refused(status::kNotSupported, __LINE__);
   // (dual-source blending: the Src1 factors of target 0 - a pipeline of one colour target, Direct3D's rule -; logic operations; the rasterizer state of Direct3D 10)
   bool dual_source = bs.custom && bs.uses_dual_source();
   if (d.independent_blend)
     for (const graphics::BlendState& t : d.target_blend) dual_source = dual_source || (t.custom && t.uses_dual_source());
-  if (dual_source && !(caps_.features2 & graphics::kFeature2DualSourceBlend)) return status::kNotSupported;
-  if (dual_source && d.color_target_count != 1) return status::kInvalidParameter;
-  if (static_cast<uint32_t>(d.logic_op) >= graphics::kLogicOpCount || static_cast<uint32_t>(d.fill_mode) > 1) return status::kInvalidParameter;
-  if (d.logic_op_enable && !(caps_.features2 & graphics::kFeature2LogicOps)) return status::kNotSupported;
+  if (dual_source && !(caps_.features2 & graphics::kFeature2DualSourceBlend)) return pipeline_refused(status::kNotSupported, __LINE__);
+  if (dual_source && d.color_target_count != 1) return pipeline_refused(status::kInvalidParameter, __LINE__);
+  if (static_cast<uint32_t>(d.logic_op) >= graphics::kLogicOpCount || static_cast<uint32_t>(d.fill_mode) > 1) return pipeline_refused(status::kInvalidParameter, __LINE__);
+  if (d.logic_op_enable && !(caps_.features2 & graphics::kFeature2LogicOps)) return pipeline_refused(status::kNotSupported, __LINE__);
   const graphics::StencilState& back = d.back_stencil;
-  if (static_cast<uint32_t>(back.compare) > 7 || static_cast<uint32_t>(back.fail_op) > 7 || static_cast<uint32_t>(back.depth_fail_op) > 7 || static_cast<uint32_t>(back.pass_op) > 7) return status::kInvalidParameter;
+  if (static_cast<uint32_t>(back.compare) > 7 || static_cast<uint32_t>(back.fail_op) > 7 || static_cast<uint32_t>(back.depth_fail_op) > 7 || static_cast<uint32_t>(back.pass_op) > 7) return pipeline_refused(status::kInvalidParameter, __LINE__);
   const graphics::DepthBias& bias = d.depth_bias;
-  if ((bias.unorm_bits != 0 && bias.unorm_bits != 16 && bias.unorm_bits != 24) || bias.constant != bias.constant || bias.slope != bias.slope || bias.clamp != bias.clamp) return status::kInvalidParameter;
+  if ((bias.unorm_bits != 0 && bias.unorm_bits != 16 && bias.unorm_bits != 24) || bias.constant != bias.constant || bias.slope != bias.slope || bias.clamp != bias.clamp) return pipeline_refused(status::kInvalidParameter, __LINE__);
   const bool raster_state = d.fill_mode != graphics::FillMode::Solid || bias.enabled() || !d.depth_clip || d.separate_back_stencil;
-  if (raster_state && !(caps_.features2 & graphics::kFeature2RasterizerState)) return status::kNotSupported;
-  if (d.independent_blend && !(caps_.features & graphics::kFeatureIndependentBlend)) return status::kNotSupported;
-  if ((d.multisample || d.alpha_to_coverage) && !(caps_.features & graphics::kFeatureMultisample)) return status::kNotSupported;
-  if (d.alpha_to_coverage && !d.multisample) return status::kInvalidParameter;
-  if (d.conservative && !(caps_.features2 & graphics::kFeature2ConservativeRaster)) return status::kNotSupported;
-  if (d.line_mode != graphics::LineMode::Aliased && !(caps_.features2 & graphics::kFeature2LineModes)) return status::kNotSupported;
+  if (raster_state && !(caps_.features2 & graphics::kFeature2RasterizerState)) return pipeline_refused(status::kNotSupported, __LINE__);
+  if (d.independent_blend && !(caps_.features & graphics::kFeatureIndependentBlend)) return pipeline_refused(status::kNotSupported, __LINE__);
+  if ((d.multisample || d.alpha_to_coverage) && !(caps_.features & graphics::kFeatureMultisample)) return pipeline_refused(status::kNotSupported, __LINE__);
+  if (d.alpha_to_coverage && !d.multisample) return pipeline_refused(status::kInvalidParameter, __LINE__);
+  if (d.conservative && !(caps_.features2 & graphics::kFeature2ConservativeRaster)) return pipeline_refused(status::kNotSupported, __LINE__);
+  if (d.line_mode != graphics::LineMode::Aliased && !(caps_.features2 & graphics::kFeature2LineModes)) return pipeline_refused(status::kNotSupported, __LINE__);
   // (a forced sample count: 1, 2, 4, 8 or 16 on a device that has them; above 1 without depth, stencil, per-sample coverage or alpha to coverage - Direct3D's target-independent rasterization)
-  if (d.forced_samples > 16 || (d.forced_samples & (d.forced_samples - 1)) != 0) return status::kInvalidParameter;
-  if (d.forced_samples && !(caps_.features3 & graphics::kFeature3ForcedSampleCount)) return status::kNotSupported;
-  if (d.forced_samples > 1 && (d.depth_test || d.depth_write || st.enable || d.multisample || d.alpha_to_coverage)) return status::kInvalidParameter;
+  if (d.forced_samples > 16 || (d.forced_samples & (d.forced_samples - 1)) != 0) return pipeline_refused(status::kInvalidParameter, __LINE__);
+  if (d.forced_samples && !(caps_.features3 & graphics::kFeature3ForcedSampleCount)) return pipeline_refused(status::kNotSupported, __LINE__);
+  if (d.forced_samples > 1 && (d.depth_test || d.depth_write || st.enable || d.multisample || d.alpha_to_coverage)) return pipeline_refused(status::kInvalidParameter, __LINE__);
   if (hull || domain) {
-    if (!hull || !domain || hull->stage() != graphics::ShaderStage::Hull || domain->stage() != graphics::ShaderStage::Domain || hull->tess_output_points() != domain->tess_input_points() || hull->tess_domain() != domain->tess_domain()) return status::kInvalidParameter;
-    if (!(caps_.features & graphics::kFeatureTessellation)) return status::kNotSupported;
-    if (geometry) return status::kNotSupported;   // (a geometry shader after the tessellator is not made)
+    if (!hull || !domain || hull->stage() != graphics::ShaderStage::Hull || domain->stage() != graphics::ShaderStage::Domain || hull->tess_output_points() != domain->tess_input_points() || hull->tess_domain() != domain->tess_domain()) return pipeline_refused(status::kInvalidParameter, __LINE__);
+    if (!(caps_.features & graphics::kFeatureTessellation)) return pipeline_refused(status::kNotSupported, __LINE__);
+    if (geometry) return pipeline_refused(status::kNotSupported, __LINE__);   // (a geometry shader after the tessellator is not made)
   }
   if (d.stream_output_count) {
     // (stream output takes the outputs of the geometry shader, or the domain shader, or the vertex shader; the entries name streams the geometry shader has (the others have one), outputs and
     // components that exist, and a buffer takes only one stream; each buffer's record is as long as its entries need, in whole words)
-    if (!(caps_.features & graphics::kFeatureStreamOutput)) return status::kNotSupported;
-    if (d.stream_output_count > graphics::kMaxStreamOutputEntries || d.rasterized_stream < -1 || d.rasterized_stream >= static_cast<int32_t>(graphics::kMaxGeometryStreams) || (!geometry && d.rasterized_stream > 0)) return status::kInvalidParameter;
+    if (!(caps_.features & graphics::kFeatureStreamOutput)) return pipeline_refused(status::kNotSupported, __LINE__);
+    if (d.stream_output_count > graphics::kMaxStreamOutputEntries || d.rasterized_stream < -1 || d.rasterized_stream >= static_cast<int32_t>(graphics::kMaxGeometryStreams) || (!geometry && d.rasterized_stream > 0)) return pipeline_refused(status::kInvalidParameter, __LINE__);
     const uint32_t stream_count = geometry ? geometry->geometry_streams() : 1;
     int32_t stream_of_buffer[graphics::kMaxStreamOutputBuffers] = {-1, -1, -1, -1};
     uint32_t bytes[graphics::kMaxStreamOutputBuffers] = {};
     for (uint32_t e = 0; e < d.stream_output_count; ++e) {
       const graphics::StreamOutputEntry& entry = d.stream_output[e];
       if (entry.stream >= stream_count || entry.output > graphics::kMaxVaryings || entry.component_count == 0 || entry.start_component + entry.component_count > 4 || entry.buffer >= graphics::kMaxStreamOutputBuffers)
-        return status::kInvalidParameter;
-      if (stream_of_buffer[entry.buffer] >= 0 && stream_of_buffer[entry.buffer] != entry.stream) return status::kInvalidParameter;
+        return pipeline_refused(status::kInvalidParameter, __LINE__);
+      if (stream_of_buffer[entry.buffer] >= 0 && stream_of_buffer[entry.buffer] != entry.stream) return pipeline_refused(status::kInvalidParameter, __LINE__);
       stream_of_buffer[entry.buffer] = entry.stream;
       bytes[entry.buffer] += 4u * entry.component_count;
     }
     for (uint32_t b = 0; b < graphics::kMaxStreamOutputBuffers; ++b)
-      if (stream_of_buffer[b] >= 0 && (d.stream_output_stride[b] < bytes[b] || d.stream_output_stride[b] % 4 || d.stream_output_stride[b] > 2048)) return status::kInvalidParameter;
+      if (stream_of_buffer[b] >= 0 && (d.stream_output_stride[b] < bytes[b] || d.stream_output_stride[b] % 4 || d.stream_output_stride[b] > 2048)) return pipeline_refused(status::kInvalidParameter, __LINE__);
   }
   if (geometry && (geometry->stage() != graphics::ShaderStage::Geometry || !(caps_.features & graphics::kFeatureGeometryShaders))) return geometry && geometry->stage() != graphics::ShaderStage::Geometry ? status::kInvalidParameter : status::kNotSupported;
-  if ((bs.custom || d.depth_compare != graphics::CompareOp::LessEqual) && !(caps_.features & graphics::kFeatureBlendState)) return status::kNotSupported;
+  if ((bs.custom || d.depth_compare != graphics::CompareOp::LessEqual) && !(caps_.features & graphics::kFeatureBlendState)) return pipeline_refused(status::kNotSupported, __LINE__);
   for (uint32_t i = 0; i < d.attribute_count; ++i)
-    if (d.attributes[i].per_instance && !(caps_.features & graphics::kFeatureInstancing)) return status::kNotSupported;
-  if (d.color_target_count == 0 || d.color_target_count > caps_.max_color_targets) return status::kInvalidParameter;
-  if (d.color_target_count > 1 && !(caps_.features & graphics::kFeatureMultipleTargets)) return status::kNotSupported;
+    if (d.attributes[i].per_instance && !(caps_.features & graphics::kFeatureInstancing)) return pipeline_refused(status::kNotSupported, __LINE__);
+  if (d.color_target_count == 0 || d.color_target_count > caps_.max_color_targets) return pipeline_refused(status::kInvalidParameter, __LINE__);
+  if (d.color_target_count > 1 && !(caps_.features & graphics::kFeatureMultipleTargets)) return pipeline_refused(status::kNotSupported, __LINE__);
 
   graphics::GraphicsPipelineDesc pd;
   pd.vertex_shader = vertex->module();
@@ -3403,7 +3436,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   SharedPointer<PipelineObject> pipeline = SharedPointer<PipelineObject>::make(allocator_, device_);
   if (!pipeline) return status::kNoMemory;
   pipeline->pipeline_ = device_.create_graphics_pipeline(pd);
-  if (!pipeline->pipeline_) return status::kNotSupported;
+  if (!pipeline->pipeline_) return pipeline_refused(status::kNotSupported, __LINE__);
   pipeline->vertex_ = vertex;
   pipeline->fragment_ = fragment;
   pipeline->geometry_ = geometry;
@@ -3425,10 +3458,10 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   // pairs - each takes the units of its own pairs from the last down -, do not go together)
   for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u) {
     const bool in_vertex = (vertex->texture_mask_ >> u) & 1, in_fragment = (fragment->texture_mask_ >> u) & 1;
-    if (in_vertex && in_fragment && vertex->texture_kind(u) != fragment->texture_kind(u)) return status::kNotSupported;
-    if (in_vertex && in_fragment && vertex->unit_texture_[u] != fragment->unit_texture_[u]) return status::kNotSupported;
+    if (in_vertex && in_fragment && vertex->texture_kind(u) != fragment->texture_kind(u)) return pipeline_refused(status::kNotSupported, __LINE__);
+    if (in_vertex && in_fragment && vertex->unit_texture_[u] != fragment->unit_texture_[u]) return pipeline_refused(status::kNotSupported, __LINE__);
     const bool vertex_samples = (vertex->sampled_mask_ >> u) & 1, fragment_samples = (fragment->sampled_mask_ >> u) & 1;
-    if (vertex_samples && fragment_samples && vertex->unit_sampler_[u] != fragment->unit_sampler_[u]) return status::kNotSupported;
+    if (vertex_samples && fragment_samples && vertex->unit_sampler_[u] != fragment->unit_sampler_[u]) return pipeline_refused(status::kNotSupported, __LINE__);
     pipeline->texture_kinds_[u] = in_vertex ? vertex->texture_kind(u) : fragment->texture_kind(u);
     const ShaderObject& reader = in_vertex ? *vertex : *fragment;
     pipeline->unit_texture_[u] = reader.unit_texture_[u];
@@ -3442,7 +3475,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
     if (!stage) continue;
     for (uint32_t u = 0; u < graphics::kMaxImageSlots; ++u) {
       if (!stage->image_mask_.test(u)) continue;
-      if (pipeline->image_mask_.test(u) && (pipeline->image_dims_[u] != stage->image_dims_[u] || pipeline->image_returns_[u] != stage->image_returns_[u])) return status::kInvalidParameter;
+      if (pipeline->image_mask_.test(u) && (pipeline->image_dims_[u] != stage->image_dims_[u] || pipeline->image_returns_[u] != stage->image_returns_[u])) return pipeline_refused(status::kInvalidParameter, __LINE__);
       pipeline->image_mask_.set(u);
       pipeline->image_dims_[u] = stage->image_dims_[u], pipeline->image_returns_[u] = stage->image_returns_[u];
     }

@@ -339,7 +339,7 @@ static void test_hand_written() {
   // offsets added to the layer and the viewport, SV_Barycentrics, GetAttributeAtVertex (per-vertex fragment inputs), SV_ShadingRate both ways, residency feedback
   // with a clamp (SPARSE_BEGIN / SPARSE_END), and the coordinates in texels of non-normalized samplers
   graphics::tgsi::CompileOptions ov;
-  ov.constant_rows = 274, ov.system_row = 273, ov.view_offsets = true, ov.output_layer_any_stage = true;
+  ov.constant_rows = graphics::kDeviceConstantRegisters + 1, ov.system_row = graphics::kDeviceConstantRegisters, ov.view_offsets = true, ov.output_layer_any_stage = true;
   compile_one("view index and offsets (vertex)",
               "VERT\nDCL IN[0]\nDCL SV[7], VIEWINDEX\nDCL OUT[0], POSITION\nDCL OUT[1], GENERIC[0]\nDCL TEMP[0]\n  0: MOV OUT[0], IN[0]\n  1: U2F TEMP[0].x, SV[7].xxxx\n"
               "  2: MOV OUT[1], TEMP[0].xxxx\n  3: END\n",

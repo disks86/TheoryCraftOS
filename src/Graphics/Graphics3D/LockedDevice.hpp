@@ -45,6 +45,7 @@ class LockedDevice final : public IGraphicsDevice {
   ICommandBuffer* create_command_buffer() override { kernel::ScopedMutex g(lock_); return inner_.create_command_buffer(); }
   void destroy_command_buffer(ICommandBuffer* commands) override { kernel::ScopedMutex g(lock_); inner_.destroy_command_buffer(commands); }
   bool submit(ICommandBuffer* commands) override { kernel::ScopedMutex g(lock_); return inner_.submit(commands); }
+  uint32_t last_submit_failure() const override { return inner_.last_submit_failure(); }
   bool present(IImage* image) override { kernel::ScopedMutex g(lock_); return inner_.present(image); }
 
  private:

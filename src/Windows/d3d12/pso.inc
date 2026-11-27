@@ -386,7 +386,7 @@ static void release_shader(Dev *dev, UINT handle) {
 static HRESULT make_shader(Dev *dev, const D3D12_SHADER_BYTECODE *code, UINT stage, UINT *handle) {
   *handle = 0;
   if (!code->pShaderBytecode || !code->BytecodeLength) return S_OK;
-  if (code->BytecodeLength > 60000) return DXGI_ERROR_UNSUPPORTED;
+  if (code->BytecodeLength > TCOS_MAX_SHADER_BYTES) return DXGI_ERROR_UNSUPPORTED;
   /* ShaderKind::Dxbc (DXBC and the DXIL of Shader Model 6), or what the runtime above asked for (TcosD3D12PipelineOptions); above the kind, where a
    * pixel shader's constant buffers begin */
   UINT base = stage == 1 ? dev->next_pixel_base : stage >= 3 && stage <= 5 ? dev->next_stage_base[stage - 3] : 0;

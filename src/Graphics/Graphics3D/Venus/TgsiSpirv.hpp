@@ -66,7 +66,7 @@ struct CompileOptions {
   // Which of the pipeline's stages this is (0 .. 4: the bindings of its storage, binding_storage and the others).
   uint32_t stage_slot = 0;
   // The constant buffer's rows (the declared CONST range is checked against it): the push constants, the samplers' comparisons and the pass's samples (kDeviceConstantRegisters).
-  uint32_t constant_rows = 273;
+  uint32_t constant_rows = 977;   // (graphics::kDeviceConstantRegisters: 960 rows of push constants, 16 of the samplers' comparisons, the pass's samples; VenusPipeline.cpp checks)
   // SVIEW / IMAGE / vertex attribute / colour output value types (from what is bound or the pipeline's formats).
   ValueType sview_type[kMaxSviews] = {};
   ValueType image_type[kMaxImages] = {};

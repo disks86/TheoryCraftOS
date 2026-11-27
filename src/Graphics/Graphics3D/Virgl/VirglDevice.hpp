@@ -97,6 +97,7 @@ class VirglDevice final : public IGraphicsDevice {
 
   void interrupt_clock() override { clock_interrupted_ = true; }
   bool submit(ICommandBuffer* commands) override;
+  uint32_t last_submit_failure() const override { return __atomic_load_n(&submit_failure_line_, __ATOMIC_RELAXED); }
   bool present(IImage* image) override;
 
   // Used by the resource classes (not part of IGraphicsDevice).
@@ -125,6 +126,17 @@ class VirglDevice final : public IGraphicsDevice {
   // (VirglPipeline::blend_reset), because the host's OpenGL refuses draws into several targets while they do.
   bool host_dual_source_factors_ = false;
   kernel::Mutex submit_lock_;   // (held through a submit: see submit())
+  uint32_t submit_failure_line_ = 0;
+  bool query_timeout_said_ = false;   // (the log has said once that a host query timed out)
+  // The host left a pipeline statistics query unfinished (virglrenderer does with some of Unigine Heaven's): from then on such queries count 0 without being waited for,
+  // which would hold every submit that has one for the whole wait. An open gap: why the host does not finish them.
+  bool host_statistics_stall_ = false;
+  uint32_t images_refused_said_ = 0;
+  IImage* image_refused(const ImageDesc& desc, uint32_t line);
+  bool submit_failed(uint32_t line) {   // (the line of VirglDevice.cpp where a submit gave up: last_submit_failure)
+    __atomic_store_n(&submit_failure_line_, line, __ATOMIC_RELAXED);
+    return false;
+  }
   hardware::VirtioGpu& gpu_;
   uint32_t next_handle_ = 1;  // object handles share one namespace per context
   uint64_t all_used_until_ = 0;   // the last work of a submit that used too many buffers to note each one (see in_flight)

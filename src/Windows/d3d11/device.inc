@@ -566,8 +566,8 @@ static HRESULT dev_start(Dev *d) {
   if (SUCCEEDED(hr)) hr = ID3D12Device_CreateCommandList(d->d12, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, d->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&d->list);
   if (FAILED(hr)) return hr;
 
-  /* the one root signature: the block of constants (b0), the pixel shader's textures (t0 .. t7) and its samplers (s0 .. s7) */
-  D3D12_DESCRIPTOR_RANGE views = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, TEXTURE_SLOTS, 0, 0, 0}, samplers = {D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, TEXTURE_SLOTS, 0, 0, 0};
+  /* the one root signature: the block of constants (b0), the pixel shader's textures (t0 .. t7) and its samplers (s0 .. s15) */
+  D3D12_DESCRIPTOR_RANGE views = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, TEXTURE_SLOTS, 0, 0, 0}, samplers = {D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, SAMPLER_SLOTS, 0, 0, 0};
   D3D12_DESCRIPTOR_RANGE uavs = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, UAV_TABLE_NARROW, 0, 0, 0};
   D3D12_ROOT_PARAMETER params[4];
   memset(params, 0, sizeof params);

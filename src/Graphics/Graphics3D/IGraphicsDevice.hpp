@@ -45,8 +45,10 @@ namespace graphics {
 constexpr uint32_t kMaxVertexAttributes = 16;
 constexpr uint32_t kMaxVaryings = 16;           // values passed from the vertex to the fragment shader
 constexpr uint32_t kMaxVertexBuffers = 8;       // vertex buffers (input slots) bound at once
-// The most a command buffer may carry as shader constants; what a device really takes is DeviceInfo::max_push_constant_bytes (most take 128: eight vec4s).
-constexpr uint32_t kMaxPushConstantBytes = 4096;
+// The most a command buffer may carry as shader constants; what a device really takes is DeviceInfo::max_push_constant_bytes (most take 128: eight vec4s). 960 vec4s:
+// with the rows the device fills after them (kSamplerCompareRegister .. kRasterizerRegister) a shader's constants stay under 1024 vec4s, what every GL 4 host
+// that virgl draws on takes (NVIDIA's limit; a shader past it loses the context). Direct3D 11's constant buffers of a draw go into one block of this size.
+constexpr uint32_t kMaxPushConstantBytes = 960 * 16;
 // A device that takes larger constant blocks says so in DeviceLimits::shader_constant_bytes (at most this); its command buffers take push_constants of that size.
 constexpr uint32_t kMaxShaderConstantBytes = 16384;
 constexpr uint32_t kMaxTextureUnits = 16;
@@ -1534,6 +1536,8 @@ class IGraphicsDevice {
   // with those after. Devices without kFeatureTimestampQueries ignore it.
   virtual void interrupt_clock() {}
   virtual bool submit(ICommandBuffer* commands) = 0;
+  // Where in the device's own code the last submit that failed gave up (a source line, for the log of a lost context; 0: not known).
+  virtual uint32_t last_submit_failure() const { return 0; }
   // Shows `image` (created with kImagePresent) on the screen.
   virtual bool present(IImage* image) = 0;
 

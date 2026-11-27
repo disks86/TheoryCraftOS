@@ -23,6 +23,8 @@
 
 namespace graphics {
 
+static_assert(tgsi::CompileOptions().constant_rows == kDeviceConstantRegisters, "the TGSI translator's default constant buffer has the device's rows");
+
 // ---- shader modules -------------------------------------------------------------------------------------------------------------------------------
 bool VenusShaderModule::create() {
   if (!desc_.tgsi) return false;

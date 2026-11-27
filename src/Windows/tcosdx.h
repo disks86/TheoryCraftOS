@@ -22,6 +22,10 @@
 #ifndef TCOS_TCOSDX_H
 #define TCOS_TCOSDX_H
 
+/* The largest shader the kernel-mode driver takes (dxgk kMaxShaderBytes in src/Kernel/Dxgkrnl/Adapter.cpp): what CreateVertexShader & co. and the pipelines
+ * of Direct3D 12 refuse above. */
+#define TCOS_MAX_SHADER_BYTES (256u * 1024u)
+
 #include <windows.h>
 #include <dxgi.h>
 #include "tcos_object.h"      /* (IID_ITcosObject: is an object this family's own - read it before using any of the below on an object a program gave) */

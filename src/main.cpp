@@ -990,9 +990,36 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
     console::put_dec(static_cast<int64_t>(commands_before));
     console::puts(" commands, status ");
     console::put_hex(status);
+    if (line >= 1000000) {      // (dxgk's kDeviceLineBase: the device's own reason - IGraphicsDevice::last_submit_failure, a line of its source)
+      console::puts(" (the device's submit failed at its line ");
+      console::put_dec(static_cast<int64_t>(line - 1000000));
+    } else {
+      console::puts(" (Adapter.cpp line ");
+      console::put_dec(static_cast<int64_t>(line));
+    }
+    console::puts(")\n");
+  });
+  // (and a pipeline it refuses: the program gets an error code, the log says which check)
+  dxgk::set_pipeline_trace([](uint32_t status, uint32_t line) {
+    console::puts("direct3d pipeline refused: status ");
+    console::put_hex(status);
     console::puts(" (Adapter.cpp line ");
     console::put_dec(static_cast<int64_t>(line));
     console::puts(")\n");
+  });
+  // (and the first few draws left out for a texture of another kind than the shader declares)
+  dxgk::set_texture_kind_trace([](uint32_t unit, uint32_t declared, uint32_t bound, uint32_t layers) {
+    static uint32_t said = 0;
+    if (__atomic_fetch_add(&said, 1, __ATOMIC_RELAXED) >= 8) return;
+    console::puts("direct3d draw left out: unit ");
+    console::put_dec(static_cast<int64_t>(unit));
+    console::puts(" declared kind ");
+    console::put_dec(static_cast<int64_t>(declared));
+    console::puts(", bound kind ");
+    console::put_dec(static_cast<int64_t>(bound));
+    console::puts(" of ");
+    console::put_dec(static_cast<int64_t>(layers));
+    console::puts(" layers\n");
   });
   process::win32k::install_dxg();      // (the NtGdiDdDDI* services of win32u.dll reach the kernel-mode Direct3D driver)
   // The system's fonts for DirectWrite (dwrite.dll reaches them with NtTcosFont); lives as long as the system does.

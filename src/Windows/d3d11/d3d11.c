@@ -78,12 +78,11 @@
 __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 
 #define OBJ(x) ((DxObj *)(x))
-#define TEXTURE_SLOTS 8u              /* s0 .. s7, and the shader resources of a draw whose shaders declare none above t7 (the narrow table) */
-#define SAMPLER_SLOTS 16u             /* s0 .. s15 a stage binds (D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT): kept and given back; the kernel's table has s0 .. s7, and a shader that
-                                       * declares one above s7 is not drawn (Shader.sampler_beyond) */
+#define TEXTURE_SLOTS 8u              /* the shader resources of a draw whose shaders declare none above t7 (the narrow table) */
+#define SAMPLER_SLOTS 16u             /* s0 .. s15 a stage binds (D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT): the draws' table of samplers has them all */
 #define SRV_SLOTS 128u                /* t0 .. t127 (D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT): the wide table, for shaders that declare one above t7 */
 #define CONSTANT_SLOTS 14u            /* b0 .. b13 a stage */
-#define CONSTANT_BLOCK 4096u          /* the bytes of constants a draw has in all (the kernel's limit) */
+#define CONSTANT_BLOCK (960u * 16u)   /* the bytes of constants a draw has in all (the kernel's limit: graphics::kMaxPushConstantBytes) */
 #define RING_BYTES (1u << 20)         /* the upload memory the constant blocks of one command list go into */
 #define VIEW_HEAP 4096u               /* descriptors of the heap the textures of the draws go into */
 #define RETIRED_MAX 256u              /* upload buffers a list being recorded may still read after the program has moved on from them */
@@ -253,7 +252,6 @@ typedef struct Shader {
   UINT64 uav_mask;                        /* the u<n> it declares */
   BOOL rov;                               /* one of them is a rasterizer ordered view (the dcl_uav_* token's D3D11_SB_RASTERIZER_ORDERED_ACCESS) */
   BOOL uav_beyond;                        /* it declares one past u63 */
-  BOOL sampler_beyond;                    /* it declares a sampler above s7, which the kernel's table has not */
   UINT group[3];                          /* a compute shader's threads in a group (dcl_thread_group) */
   UINT gs_instances;                      /* a geometry shader's instances (dcl_gs_instance_count; 0: one) */
   UINT program_type;                      /* the shader's stage by its version token (D3D10_SB_TOKENIZED_PROGRAM_TYPE: 0 pixel, 1 vertex, 2 geometry, 3 hull, 4 domain, 5 compute) */
@@ -439,7 +437,7 @@ struct Dev {
   UINT ring_used, ring_last, ring_last_bytes;
   UINT view_used, sampler_used;            /* descriptors of the two heaps the list's draws have taken */
   UINT64 table_views, table_samplers;      /* the GPU handles of the tables the last draw used ... */
-  UINT table_view_ids[SRV_SLOTS], table_sampler_ids[TEXTURE_SLOTS];      /* ... and what was in them */
+  UINT table_view_ids[SRV_SLOTS], table_sampler_ids[SAMPLER_SLOTS];      /* ... and what was in them */
   UINT table_view_count;                   /* ... and how many views the view table has (TEXTURE_SLOTS, or SRV_SLOTS for the wide root signature) */
   int tables_valid;
   Tex *blank;                              /* a white pixel: what a texture slot with nothing bound samples */
@@ -2384,12 +2382,6 @@ static void shader_constants(Shader *s) {
           }
         }
       }
-      if (op == 90 /* dcl_sampler: the operand, then its register */ && length >= 3) {
-        UINT operand, slot;
-        memcpy(&operand, code + 4 * (w + 1), 4);
-        const UINT k = w + ((operand >> 31) ? 3 : 2);
-        if (k < w + length && ((operand >> 20) & 3) == 1) { memcpy(&slot, code + 4 * k, 4); if (slot >= TEXTURE_SLOTS) s->sampler_beyond = TRUE; }
-      }
       if (op == 155 /* dcl_thread_group x, y, z */ && length >= 4) for (UINT k = 0; k < 3; ++k) memcpy(&s->group[k], code + 4 * (w + 1 + k), 4);
       if (op == 206 /* dcl_gs_instance_count n */ && length >= 2) memcpy(&s->gs_instances, code + 4 * (w + 1), 4);
       if (op == 92 /* dcl_output_topology: the topology in the token (1 points, 2 lines, 3 line strip, 4 triangles, 5 triangle strip) */) {
@@ -2415,7 +2407,7 @@ static void shader_constants(Shader *s) {
 
 static HRESULT shader_make(Dev *d, const void *code, SIZE_T bytes, const void *vtbl, const GUID *const *iids, ID3D11ClassLinkage *linkage, void **out) {
   if (out) *out = NULL;
-  if (!code || bytes < 32 || bytes > 60000) return E_INVALIDARG;
+  if (!code || bytes < 32 || bytes > TCOS_MAX_SHADER_BYTES) return E_INVALIDARG;
   Shader *s = child_new(sizeof *s, d, vtbl, iids, shader_destroy);
   if (!s) return E_OUTOFMEMORY;
   s->code = mem_alloc(bytes);

@@ -185,7 +185,10 @@ void load_core(void* argument) {
 // here too, whether a debugger listens or not: the libraries' own traces come this way (kernel32's TCOS_TRACE_MISSING_PROCS).
 void trace_debug_text(process::Process& process, const process::SyscallRequest& request) {
   uint64_t code = 0, address = 0;
-  if (!process.read_user_u64(request.args[0], &code) || (code & 0xFFFFFFFFu) != 0x40010006u || !process.read_user_u64(request.args[0] + 0x28, &address)) return;
+  // (a 32-bit program's record has the 32-bit layout - its 32-bit ntdll passes it as it is -: the text's address is the second parameter, at 0x18)
+  const bool wow = process.address_space() && process.address_space()->is_32bit();
+  if (!process.read_user_u64(request.args[0], &code) || (code & 0xFFFFFFFFu) != 0x40010006u || !process.read_user_u64(request.args[0] + (wow ? 0x18 : 0x28), &address)) return;
+  if (wow) address &= 0xFFFFFFFFu;
   char text[200];
   uint32_t length = 0;
   while (length + 1 < sizeof(text)) {

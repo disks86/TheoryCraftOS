@@ -23,6 +23,7 @@
 #include <new>
 #include "Graphics/Graphics3D/Virgl/VirglProtocol.hpp"
 #include "Kernel/Delay.hpp"
+#include "console.hpp"
 #include "Kernel/Interrupts.hpp"
 #include "Kernel/Thread.hpp"
 #include "Graphics/Graphics3D/Virgl/VirglVertexPatch.hpp"
@@ -148,7 +149,7 @@ uint32_t query_targets(QueryKind kind, uint32_t stream) {
     default: return 0;
   }
 }
-constexpr uint32_t kQueryPolls = 5000;   // how many empty commands to wait for the host's query results with
+constexpr uint64_t kQueryWaitUs = 2000000;   // how long to wait for the host's query results (Windows' GPU timeout, TdrDelay: 2 s - a heavy frame takes far more than a few polls)
 
 // --- Objects -------------------------------------------------------------------
 
@@ -389,6 +390,7 @@ class VirglImage final : public IImage {
     if (view_) device_.destroy_object(view_);
     if (stencil_view_) device_.destroy_object(stencil_view_);
     if (stand_in_) destroy(gpu.allocator(), stand_in_);
+    if (scanout_copy_) destroy(gpu.allocator(), scanout_copy_);
     if (fetch_view_) device_.destroy_object(fetch_view_);
     for (const LayerSurface& s : surfaces_.view())
       if (s.handle) device_.destroy_object(s.handle);
@@ -492,6 +494,23 @@ class VirglImage final : public IImage {
   // only drawn into and shown) would leave its rows the other way round too. Such a pass draws into this upright stand-in for the colour target instead, which is filled from the
   // target first (unless the pass clears it) and copied into it after the pass; the host's blits turn the rows over between the two kinds of image. Made on first use, kept
   // with the image; null if the host will not make it.
+  // An image that is shown and sampled too (a swap chain's buffer a program also reads) is kept the way textures are; present() shows it through this copy of it,
+  // which is kept the way shown images are (the host turns the rows over in the blit). Made on first use; nullptr if the host refuses it.
+  bool shown_through_copy() const { return shown_through_copy_; }
+  void set_shown_through_copy() { shown_through_copy_ = true; }
+  VirglImage* scanout_copy() {
+    if (scanout_copy_) return scanout_copy_;
+    ImageDesc d = desc_;
+    d.usage = kImageColorAttachment | kImagePresent;
+    d.mip_levels = 1;
+    VirglImage* made = make<VirglImage>(device_.gpu().allocator(), device_, d);
+    if (made && !made->valid()) {
+      destroy(device_.gpu().allocator(), made);
+      made = nullptr;
+    }
+    scanout_copy_ = made;
+    return scanout_copy_;
+  }
   VirglImage* stand_in() {
     if (stand_in_) return stand_in_;
     ImageDesc d = desc_;
@@ -846,6 +865,8 @@ class VirglImage final : public IImage {
   uint32_t id_ = 0, surface_ = 0, view_ = 0, color_format_ = 0;
   uint32_t stencil_view_ = 0;          // a depth buffer read as a texture: the view of its stencil plane
   VirglImage* stand_in_ = nullptr;     // (stand_in)
+  VirglImage* scanout_copy_ = nullptr;  // (scanout_copy)
+  bool shown_through_copy_ = false;
   uint32_t fetch_view_ = 0;   // (fetch_view)
   uint64_t accounted_ = 0;   // what the GPU's video memory figure counts for this image
   ByteView backing_;
@@ -1813,32 +1834,52 @@ uint32_t VirglDevice::max_image_dimension() const {
   return host < 4096 ? 4096 : host > 16384 ? 16384 : host;
 }
 
+// An image the device does not make: the first few go to the log (format, kind, usage and the line), so a program's missing images can be told apart.
+IImage* VirglDevice::image_refused(const ImageDesc& desc, uint32_t line) {
+  if (__atomic_fetch_add(&images_refused_said_, 1, __ATOMIC_RELAXED) < 8) {
+    console::puts("virgl: an image not made: format ");
+    console::put_dec(static_cast<int64_t>(desc.format));
+    console::puts(", kind ");
+    console::put_dec(static_cast<int64_t>(desc.kind));
+    console::puts(", usage ");
+    console::put_hex(desc.usage);
+    console::puts(", ");
+    console::put_dec(static_cast<int64_t>(desc.extent.width));
+    console::puts("x");
+    console::put_dec(static_cast<int64_t>(desc.extent.height));
+    console::puts(" (VirglDevice.cpp line ");
+    console::put_dec(static_cast<int64_t>(line));
+    console::puts(")\n");
+  }
+  return nullptr;
+}
+
 IImage* VirglDevice::create_image(const ImageDesc& desc) {
-  if (desc.extent.width > max_image_dimension() || desc.extent.height > max_image_dimension()) return nullptr;
+  if (desc.extent.width > max_image_dimension() || desc.extent.height > max_image_dimension()) return image_refused(desc, __LINE__);
   // (a format numbered from 64: what format_caps says of it)
   const bool extra = static_cast<uint32_t>(desc.format) >= static_cast<uint32_t>(Format::R8Unorm);
   if (extra) {
     const uint32_t caps = format_caps(desc.format);
     if (!(caps & kFormatSampled) || ((desc.usage & kImageColorAttachment) && !(caps & kFormatRenderTarget)) || ((desc.usage & kImageStorage) && !(caps & kFormatStorage)) ||
         (desc.mip_levels > 1 && !(caps & kFormatMipmaps)) || desc.samples != 1)
-      return nullptr;
+      return image_refused(desc, __LINE__);
   }
   // (mipmaps: a plain texture of 8-bit colour that is only sampled, as the kernel's own; with kFeature2MipmappedLayers any image of one sample - arrays, volumes, cubes, cube arrays,
   // targets, depth buffers, storage images, the wide formats -; its levels are written one by one)
-  if (desc.mip_levels == 0 || desc.mip_levels > mip_level_limit(desc.extent)) return nullptr;
+  if (desc.mip_levels == 0 || desc.mip_levels > mip_level_limit(desc.extent)) return image_refused(desc, __LINE__);
   const bool all_levels = (info().features2 & kFeature2MipmappedLayers) != 0;
   const uint32_t layers = image_layer_count(desc.kind, desc.layers);
   const bool cube = desc.kind == TextureKind::TextureCube || desc.kind == TextureKind::TextureCubeArray;
-  if (desc.kind == TextureKind::Texture2DMS || (desc.kind == TextureKind::TextureCubeArray && (!all_levels || layers % 6 != 0))) return nullptr;
+  if (desc.kind == TextureKind::Texture2DMS || (desc.kind == TextureKind::TextureCubeArray && (!all_levels || layers % 6 != 0))) return image_refused(desc, __LINE__);
   if (is_compressed_format(desc.format)) {
     // (block-compressed: sampled only, of any kind, plain textures with levels - and the others too with kFeature2MipmappedLayers; filled with write_compressed)
     if (desc.usage != kImageSampled || desc.samples != 1 || layers == 0 || layers > kMaxTextureLayers || (desc.kind != TextureKind::Texture2D && desc.mip_levels != 1 && !all_levels) ||
         (desc.kind == TextureKind::Texture2D && desc.layers != 1) || (cube && desc.extent.width != desc.extent.height))
-      return nullptr;
+      return image_refused(desc, __LINE__);
     VirglImage* image = make<VirglImage>(gpu_.allocator(), *this, desc);
     if (image && !image->valid()) {
       destroy(gpu_.allocator(), image);
-      return nullptr;
+      return image_refused(desc, __LINE__);
     }
     return image;
   }
@@ -1846,11 +1887,11 @@ IImage* VirglDevice::create_image(const ImageDesc& desc) {
   // row 0 first)
   if ((desc.usage & kImageStorage) && (!(desc.usage & kImageSampled) || desc.samples != 1 || (cube && !all_levels) || desc.format == Format::D32Float || is_srgb_format(desc.format) ||
                                        !(info().features2 & kFeature2StorageImages)))
-    return nullptr;
+    return image_refused(desc, __LINE__);
   if (desc.mip_levels != 1 && !all_levels && ((desc.usage & ~kImageStorage) != kImageSampled || desc.kind != TextureKind::Texture2D || desc.samples != 1 || desc.layers != 1 ||
                                                (desc.format != Format::B8G8R8A8Unorm && desc.format != Format::B8G8R8A8Srgb && desc.format != Format::R8G8B8A8Unorm && desc.format != Format::R8G8B8A8Srgb && !is_packed32_format(desc.format))))
-    return nullptr;
-  if (desc.mip_levels != 1 && (desc.samples != 1 || (desc.usage & kImagePresent))) return nullptr;
+    return image_refused(desc, __LINE__);
+  if (desc.mip_levels != 1 && (desc.samples != 1 || (desc.usage & kImagePresent))) return image_refused(desc, __LINE__);
   const bool multisampled = desc.samples != 1;
   if (multisampled) {
     // (a multisampled image is an 8-bit colour image or a depth attachment, which a shader may read with texel fetches (kFeature3MultisampleLoads / MultisampleDepthLoads), resolved; a
@@ -1860,7 +1901,7 @@ IImage* VirglDevice::create_image(const ImageDesc& desc) {
         (depth ? (desc.usage & ~kImageSampled) != kImageDepthAttachment : (desc.usage & ~kImageSampled) != kImageColorAttachment) || (!depth && desc.format != Format::B8G8R8A8Unorm && desc.format != Format::R8G8B8A8Unorm) ||
         desc.layers == 0 || desc.layers > kMaxTextureLayers || (desc.kind == TextureKind::Texture2D && desc.layers != 1) ||
         (desc.kind == TextureKind::Texture2DArray && !(info().features3 & kFeature3MultisampleArrays)))
-      return nullptr;
+      return image_refused(desc, __LINE__);
   }
   if (multisampled) {
     // (checked above)
@@ -1869,26 +1910,37 @@ IImage* VirglDevice::create_image(const ImageDesc& desc) {
     // staged as such: write_subresource_float), one level or with kFeature2MipmappedLayers several; or a depth buffer of layers, an array, a cube or a cube array - maybe sampled too)
     const bool depth_layers = desc.format == Format::D32Float && (desc.usage & ~kImageSampled) == kImageDepthAttachment && desc.kind != TextureKind::Texture3D;
     const bool colour = (desc.usage & kImageSampled) && !(desc.usage & ~(kImageSampled | kImageColorAttachment | kImageStorage)) &&
-                        (desc.format == Format::B8G8R8A8Unorm || desc.format == Format::R8G8B8A8Unorm || is_wide_format(desc.format) || is_packed32_format(desc.format));
-    if ((!colour && !depth_layers) || layers == 0 || layers > kMaxTextureLayers || (desc.mip_levels != 1 && !all_levels) || (cube && desc.extent.width != desc.extent.height)) return nullptr;
-    if ((depth_layers || (desc.usage & kImageColorAttachment)) && !(info().features2 & kFeature2LayeredTargets)) return nullptr;
+                        (desc.format == Format::B8G8R8A8Unorm || desc.format == Format::R8G8B8A8Unorm || desc.format == Format::B8G8R8A8Srgb || desc.format == Format::R8G8B8A8Srgb ||
+                         is_wide_format(desc.format) || is_packed32_format(desc.format));
+    if ((!colour && !depth_layers) || layers == 0 || layers > kMaxTextureLayers || (desc.mip_levels != 1 && !all_levels) || (cube && desc.extent.width != desc.extent.height)) return image_refused(desc, __LINE__);
+    if ((depth_layers || (desc.usage & kImageColorAttachment)) && !(info().features2 & kFeature2LayeredTargets)) return image_refused(desc, __LINE__);
   } else if (desc.layers != 1) {
-    return nullptr;
+    return image_refused(desc, __LINE__);
   }
   // A texture is not shown: the two kinds of image are stored in opposite row order (see VirglImage). A depth buffer that is read as a texture is kept the way textures are, and
   // a pass that draws into it with a colour target kept the other way draws into a stand-in for the target (VirglImage::stand_in). (Such a depth buffer has one level, or any with
   // kFeature2MipmappedLayers: its sampler views show the levels as a colour texture's do.)
-  if ((desc.usage & kImageSampled) && (desc.usage & kImagePresent)) return nullptr;
+  // (shown and sampled: made as a texture - see VirglImage::scanout_copy -, an 8-bit 2D image of one level; present() shows its copy)
+  if ((desc.usage & kImageSampled) && (desc.usage & kImagePresent)) {
+    if (desc.kind != TextureKind::Texture2D || desc.samples > 1 || (desc.format != Format::B8G8R8A8Unorm && desc.format != Format::R8G8B8A8Unorm && desc.format != Format::B8G8R8A8Srgb &&
+                                                                  desc.format != Format::R8G8B8A8Srgb))
+      return image_refused(desc, __LINE__);
+    ImageDesc sampled = desc;
+    sampled.usage &= ~kImagePresent;
+    VirglImage* made = static_cast<VirglImage*>(create_image(sampled));
+    if (made) made->set_shown_through_copy();
+    return made;
+  }
   if ((desc.usage & kImageSampled) && (desc.usage & kImageDepthAttachment) &&
       (desc.format != Format::D32Float || (desc.mip_levels != 1 && !all_levels) || (desc.usage & ~(kImageSampled | kImageDepthAttachment))))
-    return nullptr;
-  if ((desc.usage & kImageSampled) && desc.format != Format::D32Float && desc.format != Format::B8G8R8A8Unorm && desc.format != Format::B8G8R8A8Srgb && desc.format != Format::R8G8B8A8Unorm && desc.format != Format::R8G8B8A8Srgb && !is_wide_format(desc.format) && !is_packed32_format(desc.format)) return nullptr;
-  if (!desc.extent.width || !desc.extent.height || desc.format == Format::Undefined) return nullptr;
-  if (desc.stencil && desc.format != Format::D32Float) return nullptr;
+    return image_refused(desc, __LINE__);
+  if ((desc.usage & kImageSampled) && desc.format != Format::D32Float && desc.format != Format::B8G8R8A8Unorm && desc.format != Format::B8G8R8A8Srgb && desc.format != Format::R8G8B8A8Unorm && desc.format != Format::R8G8B8A8Srgb && !is_wide_format(desc.format) && !is_packed32_format(desc.format)) return image_refused(desc, __LINE__);
+  if (!desc.extent.width || !desc.extent.height || desc.format == Format::Undefined) return image_refused(desc, __LINE__);
+  if (desc.stencil && desc.format != Format::D32Float) return image_refused(desc, __LINE__);
   VirglImage* image = make<VirglImage>(gpu_.allocator(), *this, desc);
   if (image && !image->valid()) {
     destroy(gpu_.allocator(), image);
-    return nullptr;
+    return image_refused(desc, __LINE__);
   }
   return image;
 }
@@ -1944,7 +1996,7 @@ void VirglDevice::destroy_command_buffer(ICommandBuffer* commands) {
 }
 
 bool VirglDevice::submit(ICommandBuffer* commands) {
-  if (!commands) return false;
+  if (!commands) return submit_failed(__LINE__);
   // One submit at a time: the host's context has one set of bound state (framebuffer, shaders, objects, sampler views, constants), and a submit is sent in parts when its
   // stream fills - another thread's commands between two parts would leave the rest of this one drawing with that thread's state. (A caller with interrupts masked does
   // not block - see VirtioGpu::lock_for_command -: it tries for a while and gives up.)
@@ -1962,10 +2014,10 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
     }
     ~SubmitLock() { if (held) mutex.unlock(); }
   } submit_lock(submit_lock_);
-  if (!submit_lock.held) return false;
+  if (!submit_lock.held) return submit_failed(__LINE__);
   CommandRecorder& recorder = *static_cast<CommandRecorder*>(commands);
   Stream stream(gpu_.allocator());
-  if (!stream.valid()) return false;
+  if (!stream.valid()) return submit_failed(__LINE__);
 
   // Queries: the host's query objects, each with a buffer of its own for its result (16 bytes: state, size, the count) that the host fills in when asked for it after the commands
   // have run (the host takes no offset into a shared buffer: two queries on one buffer overwrite each other). Ours may be any number open at once, of one kind or several and nested,
@@ -1987,6 +2039,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
   struct HostQuery {
     VirglBuffer* result = nullptr;
     uint32_t object = 0;
+    bool statistic = false;   // (a pipeline statistics counter: see host_statistics_stall_)
   };
   struct Queries {
     explicit Queries(VirglDevice& d) : device(d), host(d.gpu().allocator()), segments(d.gpu().allocator()), users(d.gpu().allocator()) {}
@@ -2023,6 +2076,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
     }
     HostQuery& made = queries.host[queries.host.count() - 1];
     made.object = new_handle();
+    made.statistic = (type & 0xFFFFu) == (virgl::kQueryPipelineStatistics & 0xFFFFu);
     stream.command(virgl::kCreateObject, virgl::kObjectQuery, 4);
     stream.put(made.object);
     stream.put(type);
@@ -2039,7 +2093,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
   auto begin_segment = [&](uint32_t target) {
     if (!target_runs(target)) return true;   // (counted from when it runs: while a transform feedback is alive)
     const int64_t h = host_query(host_query_type(target), false);
-    if (h < 0 || !queries.segments.push_back({target, static_cast<uint32_t>(h)})) return false;
+    if (h < 0 || !queries.segments.push_back({target, static_cast<uint32_t>(h)})) return submit_failed(__LINE__);
     queries.active[target] = static_cast<int64_t>(queries.segments.count() - 1);
     return true;
   };
@@ -2051,7 +2105,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
   };
   // Begins query `slot` of ours (false if it cannot be: a slot begun twice, no memory).
   auto begin_user = [&](uint32_t slot, QueryKind kind, uint32_t output_stream) {
-    if (slot >= kQuerySlots || queries.slot_user[slot] >= 0) return false;
+    if (slot >= kQuerySlots || queries.slot_user[slot] >= 0) return submit_failed(__LINE__);
     UserQuery u;
     u.open = true;
     u.kind = kind;
@@ -2066,31 +2120,31 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
     for (uint32_t t = 0; t < kQueryTargets; ++t) {
       if (!(u.targets >> t & 1)) continue;
       end_segment(t);   // (the others that need it go on in the next segment)
-      if (!begin_segment(t)) return false;
+      if (!begin_segment(t)) return submit_failed(__LINE__);
       u.first[t] = queries.active[t] >= 0 ? static_cast<uint64_t>(queries.active[t]) : queries.segments.count();
       ++queries.open_users[t];
     }
-    if (!queries.users.push_back(u)) return false;
+    if (!queries.users.push_back(u)) return submit_failed(__LINE__);
     queries.slot_user[slot] = static_cast<int32_t>(queries.users.count() - 1);
     ++queries.open_count;
     return true;
   };
   auto end_user = [&](uint32_t slot) {
-    if (slot >= kQuerySlots || queries.slot_user[slot] < 0) return false;
+    if (slot >= kQuerySlots || queries.slot_user[slot] < 0) return submit_failed(__LINE__);
     UserQuery& u = queries.users[static_cast<uint64_t>(queries.slot_user[slot])];
-    if (!u.open) return false;
+    if (!u.open) return submit_failed(__LINE__);
     u.open = false;
     --queries.open_count;
     if (u.kind == QueryKind::Timestamp) {
       const int64_t h = host_query(virgl::kQueryTimestamp, true);
-      if (h < 0) return false;
+      if (h < 0) return submit_failed(__LINE__);
       u.timestamp = static_cast<uint32_t>(h);
     }
     for (uint32_t t = 0; t < kQueryTargets; ++t) {
       if (!(u.targets >> t & 1)) continue;
       u.end[t] = queries.active[t] >= 0 ? static_cast<uint64_t>(queries.active[t]) + 1 : queries.segments.count();
       end_segment(t);
-      if (--queries.open_users[t] && !begin_segment(t)) return false;
+      if (--queries.open_users[t] && !begin_segment(t)) return submit_failed(__LINE__);
     }
     return true;
   };
@@ -2110,7 +2164,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
   };
   auto resume_queries = [&]() {
     for (uint32_t t = 0; t < kQueryTargets; ++t)
-      if (queries.open_users[t] && queries.active[t] < 0 && !begin_segment(t)) return false;
+      if (queries.open_users[t] && queries.active[t] < 0 && !begin_segment(t)) return submit_failed(__LINE__);
     return true;
   };
 
@@ -2136,7 +2190,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
       if (pass_level[n] < v.base_level || pass_level[n] >= v.base_level + v.level_count) continue;
       if (textures[unit]->kind() == TextureKind::Texture3D || (pass_first[n] < v.first_layer + v.layer_count && v.first_layer < pass_first[n] + pass_count[n])) return true;
     }
-    return false;
+    return submit_failed(__LINE__);
   };
   // The storage images bound (bind_storage_image), the typed views of buffers (bind_storage_texel_buffer: of the u# slots and of the t# ones), and the host's shaders bound for each
   // stage (virgl::kShader*: the variants of modules that have images).
@@ -2259,7 +2313,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
   };
 
   auto flush = [&]() {
-    if (stream.count() && !send_commands(stream.data(), stream.count())) return false;
+    if (stream.count() && !send_commands(stream.data(), stream.count())) return submit_failed(__LINE__);
     if (stream.count()) {
       const uint64_t work = gpu_.work_sent();   // (this part's number, or a later one if another thread sent meanwhile: later is safe)
       for (uint32_t k = 0; k < used_count; ++k) used[k]->note_use(work);
@@ -2301,7 +2355,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         key.texel_count[k] = t.view.elements;
       }
       const uint32_t shader = m->variant(*this, key);
-      if (!shader) return false;
+      if (!shader) return submit_failed(__LINE__);
       if (shader != bound_shader[stage]) {
         stream.command(virgl::kBindShader, 0, 2);
         stream.put(shader);
@@ -2351,7 +2405,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         if (!t.host_view) {
           if (made_views.count == sizeof made_views.handles / sizeof made_views.handles[0]) {
             // (out of room: what was recorded goes out, the views go, and those still bound are made again as they are needed)
-            if (!flush()) return false;
+            if (!flush()) return submit_failed(__LINE__);
             made_views.destroy_all();
             for (TexelBinding& other : texels) other.host_view = 0;
           }
@@ -2359,14 +2413,14 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           const uint32_t view = new_handle();
           const uint32_t create[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSamplerView, 6), view, t.buffer->id(), texel_virgl_format(t.view.format) /* | PIPE_BUFFER << 24 */, 0, last,
                                      virgl::kSwizzleRgba};
-          if (!send_commands(create, 7)) return false;
+          if (!send_commands(create, 7)) return submit_failed(__LINE__);
           made_views.handles[made_views.count++] = view;
           t.host_view = view;
         }
         handles[k] = t.host_view;
       }
       const uint32_t state = sampler_state(SamplerDesc());
-      if (!state) return false;
+      if (!state) return submit_failed(__LINE__);
       stream.command(virgl::kSetSamplerViews, 0, 2 + b.texel_count);
       stream.put(stage);
       stream.put(kTgsiTexelViewBase);
@@ -2421,7 +2475,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         uint64_t offset = so_slot[k].offset, room = limit > offset ? limit - offset : 0;
         if (room < 4) {
           const uint64_t record = uint64_t{pd.stream_output_stride[k]} * vertices;
-          if (record <= 4 || limit < 4) return false;
+          if (record <= 4 || limit < 4) return submit_failed(__LINE__);
           offset = limit - 4, room = 4;
         }
         so_handles[k] = new_handle();
@@ -2431,21 +2485,21 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
       // The primitives a stream wrote, for each stream the declaration takes buffers from.
       for (uint32_t b = 0; b < kMaxStreamOutputBuffers; ++b) {
         if (!so_slot[b].buffer || !(pipeline->stream_output_buffers() >> b & 1)) continue;
-        if (fill_count >= kFillQueries) return false;
+        if (fill_count >= kFillQueries) return submit_failed(__LINE__);
         Fill& fill = fills[fill_count++];
         fill = {so_slot[b].buffer, so_slot[b].offset, pd.stream_output_stride[b], vertices, 0};
         const uint32_t output_stream = pipeline->stream_of_buffer(b);
         if (!so_query_slot[output_stream]) {
-          if (internal_queries >= kFillQueries) return false;
+          if (internal_queries >= kFillQueries) return submit_failed(__LINE__);
           const uint32_t slot = kMaxOcclusionQueries + internal_queries++;
-          if (!begin_user(slot, QueryKind::SoPrimitivesWritten, output_stream)) return false;
+          if (!begin_user(slot, QueryKind::SoPrimitivesWritten, output_stream)) return submit_failed(__LINE__);
           so_query_slot[output_stream] = slot;
         }
         fill.query = so_query_slot[output_stream];
       }
       for (uint32_t k = 0; k < 5; ++k) so_program[k] = program[k];
       so_alive = true;
-      if (!resume_queries()) return false;   // (the stream output targets' segments of the queries open: they count from here)
+      if (!resume_queries()) return submit_failed(__LINE__);   // (the stream output targets' segments of the queries open: they count from here)
     }
     if (!so_set) {
       stream.command(virgl::kSetStreamoutTargets, 0, 5);
@@ -2494,34 +2548,34 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
     const RecordedCommand& cmd = recorder.commands()[i];
     switch (cmd.type) {
       case RecordedCommand::Type::BeginRenderPass: {
-        if (in_pass || !cmd.pass.color) return false;
+        if (in_pass || !cmd.pass.color) return submit_failed(__LINE__);
         color = static_cast<VirglImage*>(cmd.pass.color);
         depth = static_cast<VirglImage*>(cmd.pass.depth);
         if (color->samples() != pass_samples) sampler_constants_dirty = true;   // (the samples a text reads with the comparisons)
         pass_samples = color->samples();
-        if (!color->surface() || color->format() == Format::D32Float) return false;
-        if (depth && (depth->format() != Format::D32Float || !depth->surface())) return false;
+        if (!color->surface() || color->format() == Format::D32Float) return submit_failed(__LINE__);
+        if (depth && (depth->format() != Format::D32Float || !depth->surface())) return submit_failed(__LINE__);
         // (the pass is the size of the targets' levels: all of one size)
-        if (cmd.pass.level[0] >= color->mip_levels() || (depth && cmd.pass.level[kMaxColorTargets] >= depth->mip_levels())) return false;
+        if (cmd.pass.level[0] >= color->mip_levels() || (depth && cmd.pass.level[kMaxColorTargets] >= depth->mip_levels())) return submit_failed(__LINE__);
         const Extent2D e = {mip_extent(color->extent().width, cmd.pass.level[0]), mip_extent(color->extent().height, cmd.pass.level[0])};
         auto sized = [&](const VirglImage* image, uint32_t level) { return level < image->mip_levels() && mip_extent(image->extent().width, level) == e.width && mip_extent(image->extent().height, level) == e.height; };
         // (a depth target as large as the pass or larger - the framebuffer is the part all have, as OpenGL and Direct3D 9 have it - not a smaller one)
         auto covers = [&](const VirglImage* image, uint32_t level) { return level < image->mip_levels() && mip_extent(image->extent().width, level) >= e.width && mip_extent(image->extent().height, level) >= e.height; };
-        if (depth && !covers(depth, cmd.pass.level[kMaxColorTargets])) return false;
+        if (depth && !covers(depth, cmd.pass.level[kMaxColorTargets])) return submit_failed(__LINE__);
         target_count = 1;
         for (uint32_t n = 0; n + 1 < kMaxColorTargets; ++n) {
           extra_colors[n] = static_cast<VirglImage*>(cmd.pass.extra_colors[n]);
           if (!extra_colors[n]) {
             for (uint32_t k = n + 1; k + 1 < kMaxColorTargets; ++k)
-              if (cmd.pass.extra_colors[k]) return false;   // (a gap)
+              if (cmd.pass.extra_colors[k]) return submit_failed(__LINE__);   // (a gap)
             break;
           }
           VirglImage* extra = extra_colors[n];
           // (one set of window-space conventions for the whole framebuffer)
           if (!extra->surface() || extra->format() == Format::D32Float || extra == color || extra == depth || extra->y0_top() != color->y0_top() || !sized(extra, cmd.pass.level[n + 1]))
-            return false;
+            return submit_failed(__LINE__);
           for (uint32_t k = 0; k < n; ++k)
-            if (extra_colors[k] == extra) return false;
+            if (extra_colors[k] == extra) return submit_failed(__LINE__);
           target_count = n + 2;
         }
         for (uint32_t n = target_count - 1; n + 1 < kMaxColorTargets; ++n) extra_colors[n] = nullptr;
@@ -2531,7 +2585,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           for (uint32_t n = 0; n < target_count; ++n) {
             VirglImage*& target = n == 0 ? color : extra_colors[n - 1];
             VirglImage* stand = target->stand_in();
-            if (!stand || !stand->surface()) return false;
+            if (!stand || !stand->surface()) return submit_failed(__LINE__);
             if (!cmd.pass.clear_color) copy_image(target, stand);
             stood_for[n] = target;
             stand_ins[n] = stand;
@@ -2546,7 +2600,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           if (!image) continue;
           surfaces[n] = cmd.pass.level[n] == 0 && cmd.pass.first_layer[n] == 0 && cmd.pass.layer_count[n] == 1 ? image->surface()
                                                                                                                  : image->surface(cmd.pass.level[n], cmd.pass.first_layer[n], cmd.pass.layer_count[n]);
-          if (!surfaces[n]) return false;
+          if (!surfaces[n]) return submit_failed(__LINE__);
           pass_target[n] = image;
           pass_level[n] = cmd.pass.level[n], pass_first[n] = cmd.pass.first_layer[n], pass_count[n] = cmd.pass.layer_count[n];
         }
@@ -2603,16 +2657,16 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         const VirglImage* from = static_cast<const VirglImage*>(cmd.image2);
         if (in_pass || !to || !from || to->samples() != 1 || from->samples() < 2 || to->extent().width != from->extent().width || to->extent().height != from->extent().height ||
             cmd.first >= from->layer_count())
-          return false;
+          return submit_failed(__LINE__);
         const Extent2D e = from->extent();
         const bool depth = to->format() == Format::D32Float;
         const ResolveMode mode = static_cast<ResolveMode>(cmd.count);
-        if (cmd.first != 0 && (mode == ResolveMode::Min || mode == ResolveMode::Max)) return false;   // (the passes of texel fetches read layer 0)
+        if (cmd.first != 0 && (mode == ResolveMode::Min || mode == ResolveMode::Max)) return submit_failed(__LINE__);   // (the passes of texel fetches read layer 0)
         if (!depth && (mode == ResolveMode::Min || mode == ResolveMode::Max)) {
           // (the least or greatest samples of a colour image - kFeature2ColorResolveModes: the host's blit only averages - drawn, and the state it took set again by
           // the next pass and draw)
           unset_stream_output();
-          if (!extreme_resolve(*this, stream, *to, *const_cast<VirglImage*>(from), mode == ResolveMode::Max)) return false;
+          if (!extreme_resolve(*this, stream, *to, *const_cast<VirglImage*>(from), mode == ResolveMode::Max)) return submit_failed(__LINE__);
           pipeline = nullptr;
           textures_dirty = true;
           constants_dirty = constants_dwords != 0;
@@ -2620,7 +2674,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           break;
         }
         // (the host's blit averages colour and takes the first sample of depth: the other modes of a depth image are not made)
-        if (mode != (depth ? ResolveMode::Sample0 : ResolveMode::Average)) return false;
+        if (mode != (depth ? ResolveMode::Sample0 : ResolveMode::Average)) return submit_failed(__LINE__);
         const bool flip = !depth && to->y0_top();   // (a multisampled image does not take the flag: the host stores it the way GL does, and only a destination kept upright needs the blit to turn it over)
         pause_queries();
         stream.command(virgl::kBlit, 0, 21);
@@ -2631,12 +2685,12 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         stream.put(0), stream.put(flip ? e.height : 0), stream.put(0), stream.put(e.width), stream.put(flip ? static_cast<uint32_t>(-static_cast<int32_t>(e.height)) : e.height), stream.put(1);
         stream.put(from->id()), stream.put(0), stream.put(from->blit_format());
         stream.put(0), stream.put(0), stream.put(cmd.first), stream.put(e.width), stream.put(e.height), stream.put(1);   // (the source's layer: resolve_layer)
-        if (!resume_queries()) return false;
+        if (!resume_queries()) return submit_failed(__LINE__);
         break;
       }
       case RecordedCommand::Type::BindComputePipeline: {
         compute = static_cast<const VirglComputePipeline*>(cmd.pipeline);
-        if (in_pass || !compute) return false;
+        if (in_pass || !compute) return submit_failed(__LINE__);
         stream.command(virgl::kBindShader, 0, 2);
         stream.put(compute->shader());
         stream.put(virgl::kShaderCompute);
@@ -2647,7 +2701,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         break;
       }
       case RecordedCommand::Type::BindStreamOutput: {
-        if (cmd.unit >= kMaxStreamOutputBuffers) return false;
+        if (cmd.unit >= kMaxStreamOutputBuffers) return submit_failed(__LINE__);
         VirglBuffer* target = static_cast<VirglBuffer*>(cmd.buffer);
         const bool append = cmd.offset == kStreamOutputAppend;
         if (append && target && so_slot[cmd.unit].buffer == target && so_slot[cmd.unit].end == cmd.end) break;   // (it goes on where it is)
@@ -2655,24 +2709,24 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         if (append && target) {
           // (how far the buffer got in an earlier submit; one written in this one has no known end until the host has run it)
           for (uint32_t f = 0; f < fill_count; ++f)
-            if (fills[f].buffer == target) return false;
+            if (fills[f].buffer == target) return submit_failed(__LINE__);
           start = target->stream_output_filled();
-          if (start == kStreamOutputAppend) return false;
+          if (start == kStreamOutputAppend) return submit_failed(__LINE__);
         }
-        if (target && start > target->size()) return false;
+        if (target && start > target->size()) return submit_failed(__LINE__);
         end_stream_output();   // (the draws that follow start at this binding's beginning)
         so_slot[cmd.unit] = {target, start, cmd.end};
         use(target);
         break;
       }
       case RecordedCommand::Type::BindStorageImage: {
-        if (cmd.unit >= kMaxStorageImages) return false;
+        if (cmd.unit >= kMaxStorageImages) return submit_failed(__LINE__);
         VirglImage* image = static_cast<VirglImage*>(cmd.image);
         const StorageImageView& v = cmd.storage_view;
         if (image && (!(image->usage() & kImageStorage) || v.level >= image->mip_levels() || v.layer_count == 0 || v.first_layer >= image->level_layers(v.level) ||
                       v.layer_count > image->level_layers(v.level) - v.first_layer ||
                       !storage_view_compatible(image->format(), v.format)))
-          return false;
+          return submit_failed(__LINE__);
         images[cmd.unit] = image;
         image_views[cmd.unit] = v;
         texels[cmd.unit] = TexelBinding();
@@ -2681,7 +2735,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
       }
       case RecordedCommand::Type::BindStorageTexelBuffer: {
         // (a typed view of a buffer: a format the host has - one that can be stored for a u# slot -, a whole number of elements in the buffer)
-        if (cmd.unit >= kMaxImageSlots) return false;
+        if (cmd.unit >= kMaxImageSlots) return submit_failed(__LINE__);
         VirglBuffer* buffer = static_cast<VirglBuffer*>(cmd.buffer);
         const TexelBufferView& v = cmd.texel_view;
         if (buffer) {
@@ -2689,7 +2743,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           if (!texel_format_valid(v.format) || !texel_virgl_format(v.format) || !texel_host_buffer_format(v.format) || (cmd.unit < kMaxStorageImages && !texel_format_storable(v.format)) ||
               v.elements == 0 || v.offset % bytes ||
               v.offset > buffer->size() || uint64_t{v.elements} * bytes > buffer->size() - v.offset)
-            return false;
+            return submit_failed(__LINE__);
           use(buffer);
         }
         texels[cmd.unit] = {buffer, v, 0};
@@ -2698,13 +2752,13 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         break;
       }
       case RecordedCommand::Type::BindStorageBuffer:
-        if (cmd.unit >= kMaxStorageBuffers || !cmd.buffer) return false;   // (the bindings may change between draws)
+        if (cmd.unit >= kMaxStorageBuffers || !cmd.buffer) return submit_failed(__LINE__);   // (the bindings may change between draws)
         storage[cmd.unit] = {static_cast<VirglBuffer*>(cmd.buffer), cmd.offset, cmd.count};
         use(storage[cmd.unit].buffer);
         draw_bindings_dirty = compute_bindings_dirty = true;
         break;
       case RecordedCommand::Type::Dispatch: {
-        if (in_pass || !compute) return false;
+        if (in_pass || !compute) return submit_failed(__LINE__);
         if (compute_textures_dirty) {
           // The textures bound (a prefix of the units, up to the last one bound: the kernel has checked that those the shader reads are there), for the compute stage.
           uint32_t unit_count = 0;
@@ -2713,7 +2767,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           if (unit_count) {
             uint32_t states[kMaxTextureUnits] = {};
             for (uint32_t unit = 0; unit < unit_count; ++unit)
-              if (textures[unit] && !(states[unit] = sampler_state(unfiltered_for(samplers[unit], textures[unit])))) return false;
+              if (textures[unit] && !(states[unit] = sampler_state(unfiltered_for(samplers[unit], textures[unit])))) return submit_failed(__LINE__);
             bool depth_views = false;   // (see the draws': the host's depth texture mode is set as a view is bound)
             for (uint32_t unit = 0; unit < unit_count; ++unit) depth_views = depth_views || (textures[unit] && textures[unit]->sampled_depth());
             if (depth_views) {
@@ -2741,7 +2795,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         }
         if (compute_bindings_dirty) {
           // (the host's shader for what is bound, and the buffers, images and buffer views as the shader numbers them)
-          if (!bind_stage(virgl::kShaderCompute, compute->module())) return false;
+          if (!bind_stage(virgl::kShaderCompute, compute->module())) return submit_failed(__LINE__);
           compute_bindings_dirty = false;
         }
         stream.command(virgl::kLaunchGrid, 0, 8);
@@ -2760,14 +2814,14 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
       case RecordedCommand::Type::BeginQuery:
         if (cmd.unit >= kMaxOcclusionQueries || (cmd.count & 0xFF) > static_cast<uint32_t>(QueryKind::PipelineStatistics) ||
             !begin_user(cmd.unit, static_cast<QueryKind>(cmd.count & 0xFF), cmd.count >> 8 & 3))
-          return false;
+          return submit_failed(__LINE__);
         break;
       case RecordedCommand::Type::EndQuery:
-        if (!end_user(cmd.count ? cmd.unit : last_open_slot())) return false;
+        if (!end_user(cmd.count ? cmd.unit : last_open_slot())) return submit_failed(__LINE__);
         break;
       case RecordedCommand::Type::BindPipeline: {
         pipeline = static_cast<const VirglPipeline*>(cmd.pipeline);
-        if (!pipeline) return false;
+        if (!pipeline) return submit_failed(__LINE__);
         if (!pipeline->desc().stream_output_count) unset_stream_output();
         // (after a pipeline that blends with the second source, the next one's reset variant until it has drawn: see VirglPipeline's blend objects)
         stream.command(virgl::kBindObject, virgl::kObjectBlend, 1);
@@ -2820,7 +2874,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         break;
       }
       case RecordedCommand::Type::BindVertexBuffer:
-        if (cmd.unit >= kMaxVertexBuffers) return false;
+        if (cmd.unit >= kMaxVertexBuffers) return submit_failed(__LINE__);
         vertex_buffers[cmd.unit] = static_cast<VirglBuffer*>(cmd.buffer);
         vertex_offsets[cmd.unit] = cmd.offset;
         use(vertex_buffers[cmd.unit]);
@@ -2833,7 +2887,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         break;
       case RecordedCommand::Type::BindTexture: {
         VirglImage* image = static_cast<VirglImage*>(cmd.image);
-        if (cmd.unit >= kMaxTextureUnits || !image || !image->view()) return false;   // (only an image created with kImageSampled has a view)
+        if (cmd.unit >= kMaxTextureUnits || !image || !image->view()) return submit_failed(__LINE__);   // (only an image created with kImageSampled has a view)
         // (a view of its levels and layers and of the kind the shader declares, or the whole of it)
         TextureView range{image->kind(), 0, image->mip_levels(), 0, image->layer_count()};
         uint32_t handle = image->view(cmd.sampler.stencil);   // (of a depth buffer: its depth, or its stencil plane)
@@ -2842,7 +2896,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           if (range.level_count == 0 && range.base_level < image->mip_levels()) range.level_count = image->mip_levels() - range.base_level;
           if (range.layer_count == 0 && range.first_layer < image->layer_count()) range.layer_count = image->layer_count() - range.first_layer;
           handle = image->view(cmd.texture_view, cmd.sampler.stencil);
-          if (!handle) return false;
+          if (!handle) return submit_failed(__LINE__);
         }
         textures[cmd.unit] = image;
         texture_views[cmd.unit] = handle;
@@ -2856,7 +2910,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
       }
       case RecordedCommand::Type::PushConstants: {
         ConstByteView block;
-        if (!pool.try_subview(cmd.constants_offset, cmd.constants_size, &block)) return false;
+        if (!pool.try_subview(cmd.constants_offset, cmd.constants_size, &block)) return submit_failed(__LINE__);
         constants = block;
         constants_dwords = cmd.constants_size / 4;
         constants_dirty = true;
@@ -2870,7 +2924,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         emit_scissor();   // (the scissors past the first follow the viewports' count)
         break;
       case RecordedCommand::Type::SetViewportAt:
-        if (cmd.unit >= kMaxViewports || cmd.count == 0 || cmd.count > kMaxViewports || (cmd.count > 1 && host_viewports < kMaxViewports)) return false;
+        if (cmd.unit >= kMaxViewports || cmd.count == 0 || cmd.count > kMaxViewports || (cmd.count > 1 && host_viewports < kMaxViewports)) return submit_failed(__LINE__);
         viewports[cmd.unit] = cmd.viewport;
         viewport_count = cmd.count;
         if (cmd.unit + 1 == cmd.count) {   // (the last of them: the host gets them all at once)
@@ -2879,14 +2933,14 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         }
         break;
       case RecordedCommand::Type::SetScissor: {
-        if (!in_pass) return false;
+        if (!in_pass) return submit_failed(__LINE__);
         scissors[0] = clamped_scissor(cmd.scissor);
         scissor_count = 1;
         emit_scissor();
         break;
       }
       case RecordedCommand::Type::SetScissorAt: {
-        if (!in_pass || cmd.unit >= kMaxViewports || cmd.count == 0 || cmd.count > kMaxViewports || (cmd.count > 1 && host_viewports < kMaxViewports)) return false;
+        if (!in_pass || cmd.unit >= kMaxViewports || cmd.count == 0 || cmd.count > kMaxViewports || (cmd.count > 1 && host_viewports < kMaxViewports)) return submit_failed(__LINE__);
         scissors[cmd.unit] = clamped_scissor(cmd.scissor);
         scissor_count = cmd.count;
         if (cmd.unit + 1 == cmd.count) emit_scissor();
@@ -2894,28 +2948,28 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
       }
       case RecordedCommand::Type::Draw:
       case RecordedCommand::Type::DrawIndexed: {
-        if (!in_pass || !pipeline || pipeline->desc().color_target_count > target_count) return false;
+        if (!in_pass || !pipeline || pipeline->desc().color_target_count > target_count) return submit_failed(__LINE__);
         // (a slot the pipeline reads with no buffer reads a buffer of zeros at stride 0: kFeature3NullVertexBuffers)
         VirglBuffer* zeros = nullptr;
         for (uint32_t binding = 0; binding < pipeline->binding_count(); ++binding)
           if (!vertex_buffers[pipeline->binding_slot(binding)] && !zeros) {
             zeros = static_cast<VirglBuffer*>(zero_vertex_buffer());
-            if (!zeros || !(info().features3 & kFeature3NullVertexBuffers)) return false;
+            if (!zeros || !(info().features3 & kFeature3NullVertexBuffers)) return submit_failed(__LINE__);
             use(zeros);
           }
         const bool indexed = cmd.type == RecordedCommand::Type::DrawIndexed;
-        if (indexed && !index_buffer) return false;
-        if (pipeline->desc().stream_output_count && !begin_stream_output()) return false;
+        if (indexed && !index_buffer) return submit_failed(__LINE__);
+        if (pipeline->desc().stream_output_count && !begin_stream_output()) return submit_failed(__LINE__);
 
         if (const uint32_t unit_count = pipeline->desc().texture_count) {
           for (uint32_t unit = 0; unit < unit_count; ++unit)
-            if (!textures[unit] || drawn_into(unit)) return false;   // unbound, or a view of what is being drawn into (other levels and layers of it may be sampled)
+            if (!textures[unit] || drawn_into(unit)) return submit_failed(__LINE__);   // unbound, or a view of what is being drawn into (other levels and layers of it may be sampled)
           if (textures_dirty) {
             // (to the vertex and the pixel stage alike: a vertex shader may read the units too, numbered as the pipeline's)
             uint32_t states[kMaxTextureUnits];
             for (uint32_t unit = 0; unit < unit_count; ++unit) {
               states[unit] = sampler_state(unfiltered_for(samplers[unit], textures[unit]));   // (created straight away, so it exists before the stream that uses it)
-              if (!states[unit]) return false;
+              if (!states[unit]) return submit_failed(__LINE__);
             }
             // (and to the geometry, control and evaluation stages the pipeline has: a texture read there, by the same numbers)
             bool depth_views = false;   // (a depth buffer's plane is the host texture's mode, set as a view is bound: unbound first, so that binding the view again sets it)
@@ -2945,7 +2999,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         if (draw_bindings_dirty) {
           // The storage of each stage the pipeline has, as its shader numbers it (and the host's shader for what is bound, for one with images); the compute shader's go with a dispatch.
           for (const uint32_t stage : {virgl::kShaderVertex, virgl::kShaderFragment, virgl::kShaderGeometry, virgl::kShaderTessControl, virgl::kShaderTessEval})
-            if (!bind_stage(stage, pipeline->stage_module(stage))) return false;
+            if (!bind_stage(stage, pipeline->stage_module(stage))) return submit_failed(__LINE__);
           draw_bindings_dirty = false;
           compute_bindings_dirty = true;   // (the compute stage's own are made again before a dispatch)
         }
@@ -2999,7 +3053,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           stream.put(patch_points);
           stream.put(0);   // draw id
         }
-        if (pause_ps && queries.open_users[kPsTarget] && !begin_segment(kPsTarget)) return false;
+        if (pause_ps && queries.open_users[kPsTarget] && !begin_segment(kPsTarget)) return submit_failed(__LINE__);
         if (pipeline->desc().fragment_stores || pipeline->desc().vertex_stores || pipeline->desc().geometry_stores || pipeline->desc().tessellation_stores) {   // (what the shaders wrote is there for the next read, a transfer to the system included)
           stream.command(virgl::kMemoryBarrier, 0, 1);
           stream.put(0xFFFFFFFFu);
@@ -3007,23 +3061,41 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         break;
       }
     }
-    if (stream.overflow()) return false;
-    if (stream.count() > Stream::kCapacity - 512 && !flush()) return false;  // leave room for the next command
+    if (stream.overflow()) return submit_failed(__LINE__);
+    if (stream.count() > Stream::kCapacity - 512 && !flush()) return submit_failed(__LINE__);  // leave room for the next command
   }
   end_stream_output();
-  if (in_pass || queries.open_count || !flush()) return false;
+  if (in_pass || queries.open_count || !flush()) return submit_failed(__LINE__);
   // Ask the host for each query's count (waiting for the draws), then read what it wrote into the buffer.
   for (const HostQuery& q : queries.host.view()) {
     stream.command(virgl::kGetQueryResult, 0, 2);
     stream.put(q.object);
     stream.put(1);
-    if (stream.count() > Stream::kCapacity - 512 && !flush()) return false;
+    if (stream.count() > Stream::kCapacity - 512 && !flush()) return submit_failed(__LINE__);
   }
   const bool asked = queries.host.count() != 0;
-  if (asked && !flush()) return false;
+  if (asked && !flush()) return submit_failed(__LINE__);
   // (the host writes each result - state, size, count - straight into the buffer's guest memory when its GL says the query is complete. It checks as it polls, which it does while
   // commands with fences are coming in: so keep it busy with empty ones until every state reads DONE. Pulling a buffer from the host would overwrite what it wrote.)
-  for (uint32_t attempt = 0; asked; ++attempt) {
+  const uint64_t waiting_since = asked ? hardware::uptime_us() : 0;
+  // (once the host has left a pipeline statistics query unfinished, they are not waited for any more: see host_statistics_stall_)
+  const bool skip_statistics = __atomic_load_n(&host_statistics_stall_, __ATOMIC_RELAXED);
+  auto give_up = [&](bool statistics_only) {
+    for (const HostQuery& q : queries.host.view()) {
+      if (statistics_only && !q.statistic) continue;
+      ByteView unwritten = q.result->map();
+      ByteReader in(unwritten);
+      if (in.le32() == virgl::kQueryStateDone) continue;
+      if (q.statistic) __atomic_store_n(&host_statistics_stall_, true, __ATOMIC_RELAXED);
+      ByteWriter out(unwritten);
+      out.le32(virgl::kQueryStateDone);
+      out.le32(8);
+      out.le32(0);
+      out.le32(0);
+    }
+  };
+  if (asked && skip_statistics) give_up(true);
+  while (asked) {
     bool pending = false;
     for (const HostQuery& q : queries.host.view()) {
       ByteReader in(q.result->map());
@@ -3031,7 +3103,14 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
     }
     if (!pending) break;
     const uint32_t nop = 0;
-    if (attempt > kQueryPolls || !send_commands(&nop, 1, /*fence=*/true)) return false;   // (a fenced one: the host looks at its queries while it waits for fences)
+    // (a query the host does not finish in that time - its pipeline statistics queries are left unwritten in some cases - counts nothing: the draws themselves are done,
+    // and losing the program's whole context over a statistic would be far worse)
+    if (hardware::uptime_us() - waiting_since > kQueryWaitUs) {
+      if (!__atomic_exchange_n(&query_timeout_said_, true, __ATOMIC_RELAXED)) console::puts("virgl: a query the host did not finish counts 0\n");
+      give_up(false);
+      break;
+    }
+    if (!send_commands(&nop, 1, /*fence=*/true)) return submit_failed(__LINE__);   // (a fenced one: the host looks at its queries while it waits for fences)
   }
   if (disjoint_asked) clock_interrupted_ = false;
   auto host_value = [&](uint32_t index, uint64_t* value) {
@@ -3049,7 +3128,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
     for (uint64_t k = u.first[target]; k < u.end[target] && k < queries.segments.count(); ++k) {
       if (queries.segments[k].target != target) continue;
       uint64_t v = 0;
-      if (!host_value(queries.segments[k].host, &v)) return false;
+      if (!host_value(queries.segments[k].host, &v)) return submit_failed(__LINE__);
       *sum += v;
     }
     return true;
@@ -3062,14 +3141,14 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
     if (u.synthetic) {
       values[0] = u.synthetic_value;
     } else if (u.kind == QueryKind::Timestamp) {
-      if (!host_value(u.timestamp, &values[0])) return false;
+      if (!host_value(u.timestamp, &values[0])) return submit_failed(__LINE__);
     } else if (u.kind == QueryKind::PipelineStatistics) {
       for (uint32_t k = 0; k < kPipelineStatisticCount; ++k)
-        if (!target_sum(u, kTargetStatistic + k, &values[k])) return false;
+        if (!target_sum(u, kTargetStatistic + k, &values[k])) return submit_failed(__LINE__);
     } else {
       uint32_t target = 0;
       while (target < kQueryTargets && !(u.targets >> target & 1)) ++target;
-      if (target == kQueryTargets || !target_sum(u, target, &values[0])) return false;
+      if (target == kQueryTargets || !target_sum(u, target, &values[0])) return submit_failed(__LINE__);
       if (u.kind == QueryKind::OcclusionPredicate) values[0] = values[0] ? 1 : 0;
     }
     counts[slot] = values[0];
@@ -3087,6 +3166,17 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
 
 bool VirglDevice::present(IImage* image) {
   auto* img = static_cast<VirglImage*>(image);
+  if (img && img->shown_through_copy()) {
+    // (a sampled image: its scanout copy, filled by a blit that turns the rows over, is shown)
+    VirglImage* shown = img->scanout_copy();
+    if (!shown) return false;
+    const Extent2D e = img->extent();
+    const uint32_t cmd[] = {virgl::header(virgl::kBlit, 0, 21), 0xFu, 0, e.width | (e.height << 16),
+                            shown->id(), 0, shown->blit_format(), 0, 0, 0, e.width, e.height, 1,
+                            img->id(), 0, img->blit_format(), 0, 0, 0, e.width, e.height, 1};
+    if (!send_commands(cmd, sizeof cmd / sizeof cmd[0])) return false;
+    return gpu_.show_resource(shown->id(), e.width, e.height);
+  }
   if (!img || !(img->usage() & kImagePresent)) return false;
   return gpu_.show_resource(img->id(), img->extent().width, img->extent().height);
 }

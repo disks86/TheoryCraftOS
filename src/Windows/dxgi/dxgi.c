@@ -872,6 +872,7 @@ static HRESULT show(SwapChain *s, IUnknown *buffer) {
   }
   const HRESULT hr = s->kind == SC_PRESENTER ? s->presenter->lpVtbl->ReadBackBuffer(s->presenter, buffer, s->pixels, s->desc.Width * 4)
                                              : fallback_read(s, buffer, s->pixels, s->desc.Width * 4);
+  if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "IDXGISwapChain::Present (the buffer's pixels)", hr); }
   if (FAILED(hr) || !s->window) return hr;
   HDC dc = GetDC(s->window);
   if (!dc) return S_OK;      /* (a window the display cannot give a context: nothing to show it on) */
