@@ -719,8 +719,10 @@ bool WebGlAccelerator::run_pass_on(const RenderPassBegin& pass, uint32_t width, 
     commands_->set_scissor(sc);
     static constexpr PrimitiveTopology kTopologies[6] = {PrimitiveTopology::TriangleList, PrimitiveTopology::LineList, PrimitiveTopology::PointList,
                                                          PrimitiveTopology::PatchList, PrimitiveTopology::LineListAdjacency, PrimitiveTopology::TriangleListAdjacency};
+    // (every draw sets its topology: a draw batched after another in one command buffer would otherwise take the topology the one before set - a list of triangles
+    // after patches reached the host as patches, which its GL refuses for a program without tessellation, losing the whole context)
     if (state->topology == 3) commands_->set_patch_control_points(program->patch_vertices);
-    if (state->topology) commands_->set_primitive_topology(kTopologies[state->topology]);
+    commands_->set_primitive_topology(kTopologies[state->topology]);
     commands_->draw(vertex_count, 0, state->instances ? state->instances : 1);
   }
   if (batched) {
@@ -855,9 +857,24 @@ bool WebGlAccelerator::draw_images(const webgl::AccelAttachments& a, uint32_t pr
   pass.clear_color = false;
   pass.clear_depth = false;
   pass.clear_stencil = false;
-  // (a depth-only draw has the blank colour image, which must never be written: the colour mask is the device's blend state, so such a draw needs it)
-  if (a.color_count == 0 && (!state.custom_blend || state.color_mask != 0)) return failed("a depth-only draw that writes colour");
-  return run_pass_on(pass, w, h, a.color_count ? a.color_count : 1, p, &state, vertices, vertex_count, constants);
+  if (a.color_count == 0) {
+    // A framebuffer with no colour image (a depth-only pass) writes no colour whatever the program outputs (GL 4.6 17.4.2), but the pass has the blank colour
+    // image, which must never be written: the draw runs with every colour channel masked off, through the device's blend state.
+    if (!(device_.info().features & kFeatureBlendState)) return failed("a depth-only draw on a device without colour masks");
+    webgl::AccelState masked = state;
+    if (!masked.custom_blend) {   // (the defaults' meaning in the custom fields: no blending, a depth test that passes when closer or equal)
+      masked.custom_blend = true;
+      masked.src_rgb = masked.src_alpha = 1;
+      masked.dst_rgb = masked.dst_alpha = 0;
+      masked.op_rgb = masked.op_alpha = 0;
+      masked.depth_compare = 3;
+      masked.blend = false;
+    }
+    masked.color_mask = 0;
+    masked.per_target = false;
+    return run_pass_on(pass, w, h, 1, p, &masked, vertices, vertex_count, constants);
+  }
+  return run_pass_on(pass, w, h, a.color_count, p, &state, vertices, vertex_count, constants);
 }
 
 uint32_t WebGlAccelerator::add_texture(UniquePointer<Texture>&& t) {

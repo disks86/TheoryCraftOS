@@ -75,6 +75,11 @@ for a in "${words[@]}"; do
     args+=("$a")
   fi
 done
+# QEMU_ARGS="...": more arguments for QEMU (e.g. -trace enable=virtio_gpu_cmd_set_scanout,file=<path> to see which image the display shows)
+# shellcheck disable=SC2206
+[ -n "${QEMU_ARGS:-}" ] && args+=(${QEMU_ARGS})
+# HOST_GDB=<gdb script>: QEMU runs under gdb with that script - scripts/host-gl-error.gdb stops at the host's first GL error in a draw and says why its GL refused it
+[ -n "${HOST_GDB:-}" ] && args=(gdb -batch -x "$HOST_GDB" --args "${args[@]}")
 # (UNIX socket paths are at most 107 bytes: the sockets go in a short folder of their own)
 sockets=$(mktemp -d /tmp/tcos-heaven.XXXXXX)
 vnc=$sockets/vnc monitor=$sockets/mon
@@ -94,7 +99,11 @@ while kill -0 $qemu_pid 2>/dev/null; do
     python3 -I scripts/qemu-profile.py "$monitor" 60 "$build/BOOTX64.efi" "$build/debugcon.log" "$build/windows" "$build/windows32" > "$work/profile.txt" 2>&1 || true
   fi
   # (the autorun reports the program's end; the engine has quit once cmd.exe has)
-  grep -a -q "autorun: ended" "$build/debugcon.log" 2>/dev/null && { sleep 5; break; }
+  # (AFTER=<seconds>: screenshots go on that long after it ended - to see whether the screen catches up)
+  if grep -a -q "autorun: ended" "$build/debugcon.log" 2>/dev/null; then
+    [ -z "${ended_at:-}" ] && ended_at=$(date +%s)
+    [ $(( $(date +%s) - ended_at )) -ge "${AFTER:-0}" ] && { sleep 5; break; }
+  fi
 done
 kill $qemu_pid 2>/dev/null || true
 wait $qemu_pid 2>/dev/null || true

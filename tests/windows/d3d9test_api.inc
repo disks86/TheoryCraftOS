@@ -560,8 +560,11 @@ static void test_device_misc(void) {
   IDirect3DTexture9 *big = NULL;
   IDirect3DDevice9_CreateTexture(g_device, 1024, 1024, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &big, NULL);
   const UINT after = IDirect3DDevice9_GetAvailableTextureMem(g_device);
-  if (!(before > (64u << 20) && (before & 0xFFFFF) == 0 && after <= before - (4u << 20))) printf("d3d9test: GetAvailableTextureMem %u then %u\n", before, after);
-  check(before > (64u << 20) && (before & 0xFFFFF) == 0 && after <= before - (4u << 20), "GetAvailableTextureMem: in megabytes, less by what a texture takes");
+  /* (less by what the texture takes - unless there is more than a UINT holds: then both are the 0xFFF00000 that Direct3D 9 caps the figure at, as on a machine
+   * whose adapter shares half of a large memory) */
+  const BOOL capped = before == 0xFFF00000u && after == 0xFFF00000u;
+  if (!(before > (64u << 20) && (before & 0xFFFFF) == 0 && (capped || after <= before - (4u << 20)))) printf("d3d9test: GetAvailableTextureMem %u then %u\n", before, after);
+  check(before > (64u << 20) && (before & 0xFFFFF) == 0 && (capped || after <= before - (4u << 20)), "GetAvailableTextureMem: in megabytes, less by what a texture takes (or at the cap)");
   if (big) IDirect3DTexture9_Release(big);
   check(IDirect3DDevice9_EvictManagedResources(g_device) == D3D_OK, "EvictManagedResources");
   DEVMODEW dm;

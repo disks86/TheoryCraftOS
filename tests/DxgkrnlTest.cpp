@@ -1836,7 +1836,11 @@ class SpyDevice final : public graphics::IGraphicsDevice {
     return inner_.create_shader_module(desc);
   }
   void destroy_shader_module(graphics::IShaderModule* module) override { inner_.destroy_shader_module(module); }
-  graphics::IPipeline* create_graphics_pipeline(const graphics::GraphicsPipelineDesc& desc) override { return inner_.create_graphics_pipeline(desc); }
+  uint32_t last_texture_count = 0;   // the texture units of the last graphics pipeline made
+  graphics::IPipeline* create_graphics_pipeline(const graphics::GraphicsPipelineDesc& desc) override {
+    last_texture_count = desc.texture_count;
+    return inner_.create_graphics_pipeline(desc);
+  }
   void destroy_pipeline(graphics::IPipeline* pipeline) override { inner_.destroy_pipeline(pipeline); }
   graphics::ICommandBuffer* create_command_buffer() override { return inner_.create_command_buffer(); }
   void destroy_command_buffer(graphics::ICommandBuffer* commands) override { inner_.destroy_command_buffer(commands); }
@@ -4180,6 +4184,100 @@ void test_layered_pass_kernel() {
   CHECK(draw({0, 1, 0}, kNoAllocation, 3) == status::kInvalidParameter);
 }
 
+
+// A pixel shader that reads textures at registers far apart and of other kinds (ps_sparse_units: t0 a 2D texture, t5 a cube, nothing at t1 .. t4), in a pipeline
+// whose description counts fewer textures than it reads (Direct3D 11's narrow root table): the pipeline has units up to t5 all the same - a unit left out would be
+// sampled unbound, which a GL host turns into unit 0 and the loss of the context when the kinds differ -, the units between are bound for the device from one that
+// is read, and the draw samples both.
+void test_sparse_texture_units() {
+  Env e;
+  Handle vs = 0, ps = 0, pipe = 0;
+  auto shader = [&](const char* name, graphics::ShaderStage stage, Handle* out) {
+    const std::vector<uint8_t> code = read_blob(name);
+    ShaderDesc sd;
+    sd.kind = ShaderKind::Dxbc, sd.stage = stage, sd.code = ConstByteView(code.data(), code.size());
+    return !code.empty() && e.kernel.create_shader(kPid, e.dev, sd, out) == status::kSuccess;
+  };
+  CHECK(shader("vs.dxbc", graphics::ShaderStage::Vertex, &vs) && shader("ps_sparse_units.dxbc", graphics::ShaderStage::Fragment, &ps));
+  auto red = [](uint32_t p) { return (p >> 16) & 0xFF; };
+  auto green = [](uint32_t p) { return (p >> 8) & 0xFF; };
+  auto blue = [](uint32_t p) { return p & 0xFF; };
+  PipelineDesc pd;
+  pd.vertex_shader = vs, pd.fragment_shader = ps, pd.vertex_stride = 28, pd.attribute_count = 2, pd.varying_count = 3, pd.texture_count = 1;
+  pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+  pd.attributes[1] = {1, graphics::VertexFormat::Float4, 12};
+  pd.cull_mode = graphics::CullMode::None;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+  {   // (what the device is given: units 0 .. 5)
+    FakeScreen screen(8, 6);
+    graphics::SoftwareDevice inner(e.allocator, &screen);
+    SpyDevice spy(inner);
+    Kernel k(e.allocator);
+    AdapterConfig c;
+    c.display = &screen;
+    CHECK(k.add_adapter(spy, c) == 0);
+    Handle a = 0, d = 0, kvs = 0, kps = 0, kpipe = 0;
+    CHECK(k.open_process(kPid) == status::kSuccess && k.open_adapter_from_index(kPid, 0, &a) == status::kSuccess && k.create_device(kPid, a, &d) == status::kSuccess);
+    const std::vector<uint8_t> vcode = read_blob("vs.dxbc"), pcode = read_blob("ps_sparse_units.dxbc");
+    CHECK(k.create_shader(kPid, d, {ShaderKind::Dxbc, graphics::ShaderStage::Vertex, ConstByteView(vcode.data(), vcode.size())}, &kvs) == status::kSuccess);
+    CHECK(k.create_shader(kPid, d, {ShaderKind::Dxbc, graphics::ShaderStage::Fragment, ConstByteView(pcode.data(), pcode.size())}, &kps) == status::kSuccess);
+    PipelineDesc kd = pd;
+    kd.vertex_shader = kvs, kd.fragment_shader = kps;
+    CHECK(k.create_pipeline(kPid, d, kd, &kpipe) == status::kSuccess && spy.last_texture_count == 6);
+  }
+  pd.texture_count = 128;   // (a table of more than the device's units: the shaders say which they read)
+  Handle wide = 0;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &wide) == status::kSuccess);
+  const Handle target = e.alloc(kAllocRenderTarget, Format::A8R8G8B8, 16, 16), flat = e.alloc(kAllocTexture, Format::A8R8G8B8, 1, 1);
+  AllocationDesc cd;
+  cd.flags = kAllocTexture, cd.format = Format::A8R8G8B8, cd.width = cd.height = 1, cd.kind = graphics::TextureKind::TextureCube, cd.layers = 6;
+  Handle cube = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, cd, &cube) == status::kSuccess);
+  CHECK(e.fill(flat, 0xFFC00000u) && e.fill(cube, 0xFF00A000u));
+  float quad[6 * 7];
+  const float full[6][2] = {{-1, 1}, {1, 1}, {-1, -1}, {-1, -1}, {1, 1}, {1, -1}};
+  for (uint32_t i = 0; i < 6; ++i) {
+    float* v = &quad[i * 7];
+    v[0] = full[i][0], v[1] = full[i][1], v[2] = 0.5f, v[3] = 0.25f, v[4] = 0.25f, v[5] = 0, v[6] = 1;
+  }
+  const Handle vb = e.buffer(kAllocVertexBuffer, sizeof quad);
+  CHECK(e.write(vb, floats(quad, 6 * 7)));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  graphics::SamplerDesc plain;
+  plain.address_u = plain.address_v = graphics::AddressMode::ClampToEdge;
+  for (const Handle p : {pipe, wide}) {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 1, 1}, 1.0f, 0);
+    w.bind_pipeline(p);
+    w.bind_vertex_buffer(1);
+    w.push_constants(floats(identity, 16));
+    w.bind_texture(0, 2, plain);
+    w.bind_texture(5, 3, plain);
+    w.draw(6);
+    w.end_pass();
+    CHECK(e.render(w, {target, vb, flat, cube}) == status::kSuccess);
+    const uint32_t px = e.pixel(target, 8, 8);
+    printf("  sparse texture units: %08x\n", px);
+    CHECK(red(px) == 0xC0 && green(px) == 0xA0 && blue(px) == 0);
+  }
+  // (a unit between that is bound already keeps its binding, unless it is the image the pass draws into, which no pass may sample: then it is bound from t0 too)
+  {
+    const Handle second = e.alloc(kAllocRenderTarget | kAllocTexture, Format::A8R8G8B8, 16, 16);
+    CommandWriter w(e.allocator);
+    w.bind_texture(2, 0, plain);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 1, 1}, 1.0f, 0);
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(1);
+    w.push_constants(floats(identity, 16));
+    w.bind_texture(0, 2, plain);
+    w.bind_texture(5, 3, plain);
+    w.draw(6);
+    w.end_pass();
+    CHECK(e.render(w, {second, vb, flat, cube}) == status::kSuccess);
+    const uint32_t px = e.pixel(second, 8, 8);
+    CHECK(red(px) == 0xC0 && green(px) == 0xA0 && blue(px) == 0);
+  }
+}
 
 // Depth buffers read as textures (kFeature2DepthTextures) and texture and sampler pairs: a depth and stencil pass into a D24S8 buffer that is a texture too, then its depth compared
 // (SampleCmpLevelZero with two comparison samplers and sampled with a third: three pairs of t0), its stencil plane loaded, filtered comparisons, an array of depth, and one texture with two
@@ -12200,6 +12298,7 @@ int main() {
   test_vertex_uav_kernel();
   test_layered_pass_kernel();
   test_depth_textures_kernel();
+  test_sparse_texture_units();
   test_multisample();
   test_geometry_kernel();
   test_formats();

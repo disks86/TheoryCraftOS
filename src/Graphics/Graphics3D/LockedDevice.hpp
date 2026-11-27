@@ -50,7 +50,9 @@ class LockedDevice final : public IGraphicsDevice {
 
  private:
   IGraphicsDevice& inner_;
-  kernel::Mutex lock_;
+  // (fair: a thread that submits frame after frame - a game's OpenGL - would otherwise take it again before the one it woke runs, and the desktop, which presents
+  // through the same device, would wait for as long as the game draws)
+  kernel::Mutex lock_{true};
 };
 
 }  // namespace graphics

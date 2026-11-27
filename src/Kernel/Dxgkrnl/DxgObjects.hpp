@@ -149,6 +149,7 @@ class PipelineObject {
   const StorageMask& storage_mask() const { return storage_mask_; }
   uint32_t texture_mask() const { return texture_mask_; }   // a compute pipeline: the texture units its shader reads
   uint32_t declared_units() const { return declared_units_; }   // the texture units the shaders of the pipeline declare (bit n: unit n), any pipeline
+  bool knows_textures() const { return knows_textures_; }        // declared_units() is all the shaders read (DXBC; Direct3D 9 bytecode does not say all)
   bool writes_storage() const { return fragment_stores_ || vertex_stores_ || geometry_stores_ || tessellation_stores_; }   // a shader of the pipeline writes buffers
   bool has_per_instance() const { return per_instance_; }
   // Stream output: which buffers (bit n: buffer n) the pipeline's declaration writes to, and whether it has one.
@@ -187,6 +188,7 @@ class PipelineObject {
   uint8_t unit_sampler_[graphics::kMaxTextureUnits] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
   uint32_t texture_mask_ = 0;   // a compute pipeline: the units its shader reads, which a dispatch needs bound
   uint32_t declared_units_ = 0;
+  bool knows_textures_ = false;   // (declared_units_ is every unit the shaders read: DXBC)
   uint32_t vertex_slot_mask_ = 0, instance_slot_mask_ = 0, slot_strides_[graphics::kMaxVertexBuffers] = {};
   uint32_t slot_step_rates_[graphics::kMaxVertexBuffers] = {};
   uint32_t slot_extents_[graphics::kMaxVertexBuffers] = {};

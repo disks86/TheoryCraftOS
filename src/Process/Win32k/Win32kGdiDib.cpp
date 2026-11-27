@@ -359,6 +359,43 @@ uint64_t NtGdiGetDIBitsInternal(Call& c) {
   return n;
 }
 
+// SetDIBitsToDevice of a 32 bpp BI_RGB DIB onto a 32 bpp surface of the default layout (a swap chain's frame onto a window, the commonest case by far): the pixels
+// row by row inside each clip rectangle - what plot_raw would put, pixel by pixel, the same bytes (blue, green, red; the surface keeps its fourth byte).
+static bool copy_rows32(Painter& p, Point dest, const DibInfo& info, const Surface& src, int32_t xs, int32_t ys, int32_t cx, int32_t cy, uint32_t start) {
+  Surface& dst = p.surface();
+  if (src.bpp != 32 || src.masks[0] || src.masks[1] || src.masks[2] || !src.colors.empty() || dst.bpp != 32 || dst.masks[0] || dst.masks[1] || dst.masks[2]) return false;
+  // (the destination in the surface's coordinates)
+  const int64_t left = int64_t{dest.x} + p.ox(), top = int64_t{dest.y} + p.oy();
+  for (const Rect& clip : p.clip().view()) {
+    const Rect r = rect_and(rect_and(clip, p.clip_bound()), dst.bounds());
+    // (the columns: inside the clip, the destination and the DIB's width)
+    int64_t x0 = left > r.left ? left : r.left, x1 = left + cx < r.right ? left + cx : r.right;
+    if (int64_t{xs} + (x0 - left) < 0) x0 = left - xs;
+    if (int64_t{xs} + (x1 - left) > src.width) x1 = left - xs + src.width;
+    if (x0 >= x1) continue;
+    const int64_t y0 = top > r.top ? top : r.top, y1 = top + cy < r.bottom ? top + cy : r.bottom;
+    for (int64_t y = y0; y < y1; ++y) {
+      const int64_t dy = y - top;
+      const int64_t scan = info.bottom_up ? int64_t{ys} + cy - 1 - dy : int64_t{ys} + dy;
+      if (scan < int64_t{start} || scan >= int64_t{start} + info.height) continue;
+      const int64_t sy = info.bottom_up ? info.height - 1 - (scan - start) : scan - start;
+      const uint64_t src_row = (src.bottom_up ? uint64_t(src.height - 1 - sy) : uint64_t(sy)) * src.stride;
+      const uint64_t dst_row = (dst.bottom_up ? uint64_t(dst.height - 1 - y) : uint64_t(y)) * dst.stride;
+      const uint64_t n = uint64_t(x1 - x0);
+      ConstByteView from;
+      ByteView to;
+      if (!ConstByteView(src.bytes).try_subview(src_row + uint64_t(xs + (x0 - left)) * 4, n * 4, &from) || !dst.bytes.try_subview(dst_row + uint64_t(x0) * 4, n * 4, &to)) return false;
+      for (uint64_t i = 0; i < n * 4; i += 4) {
+        to[i] = from[i];
+        to[i + 1] = from[i + 1];
+        to[i + 2] = from[i + 2];
+      }
+    }
+  }
+  p.mark(Rect{dest.x, dest.y, sat_add(dest.x, cx), sat_add(dest.y, cy)});
+  return true;
+}
+
 uint64_t NtGdiSetDIBitsToDeviceInternal(Call& c) {
   Dc* dc = dc_arg(c, c.arg32(0));
   if (!dc) return 0;
@@ -377,6 +414,7 @@ uint64_t NtGdiSetDIBitsToDeviceInternal(Call& c) {
   Painter p(*dc);
   if (!p.ok()) return lines;
   const Point dest = lp_to_dp(*dc, Point{xd, yd});
+  if (copy_rows32(p, dest, info, d.s, xs, ys, cx, cy, start)) return lines;
   for (int32_t dy = 0; dy < cy; ++dy) {
     // destination row dy shows scan line ys + cy - 1 - dy (bottom-up DIB) or ys + dy (top-down)
     const int64_t scan = info.bottom_up ? int64_t{ys} + cy - 1 - dy : int64_t{ys} + dy;

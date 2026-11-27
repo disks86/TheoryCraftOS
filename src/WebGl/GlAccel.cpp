@@ -1620,7 +1620,8 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
     st.depth_compare = static_cast<uint8_t>(dfunc_ >= 0x0200 && dfunc_ <= 0x0207 ? dfunc_ - 0x0200 : 3);
   }
   // glBlendFunci / glColorMaski / glEnablei(GL_BLEND, i): each colour image's own blending and mask (AccelState::per_target)
-  if (desktop.active && (desktop.per_buffer_masks || desktop.per_buffer_blend)) {
+  // (a framebuffer object without colour images writes none: its draws keep the mask of 0 above)
+  if (desktop.active && (desktop.per_buffer_masks || desktop.per_buffer_blend) && (!fbo || att.color_count > 0)) {
     const uint32_t n = fbo ? att.color_count : 1;
     st.per_target = true;
     for (uint32_t i = 0; i < n && i < kAccelMaxColors; ++i) {

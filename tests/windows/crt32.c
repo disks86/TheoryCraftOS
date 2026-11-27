@@ -25,6 +25,7 @@
 #include <string.h>
 #include <windows.h>
 #include <intrin.h>
+#include <float.h>
 
 static int g_passed, g_failed;
 static void check(int ok, const char *what) {
@@ -49,6 +50,16 @@ static DWORD WINAPI worker(LPVOID parameter) {
   }
   /* 10 + the thread's number if all is well; else 100, 200 or 400 (and their sums) say what was not */
   return 10u + (DWORD)number + (fresh ? 0 : 100) + (t_value == 100 + number ? 0 : 200) + ((int)(INT_PTR)TlsGetValue(g_slot) == number + 1 ? 0 : 400);
+}
+
+/* 1 if the thread's floating point state is what Windows starts threads with: x87 control word 0x27F, and _controlfp saying so. (The main thread's is the C
+ * runtime's: mingw's start-up resets the x87 unit to 64-bit precision.) */
+static DWORD WINAPI fp_state(LPVOID parameter) {
+  (void)parameter;
+  unsigned short cw = 0;
+  __asm__ volatile("fnstcw %0" : "=m"(cw));
+  const unsigned flags = _controlfp(0, 0);
+  return (cw & 0x1F3F) == 0x023F && (flags & _MCW_PC) == _PC_53 && (flags & _MCW_EM) == _MCW_EM && (flags & _MCW_RC) == _RC_NEAR;
 }
 
 int main(int argc, char **argv) {
@@ -265,6 +276,28 @@ int main(int argc, char **argv) {
   check(IsWow64Process(GetCurrentProcess(), &wow) && wow, "IsWow64Process says so");
   check(own.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_INTEL && native.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 &&
         (UINT_PTR)own.lpMaximumApplicationAddress < 0x80000000u && own.dwPageSize == 4096, "GetSystemInfo is a 32-bit processor's, GetNativeSystemInfo the real one's");
+
+  /* The floating point classes and control of the C runtime, as Windows' (Microsoft's shader compilers refuse to emit a constant _fpclass calls denormal). */
+  {
+    volatile double one = 1.0, tiny = 1e-310, zero = 0.0, big = 1e308;
+    const double inf = big * 10.0, nan = inf - inf;
+    check(_fpclass(one) == _FPCLASS_PN && _fpclass(-one) == _FPCLASS_NN && _fpclass(tiny) == _FPCLASS_PD && _fpclass(-tiny) == _FPCLASS_ND &&
+          _fpclass(zero) == _FPCLASS_PZ && _fpclass(-zero) == _FPCLASS_NZ && _fpclass(inf) == _FPCLASS_PINF && _fpclass(-inf) == _FPCLASS_NINF &&
+          (_fpclass(nan) == _FPCLASS_QNAN || _fpclass(nan) == _FPCLASS_SNAN) && _finite(one) && !_finite(inf) && _isnan(nan) && !_isnan(one), "_fpclass, _finite, _isnan");
+    unsigned short cw = 0;
+    HANDLE fresh = CreateThread(NULL, 0, fp_state, NULL, 0, NULL);
+    DWORD fresh_code = 0;
+    check(fresh && WaitForSingleObject(fresh, 10000) == WAIT_OBJECT_0 && GetExitCodeThread(fresh, &fresh_code) && fresh_code == 1,
+          "threads start with 53-bit precision, round to nearest, every exception masked");
+    if (fresh) CloseHandle(fresh);
+    _controlfp(_PC_24 | _RC_CHOP, _MCW_PC | _MCW_RC);
+    __asm__ volatile("fnstcw %0" : "=m"(cw));
+    const unsigned set = _controlfp(0, 0);
+    check((cw & 0xF00) == 0xC00 && (set & _MCW_PC) == _PC_24 && (set & _MCW_RC) == _RC_CHOP, "_controlfp sets the x87 precision and rounding");
+    _controlfp(_PC_53 | _RC_NEAR, _MCW_PC | _MCW_RC);
+    __asm__ volatile("fnstcw %0" : "=m"(cw));
+    check((cw & 0xF00) == 0x200 && (_controlfp(0, 0) & (_MCW_PC | _MCW_RC)) == _PC_53, "and back");
+  }
 
   printf(g_failed == 0 ? "crt32: all %d checks passed\n" : "crt32: %d checks passed, some FAILED\n", g_passed);
   fflush(stdout);

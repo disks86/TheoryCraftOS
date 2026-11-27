@@ -22,6 +22,7 @@
 #include "Graphics/BlockCompression.hpp"
 #include <new>
 #include "Graphics/Graphics3D/Virgl/VirglProtocol.hpp"
+#include "Utility/Optional.hpp"
 #include "Kernel/Delay.hpp"
 #include "console.hpp"
 #include "Kernel/Interrupts.hpp"
@@ -1727,6 +1728,38 @@ bool VirglDevice::send_commands(const uint32_t* dwords, uint32_t count, bool fen
   return ok;
 }
 
+bool VirglDevice::submit_failed(uint32_t line) {
+  __atomic_store_n(&submit_failure_line_, line, __ATOMIC_RELAXED);
+  // (a refused submit draws nothing - its caller may not say so: the desktop's frame stays as it was -, so each line is said the first time, and every 1024th
+  // failure with the count)
+  const uint32_t count = __atomic_add_fetch(&submit_failures_said_, 1u, __ATOMIC_RELAXED);
+  bool first = true;
+  for (uint32_t& seen : submit_failure_lines_) {
+    uint32_t expected = 0;
+    if (__atomic_load_n(&seen, __ATOMIC_RELAXED) == line) { first = false; break; }
+    if (__atomic_compare_exchange_n(&seen, &expected, line, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) break;
+    if (expected == line) { first = false; break; }
+  }
+  if (first || count % 1024 == 0) {
+    char text[96];
+    uint32_t n = 0;
+    auto put = [&](const char* t) { while (*t && n < sizeof text) text[n++] = *t++; };
+    auto number = [&](uint32_t v) {
+      char d[12];
+      uint32_t k = 0;
+      do d[k++] = static_cast<char>('0' + v % 10); while ((v /= 10) && k < sizeof d);
+      while (k && n < sizeof text) text[n++] = d[--k];
+    };
+    put("virgl: a submit failed at VirglDevice.cpp line ");
+    number(line);
+    put(" (failures so far: ");
+    number(count);
+    put(")\n");
+    console::debug_puts(StringView(text, n));
+  }
+  return false;
+}
+
 bool VirglDevice::wait_for_gpu() {
   const uint32_t nop = 0;
   return send_commands(&nop, 1, /*fence=*/true);
@@ -1735,6 +1768,7 @@ bool VirglDevice::wait_for_gpu() {
 VirglDevice::~VirglDevice() {
   for (uint32_t i = 0; i < sampler_state_count_; ++i) destroy_object(sampler_states_[i].handle);
   if (zero_vertex_buffer_) destroy_buffer(zero_vertex_buffer_);
+  while (spare_query_count_) destroy(gpu_.allocator(), static_cast<VirglBuffer*>(spare_query_buffers_[--spare_query_count_]));
 }
 
 // (Called from submit, one at a time.) The attributes of a slot lie within the first 2048 bytes of an element plus the widest format (16 bytes) - the kernel's kMaxVertexStride -,
@@ -2001,29 +2035,34 @@ void VirglDevice::destroy_command_buffer(ICommandBuffer* commands) {
   destroy(gpu_.allocator(), static_cast<CommandRecorder*>(commands));
 }
 
+namespace {
+// The device's submit lock (VirglDevice::submit_lock_). A caller with interrupts masked does not block (see VirtioGpu::lock_for_command): it tries for a while and gives up.
+struct SubmitLock {
+  kernel::Mutex& mutex;
+  bool held = false;
+  explicit SubmitLock(kernel::Mutex& m) : mutex(m) {
+    if (kernel::irq_enabled() || !kernel::running()) {
+      mutex.lock();
+      held = true;
+      return;
+    }
+    const uint64_t start = hardware::uptime_us();
+    while (!(held = mutex.try_lock()) && hardware::uptime_us() - start < 50000) hardware::delay_spin_us(20);
+  }
+  ~SubmitLock() { release(); }
+  void release() {
+    if (held) mutex.unlock();
+    held = false;
+  }
+};
+}  // namespace
+
 bool VirglDevice::submit(ICommandBuffer* commands) {
   if (!commands) return submit_failed(__LINE__);
   // One submit at a time: the host's context has one set of bound state (framebuffer, shaders, objects, sampler views, constants), and a submit is sent in parts when its
   // stream fills - another thread's commands between two parts would leave the rest of this one drawing with that thread's state. (A caller with interrupts masked does
   // not block - see VirtioGpu::lock_for_command -: it tries for a while and gives up.)
-  struct SubmitLock {
-    kernel::Mutex& mutex;
-    bool held = false;
-    explicit SubmitLock(kernel::Mutex& m) : mutex(m) {
-      if (kernel::irq_enabled() || !kernel::running()) {
-        mutex.lock();
-        held = true;
-        return;
-      }
-      const uint64_t start = hardware::uptime_us();
-      while (!(held = mutex.try_lock()) && hardware::uptime_us() - start < 50000) hardware::delay_spin_us(20);
-    }
-    ~SubmitLock() { release(); }
-    void release() {
-      if (held) mutex.unlock();
-      held = false;
-    }
-  } submit_lock(submit_lock_);
+  SubmitLock submit_lock(submit_lock_);
   if (!submit_lock.held) return submit_failed(__LINE__);
   CommandRecorder& recorder = *static_cast<CommandRecorder*>(commands);
   Stream stream(gpu_.allocator());
@@ -2050,16 +2089,34 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
     VirglBuffer* result = nullptr;
     uint32_t object = 0;
     bool statistic = false;   // (a pipeline statistics counter: see host_statistics_stall_)
+    bool given_up = false;    // (its result was never written: give_up)
   };
   struct Queries {
-    explicit Queries(VirglDevice& d) : device(d), host(d.gpu().allocator()), segments(d.gpu().allocator()), users(d.gpu().allocator()) {}
+    Queries(VirglDevice& d, const SubmitLock& submit_lock) : device(d), outer(submit_lock), host(d.gpu().allocator()), segments(d.gpu().allocator()), users(d.gpu().allocator()) {}
     ~Queries() {
+      // (a result buffer the host has written DONE into is finished with: it is kept for the next queries, its state word cleared; one it never finished - given up on,
+      // or never waited for - may still be written, and goes)
+      if (host.count() == 0) return;
+      // (an early return of the submit still holds its lock: it is not taken twice)
+      Optional<SubmitLock> own;
+      if (!outer.held) own.emplace(device.submit_lock_);
+      const bool locked = outer.held || own->held;
       for (const HostQuery& q : host.view()) {
         if (q.object) device.destroy_object(q.object);
-        if (q.result) destroy(device.gpu().allocator(), q.result);
+        if (!q.result) continue;
+        // (finished: DONE written by the host - a submit that returned early may leave queries it never waited for, which the host may still write)
+        ByteReader state(q.result->map());
+        const bool finished = state.le32() == virgl::kQueryStateDone && !q.given_up;
+        if (locked && finished && device.spare_query_count_ < kSpareQueryBuffers) {
+          q.result->map().fill(0);
+          device.spare_query_buffers_[device.spare_query_count_++] = q.result;
+          continue;
+        }
+        destroy(device.gpu().allocator(), q.result);
       }
     }
     VirglDevice& device;
+    const SubmitLock& outer;
     List<HostQuery> host;
     List<Segment> segments;
     List<UserQuery> users;
@@ -2067,7 +2124,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
     int64_t active[kQueryTargets];             // (the segment of a target the host is running, -1 for none)
     uint32_t open_users[kQueryTargets] = {};   // (how many of ours that need the target are open)
     uint32_t open_count = 0;
-  } queries(*this);
+  } queries(*this, submit_lock);
   for (int32_t& u : queries.slot_user) u = -1;
   for (int64_t& a : queries.active) a = -1;
   bool disjoint_asked = false;
@@ -2078,7 +2135,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
   // A host query of `type` made and begun (and ended at once, for a timestamp): its index in queries.host, or -1.
   auto host_query = [&](uint32_t type, bool end_now) -> int64_t {
     HostQuery q;
-    q.result = make<VirglBuffer>(gpu_.allocator(), *this, 16, 0, virgl::kBindCustom);
+    q.result = spare_query_count_ ? static_cast<VirglBuffer*>(spare_query_buffers_[--spare_query_count_]) : make<VirglBuffer>(gpu_.allocator(), *this, 16, 0, virgl::kBindCustom);
     if (!q.result) return -1;
     if (!q.result->valid() || !queries.host.push_back(q)) {
       destroy(gpu_.allocator(), q.result);
@@ -2200,7 +2257,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
       if (pass_level[n] < v.base_level || pass_level[n] >= v.base_level + v.level_count) continue;
       if (textures[unit]->kind() == TextureKind::Texture3D || (pass_first[n] < v.first_layer + v.layer_count && v.first_layer < pass_first[n] + pass_count[n])) return true;
     }
-    return submit_failed(__LINE__);
+    return false;
   };
   // The storage images bound (bind_storage_image), the typed views of buffers (bind_storage_texel_buffer: of the u# slots and of the t# ones), and the host's shaders bound for each
   // stage (virgl::kShader*: the variants of modules that have images).
@@ -3094,12 +3151,13 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
   // (once the host has left a pipeline statistics query unfinished, they are not waited for any more: see host_statistics_stall_)
   const bool skip_statistics = __atomic_load_n(&host_statistics_stall_, __ATOMIC_RELAXED);
   auto give_up = [&](bool statistics_only) {
-    for (const HostQuery& q : queries.host.view()) {
+    for (HostQuery& q : queries.host.view()) {
       if (statistics_only && !q.statistic) continue;
       ByteView unwritten = q.result->map();
       ByteReader in(unwritten);
       if (in.le32() == virgl::kQueryStateDone) continue;
       if (q.statistic) __atomic_store_n(&host_statistics_stall_, true, __ATOMIC_RELAXED);
+      q.given_up = true;
       ByteWriter out(unwritten);
       out.le32(virgl::kQueryStateDone);
       out.le32(8);

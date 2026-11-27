@@ -698,8 +698,9 @@ static HRESULT pso_create_graphics(Dev *This, const D3D12_GRAPHICS_PIPELINE_STAT
     if (place > p->varyings) p->varyings = place;
   }
   if (p->varyings > dev->caps.max_varyings) { dx_Release(OBJ(p)); return DXGI_ERROR_UNSUPPORTED; }
-  p->textures = p->rs->textures_unbounded ? dev->caps.max_texture_units : p->rs->textures;
-  if (p->textures > dev->caps.max_texture_units) { dx_Release(OBJ(p)); return DXGI_ERROR_UNSUPPORTED; }
+  /* (the root signature's shader resources: a table of more than the device's units - Direct3D 11's t0 .. t127 - is fine, the kernel gives the pipeline the units its
+   * shaders read, from their code; a shader that reads one past the device's units is refused there) */
+  p->textures = p->rs->textures_unbounded || p->rs->textures > dev->caps.max_texture_units ? dev->caps.max_texture_units : p->rs->textures;
   /* stream output: the captured outputs by their register in the output signature of the last stage before the rasterizer (the geometry shader, else the domain
    * shader, else the vertex shader) */
   if (desc->StreamOutput.NumEntries) {

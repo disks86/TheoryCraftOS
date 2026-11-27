@@ -288,6 +288,7 @@ struct TgsiAccel : IAccelerator {
     }
     return true;
   }
+  uint8_t last_image_mask = 0xFF;   // the colour channels the last draw_images was told to write
   bool draw_images(const AccelAttachments& a, uint32_t program, const AccelState& st, ConstByteView vertices, uint32_t count, ConstByteView constants) override {
     Surfaces s;
     if (!surfaces(a, &s)) return false;
@@ -295,6 +296,7 @@ struct TgsiAccel : IAccelerator {
       for (uint32_t i = 0; i < a.color_count; ++i)
         if (st.textures[k] == a.colors[i] || (a.depth && st.textures[k] == a.depth)) return false;
     ++image_draws;
+    last_image_mask = st.custom_blend ? st.color_mask : 15;
     return render(s, program, st, vertices, count, constants);
   }
   uint32_t create_texture(uint32_t w, uint32_t h) override {

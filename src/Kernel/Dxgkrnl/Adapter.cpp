@@ -417,6 +417,23 @@ class Adapter::StreamRunner {
   }
   // The textures a pipeline's shaders read (`mask`: bit u for unit u): bound, and through a view of the kind the shader declared (texture_view_fits; a multisampled image to a Texture2DMS
   // unit only). Replaying, a unit whose device binding is of another kind is bound again with the declared one.
+  // The units below a pipeline's texture count that no shader of it reads (registers between those it reads: t0 and t12 read, t1 .. t11 not) - the device wants
+  // every unit below the count bound, and a root table leaves them empty: each is given the binding of the lowest unit that is read, unless it has a binding
+  // that may stay (one that is not of an image the pass draws into). Nothing samples them. (Only for a pipeline whose shaders say all they read: DXBC.)
+  NtStatus fill_unread_units(const PipelineObject& p) {
+    const uint32_t read = p.declared_units();
+    if (!p.knows_textures() || read == 0) return status::kSuccess;
+    const uint32_t source = static_cast<uint32_t>(__builtin_ctz(read));
+    if (source >= graphics::kMaxTextureUnits || !texture_bound_[source]) return status::kSuccess;   // (fit_textures refuses the draw)
+    for (uint32_t u = 0; u < p.texture_count() && u < graphics::kMaxTextureUnits; ++u) {
+      if ((read >> u & 1) || (texture_bound_[u] && !drawn_in_pass(u))) continue;
+      const graphics::TextureView& v = texture_view_[source];
+      const NtStatus s = lower_texture(u, texture_alloc_[source], texture_sampler_[source], graphics::TextureView{v.kind, v.base_level, v.level_count, v.first_layer, v.layer_count});
+      if (s != status::kSuccess) return s;
+    }
+    return status::kSuccess;
+  }
+
   NtStatus fit_textures(const PipelineObject& p, uint32_t mask) {
     const bool views = (adapter_.caps_.features2 & graphics::kFeature2MipmappedLayers) != 0;
     for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u) {
@@ -1209,7 +1226,11 @@ class Adapter::StreamRunner {
         if ((pipeline_->stream_output_buffers() >> b & 1) && !so_bound_[b]) return refuse(__LINE__);
     if (is_adjacency(topology_) && !pipeline_->has_geometry()) return refuse(__LINE__);   // (only a geometry shader takes the neighbours)
     if (pipeline_->has_tessellation() && (patch_points(topology_) != pipeline_->tess_input_points() || pipeline_->has_geometry())) return refuse(__LINE__);
-    if (const NtStatus fitted = fit_textures(*pipeline_, pipeline_->texture_count() >= 32 ? ~0u : (1u << pipeline_->texture_count()) - 1)) return fitted;   // (bound, and of the kinds the shaders declare)
+    if (const NtStatus filled = fill_unread_units(*pipeline_)) return filled;
+    {   // (bound, and of the kinds the shaders declare: the units they read, all below the count where they do not say which)
+      const uint32_t below = pipeline_->texture_count() >= 32 ? ~0u : (1u << pipeline_->texture_count()) - 1;
+      if (const NtStatus fitted = fit_textures(*pipeline_, pipeline_->knows_textures() ? below & pipeline_->declared_units() : below)) return fitted;
+    }
     if (skip_draw_) {   // (a texture that does not fit the kind declared: this draw is left out)
       skip_draw_ = false;
       return status::kSuccess;
@@ -2901,7 +2922,7 @@ class Adapter::StreamRunner {
     return status::kSuccess;
   }
 
-  NtStatus lower_texture(uint32_t unit, Allocation* a, const graphics::SamplerDesc& sampler, const graphics::TextureView& view) {
+  NtStatus lower_texture(uint32_t unit, const Allocation* a, const graphics::SamplerDesc& sampler, const graphics::TextureView& view) {
     uint32_t index = 0;
     if (!a || !index_of(a, &index)) return refuse(__LINE__);   // (the allocation is in the list or the draw is refused)
     ByteBuffer packet(adapter_.allocator_);
@@ -3283,23 +3304,24 @@ NtStatus Adapter::create_compute_pipeline(const SharedPointer<ShaderObject>& sha
 NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<ShaderObject>& vertex, const SharedPointer<ShaderObject>& fragment, SharedPointer<PipelineObject>* out,
                                   const SharedPointer<ShaderObject>& geometry, const SharedPointer<ShaderObject>& hull, const SharedPointer<ShaderObject>& domain) {
   if (!vertex || !fragment || vertex->stage() != graphics::ShaderStage::Vertex || fragment->stage() != graphics::ShaderStage::Fragment) return pipeline_refused(status::kInvalidParameter, __LINE__);
-  if (d.vertex_stride > kMaxVertexStride || d.attribute_count > caps_.max_vertex_attributes || d.varying_count > caps_.max_varyings || d.texture_count > caps_.max_texture_units)
+  if (d.vertex_stride > kMaxVertexStride || d.attribute_count > caps_.max_vertex_attributes || d.varying_count > caps_.max_varyings)
     return pipeline_refused(status::kInvalidParameter, __LINE__);
   for (uint32_t s = 1; s < graphics::kMaxVertexBuffers; ++s)
     if (d.slot_strides[s] > kMaxVertexStride) return pipeline_refused(status::kInvalidParameter, __LINE__);
-  // The pipeline has the texture units its shaders read, when they say which: a description may count more (a root signature with a table of textures
-  // for shaders that sample none of them, or fewer), and a device takes no units for a pixel shader that samples nothing.
+  // The pipeline has the texture units its shaders read, when they say which (DXBC), up to the highest of them: a description may count more (a root signature
+  // with a table of textures for shaders that sample none of them) or fewer (Direct3D 11's narrow table of t0 .. t7 for shaders that read t12 too, a sampler's
+  // pair unit above the table), and a device takes no units for a pixel shader that samples nothing. (Units below the highest that no shader reads are bound at
+  // a draw from one that is read: fill_unread_units.) A unit left out would be read unbound: the host's GL then samples it through unit 0, as whatever kind
+  // unit 0 is, and refuses every draw of the program - losing the whole context - when the kinds differ.
   uint32_t texture_count = d.texture_count;
-  if (vertex->knows_textures_ && fragment->knows_textures_) {
-    uint32_t used = 0, paired = 0;
-    for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u) {
-      if (((vertex->texture_mask_ | fragment->texture_mask_) >> u) & 1) used = u + 1;
-      // (a unit of a texture and sampler pair of their own is the pipeline's whatever the description counts: the binding fills it from the texture and sampler registers)
-      if ((vertex->texture_mask_ >> u & 1) && vertex->unit_texture_[u] != u) paired = u + 1;
-      if ((fragment->texture_mask_ >> u & 1) && fragment->unit_texture_[u] != u) paired = u + 1;
-    }
-    if (used < texture_count) texture_count = used;
-    if (paired > texture_count) texture_count = paired;
+  const bool knows_textures = vertex->knows_textures_ && fragment->knows_textures_ && (!geometry || geometry->knows_textures_) && (!hull || hull->knows_textures_) &&
+                              (!domain || domain->knows_textures_);
+  if (knows_textures) {
+    const uint32_t read = vertex->texture_mask_ | fragment->texture_mask_ | (geometry ? geometry->texture_mask_ : 0u) | (hull ? hull->texture_mask_ : 0u) | (domain ? domain->texture_mask_ : 0u);
+    texture_count = read ? 32u - static_cast<uint32_t>(__builtin_clz(read)) : 0u;
+    if (texture_count > caps_.max_texture_units) return pipeline_refused(status::kNotSupported, __LINE__);
+  } else if (texture_count > caps_.max_texture_units) {
+    return pipeline_refused(status::kInvalidParameter, __LINE__);
   }
   uint32_t vertex_slots = 0, instance_slots = 0, slot_rates[graphics::kMaxVertexBuffers] = {}, slot_extents[graphics::kMaxVertexBuffers] = {};
   for (uint32_t i = 0; i < d.attribute_count; ++i) {
@@ -3471,6 +3493,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   }
   pipeline->color_target_count_ = d.color_target_count;
   pipeline->declared_units_ = vertex->texture_mask_ | fragment->texture_mask_ | (geometry ? geometry->texture_mask_ : 0u) | (hull ? hull->texture_mask_ : 0u) | (domain ? domain->texture_mask_ : 0u);
+  pipeline->knows_textures_ = knows_textures;
   pipeline->fragment_stores_ = fragment->fragment_stores_;
   // (the images of every stage: a slot two stages declare must be the same thing to both)
   for (const ShaderObject* stage : {vertex.get(), fragment.get(), geometry.get(), hull.get(), domain.get()}) {

@@ -715,6 +715,19 @@ static void test_dib() {
   CHECK(f.u(N(SetDIBitsToDeviceInternal), mem, 2, 2, 4, 4, 0, 0, 0, 4, kBig, kIn, 0, 64, 40, 0, 0) == 4);
   // bottom-up: the first row in memory is the bottom line of the picture
   CHECK(px(f, mem, 2, 5) == 0xFF0000 && px(f, mem, 5, 5) == (30u | 0xFF0000u) && px(f, mem, 2, 2) == (120u | 0xFF0000u) && px(f, mem, 1, 1) == 0);
+  // The same onto a clip of two rectangles (column 4 excluded: GetPixel reads CLR_INVALID there), a top-down DIB from (1, 1), a destination from (3, -1) running past the surface's top and the
+  // DIB's edges: each pixel where the rules of the general path put it (destination row dy shows scan line 1 + dy, column dx source column 1 + dx).
+  {
+    const uint32_t clipped = make_dc(f, 8, 8);
+    put_bmi(f, kIn, 4, -4, 32);
+    for (int i = 0; i < 16; ++i) f.prog.memory.put32(kBig + 4 * i, uint32_t(i * 16));      // blue = 16 * (4 * row + column)
+    CHECK(f.u(N(ExcludeClipRect), clipped, 4, 0, 5, 8) == 3);
+    CHECK(f.u(N(SetDIBitsToDeviceInternal), clipped, 3, uint32_t(-1), 8, 8, 1, 1, 0, 4, kBig, kIn, 0, 64, 40, 0, 0) == 4);
+    CHECK(px(f, clipped, 3, 0) == (144u << 16) && px(f, clipped, 4, 0) == 0xFFFFFFFFu && px(f, clipped, 5, 0) == (176u << 16) && px(f, clipped, 6, 0) == 0);
+    CHECK(px(f, clipped, 3, 1) == (208u << 16) && px(f, clipped, 5, 1) == (240u << 16) && px(f, clipped, 3, 2) == 0 && px(f, clipped, 2, 0) == 0);
+    put_bmi(f, kIn, 4, 4, 32);
+    for (int i = 0; i < 16; ++i) f.prog.memory.put32(kBig + 4 * i, 0x00000000u | uint32_t(i * 10) << 16 | 0xFF);
+  }
   // GetDIBits: ask for 24 bpp, bottom-up
   const uint32_t bm = f.u(N(GetDCObject), mem, 7);
   put_bmi(f, kIn, 8, 8, 24);

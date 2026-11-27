@@ -542,7 +542,10 @@ struct FakeCommands final : graphics::ICommandBuffer {
   graphics::Viewport viewport;
   graphics::Rect2D scissor;
   const graphics::IPipeline* pipeline = nullptr;
-  void begin() override { ++begins; }
+  void begin() override {
+    ++begins;
+    topology = graphics::PrimitiveTopology::TriangleList;
+  }
   void begin_render_pass(const graphics::RenderPassBegin& p) override { pass = p; }
   void bind_pipeline(const graphics::IPipeline* p) override { pipeline = p; }
   void bind_vertex_buffer(graphics::IBuffer*, uint64_t) override {}
@@ -558,9 +561,15 @@ struct FakeCommands final : graphics::ICommandBuffer {
   }
   void set_viewport(const graphics::Viewport& v) override { viewport = v; }
   void set_scissor(const graphics::Rect2D& r) override { scissor = r; }
-  void draw(uint32_t n, uint32_t, uint32_t, uint32_t) override { ++draws; last_vertices = n; }
+  graphics::PrimitiveTopology topology = graphics::PrimitiveTopology::TriangleList;   // (as a device has it: what the last set_primitive_topology set, for every draw after)
+  std::vector<graphics::PrimitiveTopology> draw_topologies;
+  void draw(uint32_t n, uint32_t, uint32_t, uint32_t) override {
+    ++draws;
+    last_vertices = n;
+    draw_topologies.push_back(topology);
+  }
   void draw_indexed(uint32_t, uint32_t, int32_t, uint32_t, uint32_t) override {}
-  void set_primitive_topology(graphics::PrimitiveTopology) override {}
+  void set_primitive_topology(graphics::PrimitiveTopology t) override { topology = t; }
   void end_render_pass() override {}
   bool end() override { return true; }
 };
@@ -568,7 +577,12 @@ struct FakeDevice final : graphics::IGraphicsDevice {
   bool tgsi = true, textures = true;
   int images = 0, modules = 0, pipelines = 0, submits = 0;
   FakeCommands commands;
-  graphics::DeviceInfo info() const override { return {"fake gpu", graphics::DeviceKind::VirtualGpu, true}; }
+  uint32_t features = 0;
+  graphics::DeviceInfo info() const override {
+    graphics::DeviceInfo i{"fake gpu", graphics::DeviceKind::VirtualGpu, true};
+    i.features = features;
+    return i;
+  }
   graphics::IBuffer* create_buffer(uint64_t, uint32_t) override { return new FakeBuffer(); }
   void destroy_buffer(graphics::IBuffer* b) override { delete static_cast<FakeBuffer*>(b); }
   graphics::IImage* create_image(const graphics::ImageDesc& d) override {
@@ -789,6 +803,88 @@ static void test_device_textures() {
     CHECK(acc.create_program("VERT\nEND\n", "FRAG\nEND\n", 2, 1, 1) == 0);
     acc.destroy_texture(tex);
     acc.destroy_target(target);
+    acc.destroy_program(prog);
+  }
+  CHECK(dev.images == 0 && dev.modules == 0 && dev.pipelines == 0);
+  CHECK(a.live == 0);
+}
+
+// Draws batched into one command buffer each set their own topology: a list of triangles after a list of lines (or after patches) is drawn as triangles, not with
+// the topology the draw before it left set (the host's GL refuses patches without tessellation shaders, and the context is lost).
+static void test_batched_topologies() {
+  TestAllocator a;
+  FakeDevice dev;
+  dev.features = graphics::kFeatureLines;
+  {
+    graphics::WebGlAccelerator acc(dev, a);
+    const uint32_t prog = acc.create_program("VERT\nEND\n", "FRAG\nEND\n", 2, 1, 0);
+    const uint32_t image = acc.create_image(8, 4, webgl::AccelFormat::Rgba8, 1);
+    CHECK(prog != 0 && image != 0);
+    AccelAttachments att;
+    att.colors[0] = image;
+    att.color_count = 1;
+    AccelState st;
+    st.vp_w = 8;
+    st.vp_h = 4;
+    st.depth_far = 1;
+    uint8_t vertices[6 * 2 * 16] = {};
+    for (const uint8_t topology : {1, 0, 2, 0}) {
+      st.topology = topology;
+      CHECK(acc.draw_images(att, prog, st, ConstByteView(vertices, sizeof vertices), 6, ConstByteView()));
+    }
+    uint8_t px[8 * 4 * 4];
+    CHECK(acc.read_image(image, ByteView(px, sizeof px)));      // (sends the batch)
+    CHECK(dev.submits == 1 && dev.commands.draw_topologies.size() == 4);
+    if (dev.commands.draw_topologies.size() == 4) {
+      CHECK(dev.commands.draw_topologies[0] == graphics::PrimitiveTopology::LineList && dev.commands.draw_topologies[1] == graphics::PrimitiveTopology::TriangleList);
+      CHECK(dev.commands.draw_topologies[2] == graphics::PrimitiveTopology::PointList && dev.commands.draw_topologies[3] == graphics::PrimitiveTopology::TriangleList);
+    }
+    acc.destroy_texture(image);
+    acc.destroy_program(prog);
+  }
+  CHECK(a.live == 0);
+}
+
+// A draw into images without a colour image (a depth-only pass) runs on the device with every colour channel masked off - the pass's blank colour image is never
+// written -, whatever the state's own mask and blending say; a device without colour masks refuses it.
+static void test_depth_only_images() {
+  TestAllocator a;
+  FakeDevice dev;
+  dev.features = graphics::kFeatureBlendState;
+  {
+    graphics::WebGlAccelerator acc(dev, a);
+    const uint32_t prog = acc.create_program("VERT\nEND\n", "FRAG\nEND\n", 2, 1, 0);
+    const uint32_t depth = acc.create_image(8, 4, webgl::AccelFormat::Depth, 1);
+    CHECK(prog != 0 && depth != 0);
+    AccelAttachments att;
+    att.depth = depth;
+    AccelState st;
+    st.vp_w = 8;
+    st.vp_h = 4;
+    st.depth_far = 1;
+    st.depth_test = true;
+    st.depth_write = true;
+    st.blend = true;      // (the default state: source over destination, every channel)
+    uint8_t vertices[3 * 2 * 16] = {};
+    CHECK(acc.draw_images(att, prog, st, ConstByteView(vertices, sizeof vertices), 3, ConstByteView()));
+    const FakePipeline* pl = static_cast<const FakePipeline*>(dev.commands.pipeline);
+    CHECK(dev.commands.draws == 1 && pl && pl->desc.blend.custom && !pl->desc.blend.enable && pl->desc.blend.write_mask == 0);
+    CHECK(pl && pl->desc.depth_test && pl->desc.depth_write && pl->desc.depth_compare == graphics::CompareOp::LessEqual && pl->desc.color_target_count == 1);
+    CHECK(dev.commands.pass.depth != nullptr && dev.commands.pass.color != nullptr);
+    // custom state with a mask of all channels, per-target state of none: masked all the same; the depth function is the state's
+    st.custom_blend = true;
+    st.color_mask = 0xF;
+    st.depth_compare = 1;
+    st.per_target = true;
+    CHECK(acc.draw_images(att, prog, st, ConstByteView(vertices, sizeof vertices), 3, ConstByteView()));
+    pl = static_cast<const FakePipeline*>(dev.commands.pipeline);
+    CHECK(dev.commands.draws == 2 && pl && pl->desc.blend.write_mask == 0 && !pl->desc.independent_blend && pl->desc.depth_compare == graphics::CompareOp::Less);
+    dev.features = 0;
+    st.custom_blend = false;
+    st.per_target = false;
+    CHECK(!acc.draw_images(att, prog, st, ConstByteView(vertices, sizeof vertices), 3, ConstByteView()));
+    CHECK(acc.last_failure() && strstr(acc.last_failure(), "colour masks") != nullptr);
+    acc.destroy_texture(depth);
     acc.destroy_program(prog);
   }
   CHECK(dev.images == 0 && dev.modules == 0 && dev.pipelines == 0);
@@ -1566,6 +1662,43 @@ static void test_instancing_and_buffer_state() {
   CHECK(a.live == 0);
 }
 
+// A framebuffer object with only a depth image, drawn with per-buffer colour masks on (glColorMaski): the draw is the device's, with no colour channel written.
+static void test_depth_only_framebuffer() {
+  TestAllocator a;
+  TgsiAccel ref;
+  set_accelerator(&ref);
+  {
+    GlContext gl(a, true, 32, 32, noaa());
+    static const char* kSolidVs = "attribute vec3 pos; void main() { gl_Position = vec4(pos, 1.0); }";
+    static const char* kSolidFs = "precision mediump float; void main() { gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0); }";
+    const uint32_t solid = make_program(gl, kSolidVs, kSolidFs);
+    const uint32_t rb = gl.create_renderbuffer();
+    gl.bind_renderbuffer(rb);
+    gl.renderbuffer_storage(0x81A5, 32, 32, 0);   // DEPTH_COMPONENT16
+    const uint32_t fb = gl.create_framebuffer();
+    gl.bind_framebuffer(0x8D40, fb);
+    gl.framebuffer_renderbuffer(0x8D40, 0x8D00, rb);
+    const uint32_t none = 0;
+    gl.draw_buffers(ArrayView<const uint32_t>(&none, 1));
+    gl.read_buffer(0);
+    CHECK(gl.check_framebuffer_status(0x8D40) == 0x8CD5);
+    gl.clear(0x100);
+    gl.enable(0x0B71, true);   // DEPTH_TEST
+    gl.use_program(solid);
+    quad_buffer(gl, solid, 0.0f);
+    gl.desktop.active = true;
+    gl.desktop.per_buffer_masks = true;
+    const uint64_t cpu0 = gl.hardware_stats().cpu_draws, draws0 = ref.image_draws;
+    gl.draw_arrays(4, 0, 6, 1);
+    CHECK(gl.hardware_stats().cpu_draws == cpu0 && ref.image_draws == draws0 + 1);
+    CHECK(ref.last_image_mask == 0);
+    gl.desktop.per_buffer_masks = false;
+    gl.desktop.active = false;
+  }
+  set_accelerator(nullptr);
+  CHECK(a.live == 0);
+}
+
 // A desktop GL program of the stages given (nullptr: not there).
 static uint32_t make_stage_program(GlContext& gl, const char* vs, const char* tcs, const char* tes, const char* gs, const char* fs) {
   const uint32_t p = gl.create_program();
@@ -1814,6 +1947,9 @@ int main() {
   test_translate_refusals();
   test_hardware_texture();
   test_device_textures();
+  test_depth_only_images();
+  test_batched_topologies();
+  test_depth_only_framebuffer();
   test_hardware_draw_and_readback();
   test_fallbacks();
   test_wide_device_state();

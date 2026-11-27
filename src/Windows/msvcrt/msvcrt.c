@@ -670,11 +670,39 @@ API double fmax(double a, double b) { return a > b ? a : b; }
 API double fmin(double a, double b) { return a < b ? a : b; }
 API int _isnan(double x) { return x != x; }
 API int _finite(double x) { return !(x != x) && !ld_isinf(x); }
-API int _fpclass(double x) { return x != x ? 2 : ld_isinf(x) ? (x < 0 ? 4 : 0x200) : 0x80; }
-API int __fpclassify(double x) { return x != x ? 0x0100 : ld_isinf(x) ? 0x0500 : x == 0 ? 0x4000 : 0x0400; }
+/* _fpclass: _FPCLASS_SNAN 1, _QNAN 2, _NINF 4, _NN 8 (negative normal), _ND 0x10 (negative denormal), _NZ 0x20, _PZ 0x40, _PD 0x80, _PN 0x100, _PINF 0x200 - from the
+ * bits, so that a denormal is told from a normal number (a compiler that refuses to emit denormal constants asks this of every constant). __fpclassify: mingw's
+ * FP_NAN 0x0100, FP_NORMAL 0x0400, FP_INFINITE 0x0500, FP_ZERO 0x4000, FP_SUBNORMAL 0x4400. */
+static void double_parts(double x, unsigned *exponent, unsigned long long *fraction, int *negative) {
+  union { double d; unsigned long long u; } v;
+  v.d = x;
+  *exponent = (unsigned)(v.u >> 52) & 0x7FFu;
+  *fraction = v.u & 0xFFFFFFFFFFFFFull;
+  *negative = (int)(v.u >> 63);
+}
+API int _fpclass(double x) {
+  unsigned e;
+  unsigned long long f;
+  int neg;
+  double_parts(x, &e, &f, &neg);
+  if (e == 0x7FF) return f == 0 ? (neg ? 0x4 : 0x200) : (f >> 51) & 1 ? 0x2 : 0x1;
+  if (e == 0) return f == 0 ? (neg ? 0x20 : 0x40) : (neg ? 0x10 : 0x80);
+  return neg ? 0x8 : 0x100;
+}
+API int __fpclassify(double x) {
+  unsigned e;
+  unsigned long long f;
+  int neg;
+  double_parts(x, &e, &f, &neg);
+  if (e == 0x7FF) return f == 0 ? 0x0500 : 0x0100;
+  if (e == 0) return f == 0 ? 0x4000 : 0x4400;
+  return 0x0400;
+}
 API int __setusermatherr(void *handler) { (void)handler; return 0; }
-/* The floating point environment of x86-64: the control word of the x87 unit is left as it is (53 bit precision is what threads start with, the CRT reports 64); the SSE
- * control and status register keeps the exception masks, the rounding mode and the flush-to-zero modes. */
+/* The floating point environment. x86-64: the SSE control and status register keeps the exception masks, the rounding mode and the flush-to-zero modes, and the
+ * control word of the x87 unit is left as it is (53 bit precision is what threads start with, the CRT reports 64). x86 (32-bit): as Windows' CRT, the x87 control
+ * word too - its exception masks, rounding, precision (_MCW_PC) and infinity control (_MCW_IC) -, the SSE register taking the masks, the rounding and the
+ * denormal modes; where the two disagree in masks or rounding the result has _EM_AMBIGUOUS. */
 #define FP_EM_INVALID 0x10u
 #define FP_EM_DENORMAL 0x80000u
 #define FP_EM_ZERODIVIDE 8u
@@ -696,7 +724,7 @@ static unsigned fp_flags_from_mxcsr(unsigned x) {
   if (x & 0x8000) f |= 0x1000000u;      /* _DN_FLUSH */
   return f;      /* (the precision field is 0: _PC_64) */
 }
-API unsigned _control87(unsigned value, unsigned mask) {
+static unsigned sse_control(unsigned value, unsigned mask) {
   unsigned x;
   __asm__ volatile("stmxcsr %0" : "=m"(x));
   const unsigned old = fp_flags_from_mxcsr(x);
@@ -717,6 +745,53 @@ API unsigned _control87(unsigned value, unsigned mask) {
   }
   return old;
 }
+#ifdef __i386__
+#define FP_MCW_PC 0x30000u
+#define FP_MCW_IC 0x40000u
+#define FP_EM_AMBIGUOUS 0x80000000u
+static unsigned fp_flags_from_x87(unsigned cw) {
+  unsigned f = 0;
+  if (cw & 0x1) f |= FP_EM_INVALID;
+  if (cw & 0x2) f |= FP_EM_DENORMAL;
+  if (cw & 0x4) f |= FP_EM_ZERODIVIDE;
+  if (cw & 0x8) f |= FP_EM_OVERFLOW;
+  if (cw & 0x10) f |= FP_EM_UNDERFLOW;
+  if (cw & 0x20) f |= FP_EM_INEXACT;
+  switch (cw & 0xC00) { case 0x400: f |= 0x100; break; case 0x800: f |= 0x200; break; case 0xC00: f |= 0x300; break; }      /* _RC_DOWN, _RC_UP, _RC_CHOP */
+  switch (cw & 0x300) { case 0x000: f |= 0x20000; break; case 0x200: f |= 0x10000; break; default: break; }      /* _PC_24, _PC_53 (_PC_64: 0) */
+  if (cw & 0x1000) f |= FP_MCW_IC;      /* _IC_AFFINE */
+  return f;
+}
+static unsigned x87_from_flags(unsigned cw, unsigned f) {
+  cw &= ~0x1F3Fu;
+  if (f & FP_EM_INVALID) cw |= 0x1;
+  if (f & FP_EM_DENORMAL) cw |= 0x2;
+  if (f & FP_EM_ZERODIVIDE) cw |= 0x4;
+  if (f & FP_EM_OVERFLOW) cw |= 0x8;
+  if (f & FP_EM_UNDERFLOW) cw |= 0x10;
+  if (f & FP_EM_INEXACT) cw |= 0x20;
+  switch (f & FP_MCW_RC) { case 0x100: cw |= 0x400; break; case 0x200: cw |= 0x800; break; case 0x300: cw |= 0xC00; break; }
+  switch (f & FP_MCW_PC) { case 0x20000: break; case 0x10000: cw |= 0x200; break; default: cw |= 0x300; break; }
+  if (f & FP_MCW_IC) cw |= 0x1000;
+  return cw;
+}
+API unsigned _control87(unsigned value, unsigned mask) {
+  unsigned short cw;
+  __asm__ volatile("fnstcw %0" : "=m"(cw));
+  unsigned flags = fp_flags_from_x87(cw);
+  const unsigned x87_mask = mask & (FP_MCW_EM | FP_MCW_RC | FP_MCW_PC | FP_MCW_IC);
+  if (x87_mask) {
+    flags = (flags & ~x87_mask) | (value & x87_mask);
+    cw = (unsigned short)x87_from_flags(cw, flags);
+    __asm__ volatile("fldcw %0" : : "m"(cw));
+  }
+  const unsigned sse = sse_control(value, mask & (FP_MCW_EM | FP_MCW_RC | FP_MCW_DN));
+  if ((flags ^ sse) & (FP_MCW_EM | FP_MCW_RC)) flags |= FP_EM_AMBIGUOUS;
+  return flags | (sse & FP_MCW_DN);
+}
+#else
+API unsigned _control87(unsigned value, unsigned mask) { return sse_control(value, mask); }
+#endif
 API unsigned _controlfp(unsigned value, unsigned mask) { return _control87(value, mask & ~FP_EM_DENORMAL); }
 API int _controlfp_s(unsigned *current, unsigned value, unsigned mask) {
   const unsigned valid = FP_MCW_EM | FP_MCW_RC | FP_MCW_DN | 0x30000u;
