@@ -22,13 +22,19 @@
 
 namespace graphics {
 
-bool register_dxg_node(dxgk::Kernel& kernel, RenderNode& node, allocators::IAllocator& allocator, bool software_fallback, bool* fell_back, DxgFallback* why) {
+bool register_dxg_node(dxgk::Kernel& kernel, RenderNode& node, allocators::IAllocator& allocator, bool software_fallback, bool* fell_back, DxgFallback* why, uint64_t shared_memory) {
   if (fell_back) *fell_back = false;
   dxgk::AdapterConfig config;
   config.display = node.gpu();
   uint64_t total = 0, used = 0;
-  // The budget is the GPU's own memory when it says how much it has; the integrated and virtual GPUs use system memory, for which the default budget stands.
-  if (config.display && config.display->video_memory(&total, &used) && total) config.local_memory_budget = total;
+  // The budget is the GPU's own memory when it says how much it has; the integrated and virtual GPUs use system memory: their share of it (`shared_memory`), or the
+  // default budget. (A virtual GPU's objects are the host's; what the guest keeps of them is their backing, counted by system_memory_limit.)
+  if (config.display && config.display->video_memory(&total, &used) && total) {
+    config.local_memory_budget = total;
+  } else if (shared_memory > config.local_memory_budget) {
+    config.local_memory_budget = shared_memory;
+    if (shared_memory > config.system_memory_limit) config.system_memory_limit = shared_memory;
+  }
   IGraphicsDevice* device = &node.device();
   if (node.accelerated()) {
     // The device draws a Direct3D triangle on a kernel of its own first (nothing of it is left behind); if it cannot, the CPU renderer is this adapter's device.
@@ -56,14 +62,14 @@ bool register_dxg_node(dxgk::Kernel& kernel, RenderNode& node, allocators::IAllo
   return kernel.add_adapter(*device, config) != dxgk::kInvalidIndex;
 }
 
-uint32_t register_dxg_adapters(dxgk::Kernel& kernel, GraphicsPool& pool, allocators::IAllocator& allocator, uint32_t* fallbacks, DxgFallback* why) {
+uint32_t register_dxg_adapters(dxgk::Kernel& kernel, GraphicsPool& pool, allocators::IAllocator& allocator, uint32_t* fallbacks, DxgFallback* why, uint64_t shared_memory) {
   uint32_t added = 0;
   if (fallbacks) *fallbacks = 0;
   for (uint32_t i = 0; i < pool.count(); ++i) {
     RenderNode* node = pool.render_node(i);
     if (!node) continue;
     bool fell_back = false;
-    if (register_dxg_node(kernel, *node, allocator, true, &fell_back, why)) ++added;
+    if (register_dxg_node(kernel, *node, allocator, true, &fell_back, why, shared_memory)) ++added;
     if (fell_back && fallbacks) ++*fallbacks;
   }
   return added;

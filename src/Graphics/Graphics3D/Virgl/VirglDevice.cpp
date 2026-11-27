@@ -191,7 +191,8 @@ class VirglBuffer final : public IBuffer {
  public:
   VirglBuffer(VirglDevice& device, uint64_t size, uint32_t usage, uint32_t extra_bind = 0) : device_(device) {
     hardware::VirtioGpu& gpu = device.gpu();
-    memory_ = allocate_dma_view<uint8_t>(gpu.allocator(), size, 4096);
+    // (virtio-gpu takes 64-bit guest addresses: the memory comes from where ordinary allocations do, not the scarce pool below 4 GiB)
+    memory_ = allocate_view<uint8_t>(gpu.allocator(), size, 4096);
     if (memory_.empty()) return;
     memory_.fill(0);
     bind_ = extra_bind;
@@ -763,7 +764,7 @@ class VirglImage final : public IImage {
     if (!backing_.empty()) return true;
     hardware::VirtioGpu& gpu = device_.gpu();
     const uint64_t bytes = pixel_count * bytes_per_pixel(desc_.format);
-    backing_ = allocate_dma_view<uint8_t>(gpu.allocator(), bytes, 4096);
+    backing_ = allocate_view<uint8_t>(gpu.allocator(), bytes, 4096);   // (64-bit guest addresses: see VirglBuffer)
     if (backing_.empty()) return false;
     ResourceAttachBacking attach{header(kCmdResourceAttachBacking), id_, 1,
                                  {reinterpret_cast<uint64_t>(backing_.data()), static_cast<uint32_t>(bytes), 0}};

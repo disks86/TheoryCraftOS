@@ -973,7 +973,8 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
   dxgk::Kernel dxg_kernel(shared_allocator);
   uint32_t dxg_fallbacks = 0;
   graphics::DxgFallback dxg_why;
-  uint32_t dxg_adapters = graphics::register_dxg_adapters(dxg_kernel, graphics_pool, shared_allocator, &dxg_fallbacks, &dxg_why);
+  // (a GPU without memory of its own shares half of the RAM, as Windows reports it)
+  uint32_t dxg_adapters = graphics::register_dxg_adapters(dxg_kernel, graphics_pool, shared_allocator, &dxg_fallbacks, &dxg_why, ram.total_bytes() / 2);
   // The CPU renderer as an adapter of its own (Windows has its "WARP" one) next to the display GPU's, so the 3D test can draw on either and compare.
   if (system_graphics.accelerated() && dxg_kernel.add_adapter(system_graphics.software_device(), dxgk::AdapterConfig()) != dxgk::kInvalidIndex) ++dxg_adapters;
   dxgk::set_system_kernel(&dxg_kernel);

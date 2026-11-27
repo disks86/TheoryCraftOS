@@ -32,10 +32,12 @@ struct DxgFallback {
   dxgk::NtStatus status = dxgk::status::kSuccess;
   bool picture_wrong = false;
 };
-uint32_t register_dxg_adapters(dxgk::Kernel& kernel, GraphicsPool& pool, allocators::IAllocator& allocator, uint32_t* fallbacks = nullptr, DxgFallback* why = nullptr);
+// `shared_memory`: the bytes of system memory a GPU that has no memory of its own (an integrated or a virtual one, which says no size) may keep its objects in - what
+// Windows reports as such a GPU's shared system memory, half of the RAM; 0 keeps dxgk::AdapterConfig's defaults.
+uint32_t register_dxg_adapters(dxgk::Kernel& kernel, GraphicsPool& pool, allocators::IAllocator& allocator, uint32_t* fallbacks = nullptr, DxgFallback* why = nullptr, uint64_t shared_memory = 0);
 
 // One node as an adapter (what the function above does for each GPU of the pool), for a GPU that comes up after the pool was made. With `software_fallback` false an accelerated node that
 // fails the self-test is not added at all (it is not given the CPU renderer: the machine has that adapter already); `*fell_back` says whether the self-test failed. True if an adapter was added.
-bool register_dxg_node(dxgk::Kernel& kernel, RenderNode& node, allocators::IAllocator& allocator, bool software_fallback, bool* fell_back = nullptr, DxgFallback* why = nullptr);
+bool register_dxg_node(dxgk::Kernel& kernel, RenderNode& node, allocators::IAllocator& allocator, bool software_fallback, bool* fell_back = nullptr, DxgFallback* why = nullptr, uint64_t shared_memory = 0);
 
 }  // namespace graphics
