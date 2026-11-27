@@ -1344,13 +1344,26 @@ class VirglPipeline final : public VirglPipelineBase {
       blend_rt = 1u | (virgl::kBlendAdd << 1) | (virgl::kBlendFactorSrcAlpha << 4) | (virgl::kBlendFactorInvSrcAlpha << 9) | (virgl::kBlendAdd << 14) | (virgl::kBlendFactorOne << 17) |
                  (virgl::kBlendFactorInvSrcAlpha << 22) | (0xFu << 27);
     }
-    cmd[n++] = virgl::header(virgl::kCreateObject, virgl::kObjectBlend, 11);
-    cmd[n++] = blend_;
-    // s0: independent blend enable, logic op enable, alpha to coverage (no dither...); s1: the logic op
-    cmd[n++] = (desc.independent_blend ? 1u : 0u) | (desc.logic_op_enable ? 1u << 1 : 0u) | (desc.alpha_to_coverage && desc.multisample ? 1u << 3 : 0u);
-    cmd[n++] = desc.logic_op_enable ? virgl::kLogicOps[static_cast<uint32_t>(desc.logic_op) & 0xF] : 0u;
-    cmd[n++] = blend_rt;
-    for (uint32_t i = 1; i < 8; ++i) cmd[n++] = desc.independent_blend && i < kMaxColorTargets ? (desc.target_blend[i - 1].custom ? render_target_blend(desc.target_blend[i - 1]) : 0xFu << 27) : 0u;
+    uint32_t target_rt[7];
+    for (uint32_t i = 1; i < 8; ++i) target_rt[i - 1] = desc.independent_blend && i < kMaxColorTargets ? (desc.target_blend[i - 1].custom ? render_target_blend(desc.target_blend[i - 1]) : 0xFu << 27) : 0u;
+    dual_source_ = (desc.blend.custom && desc.blend.uses_dual_source());
+    // Two blend objects: the pipeline's, and its reset variant (blend_reset()), where a target without blending blends by ONE, ZERO and ADD - the same picture -, so that the host
+    // sets its blend factors. The host leaves its factors as they were for a target without blending, and its OpenGL refuses every draw into more than one target while a
+    // factor names the second source (ARB_blend_func_extended): after a dual-source pipeline the next one is bound by its reset variant (VirglDevice::submit).
+    auto reset_rt = [](uint32_t rt) { return (rt & 1u) ? rt : (rt & (0xFu << 27)) | 1u | (virgl::kBlendAdd << 1) | (virgl::kBlendFactorOne << 4) | (virgl::kBlendFactorZero << 9) |
+                                                                  (virgl::kBlendAdd << 14) | (virgl::kBlendFactorOne << 17) | (virgl::kBlendFactorZero << 22); };
+    blend_reset_ = dual_source_ ? 0u : device.new_handle();
+    for (const uint32_t handle : {blend_, blend_reset_}) {
+      if (!handle) continue;
+      const bool reset = handle == blend_reset_;
+      cmd[n++] = virgl::header(virgl::kCreateObject, virgl::kObjectBlend, 11);
+      cmd[n++] = handle;
+      // s0: independent blend enable, logic op enable, alpha to coverage (no dither...); s1: the logic op
+      cmd[n++] = (desc.independent_blend ? 1u : 0u) | (desc.logic_op_enable ? 1u << 1 : 0u) | (desc.alpha_to_coverage && desc.multisample ? 1u << 3 : 0u);
+      cmd[n++] = desc.logic_op_enable ? virgl::kLogicOps[static_cast<uint32_t>(desc.logic_op) & 0xF] : 0u;
+      cmd[n++] = reset ? reset_rt(blend_rt) : blend_rt;
+      for (uint32_t i = 1; i < 8; ++i) cmd[n++] = reset && (desc.independent_blend && i < kMaxColorTargets) ? reset_rt(target_rt[i - 1]) : target_rt[i - 1];
+    }
 
     // Depth and stencil: the front faces' stencil state, and the back faces' (the same unless the pipeline has one of their own: the host then tests the faces apart).
     const uint32_t depth_func = desc.depth_test ? static_cast<uint32_t>(desc.depth_compare) : virgl::kFuncAlways;   // (CompareOp is numbered as PIPE_FUNC)
@@ -1436,6 +1449,7 @@ class VirglPipeline final : public VirglPipelineBase {
     if (own_fs_) device_.destroy_object(own_fs_);
     if (own_vs_) device_.destroy_object(own_vs_);
     device_.destroy_object(blend_);
+    if (blend_reset_) device_.destroy_object(blend_reset_);
     device_.destroy_object(dsa_);
     device_.destroy_object(rasterizer_);
     device_.destroy_object(elements_);
@@ -1443,6 +1457,9 @@ class VirglPipeline final : public VirglPipelineBase {
   bool valid() const { return ok_; }
   const GraphicsPipelineDesc& desc() const { return desc_; }
   uint32_t blend() const { return blend_; }
+  // The variant of the blend object that has the host set the blend factors of every target (see the constructor); 0 for a pipeline that blends with the second source.
+  uint32_t blend_reset() const { return blend_reset_; }
+  bool dual_source() const { return dual_source_; }
   uint32_t dsa() const { return dsa_; }
   uint32_t rasterizer() const { return rasterizer_; }
   uint32_t elements() const { return elements_; }
@@ -1490,7 +1507,8 @@ class VirglPipeline final : public VirglPipelineBase {
   uint32_t so_buffers_ = 0, capture_vertices_ = 0;
   uint8_t so_stream_of_buffer_[kMaxStreamOutputBuffers] = {};
   uint8_t stencil_reference_ = 0, stencil_back_reference_ = 0;
-  uint32_t blend_ = 0, dsa_ = 0, rasterizer_ = 0, elements_ = 0;
+  uint32_t blend_ = 0, blend_reset_ = 0, dsa_ = 0, rasterizer_ = 0, elements_ = 0;
+  bool dual_source_ = false;
   uint32_t own_fs_ = 0;   // (a fragment shader of the pipeline's own: the depth bias of a normalised format)
   uint8_t bindings_[kMaxVertexAttributes] = {};   // the slot of each host vertex buffer binding
   uint32_t own_vs_ = 0;   // the vertex shader made for this pipeline's vertex formats (0: none)
@@ -2163,6 +2181,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
     stream.put(0), stream.put(0), stream.put(0), stream.put(e.width), stream.put(e.height), stream.put(1);
   };
   bool in_pass = false;
+  bool blend_reset_bound = false;   // (the bound pipeline's blend object is its reset variant)
   PrimitiveTopology topology = PrimitiveTopology::TriangleList;
   const VirglComputePipeline* compute = nullptr;
   uint32_t patch_points = 0;
@@ -2714,8 +2733,15 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         pipeline = static_cast<const VirglPipeline*>(cmd.pipeline);
         if (!pipeline) return false;
         if (!pipeline->desc().stream_output_count) unset_stream_output();
+        // (after a pipeline that blends with the second source, the next one's reset variant until it has drawn: see VirglPipeline's blend objects)
         stream.command(virgl::kBindObject, virgl::kObjectBlend, 1);
-        stream.put(pipeline->blend());
+        if (pipeline->dual_source()) {
+          __atomic_store_n(&host_dual_source_factors_, true, __ATOMIC_RELAXED);
+          blend_reset_bound = false;
+        } else {
+          blend_reset_bound = __atomic_load_n(&host_dual_source_factors_, __ATOMIC_RELAXED);
+        }
+        stream.put(blend_reset_bound ? pipeline->blend_reset() : pipeline->blend());
         stream.command(virgl::kBindObject, virgl::kObjectDsa, 1);
         stream.put(pipeline->dsa());
         stream.command(virgl::kBindObject, virgl::kObjectRasterizer, 1);
@@ -2919,6 +2945,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         constexpr uint32_t kPsTarget = kTargetStatistic + static_cast<uint32_t>(PipelineStatistic::PsInvocations);
         const bool pause_ps = pipeline->desc().stand_in_fragment && queries.active[kPsTarget] >= 0;
         if (pause_ps) end_segment(kPsTarget);
+        if (blend_reset_bound) __atomic_store_n(&host_dual_source_factors_, false, __ATOMIC_RELAXED), blend_reset_bound = false;   // (the host has set the factors)
         stream.command(virgl::kDrawVbo, 0, patches ? 14 : 12);
         stream.put(indexed ? 0 : cmd.first);
         stream.put(cmd.count);

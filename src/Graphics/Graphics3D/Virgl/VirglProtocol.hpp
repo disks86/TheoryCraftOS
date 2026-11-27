@@ -181,7 +181,7 @@ constexpr uint32_t kBlendFactors[] = {0x11, 1, 2, 0x12, 3, 0x13, 5, 0x15, 4, 0x1
 constexpr uint32_t kLogicOps[] = {0, 15, 12, 3, 10, 5, 8, 7, 14, 1, 6, 9, 4, 2, 13, 11};
 constexpr uint32_t kPolygonFill = 0, kPolygonLine = 1;   // (PIPE_POLYGON_MODE_FILL, _LINE)
 constexpr uint32_t kStencilOps[] = {0, 1, 2, 3, 4, 7, 5, 6};   // by StencilOp (Keep Zero Replace IncrementClamp DecrementClamp Invert IncrementWrap DecrementWrap): PIPE_STENCIL_OP_*
-constexpr uint32_t kBlendFactorOne = 1, kBlendFactorSrcAlpha = 3, kBlendFactorInvSrcAlpha = 0x13;
+constexpr uint32_t kBlendFactorOne = 1, kBlendFactorSrcAlpha = 3, kBlendFactorInvSrcAlpha = 0x13, kBlendFactorZero = 0x11;
 constexpr uint32_t kClearDepth = 1u << 0, kClearStencil = 1u << 1, kClearColor0 = 1u << 2;
 // Sampler state (the S0 dword of a sampler state object) and sampler view swizzle.
 constexpr uint32_t kWrapRepeat = 0, kWrapClampToEdge = 2;
