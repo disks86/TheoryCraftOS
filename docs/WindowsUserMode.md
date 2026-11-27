@@ -180,7 +180,9 @@ A library is known by the **file** it was loaded from (`Module::file`, the OS pa
   `reference_library_file`), else that file is loaded as **a library of its own, even when another of that name is loaded**. So a ReShade- or ENB-style
   proxy `d3d9.dll` / `dxgi.dll` in a program's folder that loads the System32 copy by `GetSystemDirectory` + its name gets the real one, not itself.
   `GetModuleHandle(path)` is only the library of that file (no fall-back to the name); `GetModuleFileName` is the file's real path - for the libraries a
-  run-time load brings along too (the kernel's record says each one's folder: `LoadRecord.directory`, 592-byte records since 2026-11-26).
+  run-time load brings along too (the kernel's record says each one's folder: `LoadRecord.directory`, 592-byte records since 2026-11-26). A 32-bit
+  program's system libraries are listed as `C:\Windows\SysWOW64\...` (at start-up too), as Windows lists them; `GetModuleHandle` of their System32 path
+  finds them as well.
 - Uses are counted by library, not by name: `LdrAddRefDll`, `GetModuleHandleEx` and `LdrGetDllHandleEx` add a use of the library at an address
   (`NtLoadModule` flag 8), and a library's imports keep the uses of the libraries they were bound to (`Module::import_deps`), so a later library of the
   same name cannot take them.
