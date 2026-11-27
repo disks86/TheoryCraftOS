@@ -27,7 +27,7 @@ namespace opengl {
 namespace {
 bool is_cube_face(uint32_t t) { return t >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && t <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z; }
 
-constexpr uint32_t kMaxSize = 16384;
+constexpr uint32_t kMaxSize = 1u << (webgl::kMaxLevels - 1);      // (what the levels hold: GL_MAX_TEXTURE_SIZE, GlContext::max_texture_size)
 
 // The internal format a request stands for, by the source data when it does not name one precisely.
 const webgl::FormatInfo* format_for(uint32_t internal) {
@@ -250,7 +250,7 @@ void GlApi::texture_image(uint32_t target, int32_t level, int32_t internal, uint
     return;
   }
   uint32_t face;
-  webgl::Texture* t = texture_for_target(target, &face);
+  webgl::Texture* t = texture_for_target(target, &face, false);      // (the image is replaced: no pixels are read)
   if (!t) return;
   if (t->immutable) { error(GL_INVALID_OPERATION); return; }
   if (t->target == GL_TEXTURE_CUBE_MAP && (w != h || !is_cube_face(target))) { error(is_cube_face(target) ? GL_INVALID_VALUE : GL_INVALID_ENUM); return; }
@@ -265,8 +265,8 @@ void GlApi::texture_image(uint32_t target, int32_t level, int32_t internal, uint
   if (int_data != int_store && (format != GL_STENCIL_INDEX)) { error(GL_INVALID_OPERATION); return; }
   webgl::Image* im = gl_.make_texture_image(t, target, level);
   if (!im) { error(GL_OUT_OF_MEMORY); return; }
-  if (w == 0 || h == 0 || d == 0) { im->info = nullptr; im->w = im->h = im->d = 0; return; }
-  if (!im->allocate(fi, w, h, d)) { error(GL_OUT_OF_MEMORY); return; }
+  if (w == 0 || h == 0 || d == 0) { im->release(); return; }
+  if (!gl_.budget_allows(uint64_t{w} * h * d * webgl::texel_bytes(fi->store), im->stored_bytes()) || !im->allocate(fi, w, h, d)) { error(GL_OUT_OF_MEMORY); return; }
   im->compressed = 0;
   im->requested_internal = static_cast<uint32_t>(internal);
   ++gl_.version_;
@@ -283,12 +283,14 @@ void GlApi::texture_image(uint32_t target, int32_t level, int32_t internal, uint
 
 void GlApi::texture_sub_image(uint32_t target, int32_t level, int32_t xo, int32_t yo, int32_t zo, uint32_t w, uint32_t h, uint32_t d, uint32_t format, uint32_t type, UserPtr pixels) {
   uint32_t face;
-  webgl::Texture* t = texture_for_target(target, &face);
+  webgl::Texture* t = texture_for_target(target, &face, false);
   if (!t) return;
   webgl::Image* im = gl_.texture_image(t, target, level);
   if (!im || !im->defined()) { error(GL_INVALID_OPERATION); return; }
   if (xo < 0 || yo < 0 || zo < 0 || uint64_t(xo) + w > im->w || uint64_t(yo) + h > im->h || uint64_t(zo) + d > im->d) { error(GL_INVALID_VALUE); return; }
   if (w == 0 || h == 0 || d == 0) return;
+  if (im->compressed) { error(GL_INVALID_OPERATION); return; }      // (a compressed level is written with glCompressedTexSubImage*)
+  gl_.hw_sync_image(*im);      // (this image's pixels are written: the device's newer ones first)
   ByteBuffer data(a_);
   if (!pixels_in(w, h, d, format, type, pixels, &data, unpack_)) return;
   if (pixels.null() && gl_.pixel_unpack_ == 0) return;
@@ -326,11 +328,18 @@ void GlApi::glTexSubImage3D(GLenum target, GLint level, GLint xoffset, GLint yof
 void GlApi::texture_storage(uint32_t target, uint32_t levels, uint32_t internal, uint32_t w, uint32_t h, uint32_t d) {
   if (levels == 0 || w == 0 || h == 0 || d == 0) { error(GL_INVALID_VALUE); return; }
   uint32_t face;
-  webgl::Texture* t = texture_for_target(target, &face);
+  webgl::Texture* t = texture_for_target(target, &face, false);      // (new images: none is read)
   if (!t) return;
   if (t->immutable) { error(GL_INVALID_OPERATION); return; }
-  const webgl::FormatInfo* fi = format_for(internal);
+  // (a block-compressed format: its levels are kept as zero blocks until glCompressedTexSubImage writes them)
+  const webgl::CompressedFormat* cf = webgl::find_compressed(internal);
+  const webgl::FormatInfo* fi = cf ? webgl::find_format(cf->decoded) : format_for(internal);
   if (!fi) { error(GL_INVALID_ENUM); return; }
+  if (cf && t->target != GL_TEXTURE_2D && t->target != GL_TEXTURE_CUBE_MAP && t->target != GL_TEXTURE_2D_ARRAY && t->target != GL_TEXTURE_CUBE_MAP_ARRAY &&
+      !(t->target == GL_TEXTURE_3D && webgl::sliced_3d_codec(cf->codec))) {
+    error(GL_INVALID_OPERATION);
+    return;
+  }
   const bool cube = t->target == GL_TEXTURE_CUBE_MAP;
   const bool layered = t->target == GL_TEXTURE_2D_ARRAY || t->target == GL_TEXTURE_CUBE_MAP_ARRAY;
   const bool array1 = t->target == GL_TEXTURE_1D_ARRAY;
@@ -340,7 +349,17 @@ void GlApi::texture_storage(uint32_t target, uint32_t levels, uint32_t internal,
     const uint32_t ld = layered || array1 ? d : (d >> lv ? d >> lv : 1);
     for (uint32_t f = 0; f < (cube ? 6u : 1u); ++f) {
       webgl::Image* im = gl_.make_texture_image(t, cube ? GL_TEXTURE_CUBE_MAP_POSITIVE_X + f : t->target, static_cast<int32_t>(lv));
-      if (!im || !im->allocate(fi, lw, lh, ld)) { error(GL_OUT_OF_MEMORY); return; }
+      if (!im) { error(GL_OUT_OF_MEMORY); return; }
+      const uint64_t need = cf ? webgl::compressed_size(*cf, lw, lh, ld) : uint64_t{lw} * lh * ld * webgl::texel_bytes(fi->store);
+      if (!gl_.budget_allows(need, im->stored_bytes())) { error(GL_OUT_OF_MEMORY); return; }
+      if (cf) {
+        ByteBuffer zeros(a_);
+        if (!zeros.put_zeros(need) || !im->set_blocks(fi, cf, lw, lh, ld, zeros.view())) { error(GL_OUT_OF_MEMORY); return; }
+        im->compressed = internal;
+      } else {
+        if (!im->allocate(fi, lw, lh, ld)) { error(GL_OUT_OF_MEMORY); return; }
+        im->compressed = 0;
+      }
       im->requested_internal = internal;
     }
   }
@@ -383,7 +402,8 @@ void GlApi::copy_image(uint32_t target, int32_t level, uint32_t internal, int32_
   const bool ds = fi->store == webgl::Store::Depth || fi->store == webgl::Store::DepthStencil;
   if (!read_rectangle(x, y, w, h, ds, &data)) { error(GL_INVALID_OPERATION); return; }
   webgl::Image* im = gl_.make_texture_image(t, target, level);
-  if (!im || !im->allocate(fi, w, h, 1)) { error(GL_OUT_OF_MEMORY); return; }
+  if (!im || !gl_.budget_allows(uint64_t{w} * h * webgl::texel_bytes(fi->store), im->stored_bytes()) || !im->allocate(fi, w, h, 1)) { error(GL_OUT_OF_MEMORY); return; }
+  im->compressed = 0;
   im->requested_internal = internal;
   store_floats(*im, 0, 0, 0, w, h, 1, data.view(), false);
   ++gl_.version_;
@@ -593,7 +613,7 @@ bool GlApi::tex_parameter_get(uint32_t target, uint32_t pname, double* out, uint
     case GL_DEPTH_STENCIL_TEXTURE_MODE: *out = t->stencil_mode ? GL_STENCIL_INDEX : GL_DEPTH_COMPONENT; return true;
     case GL_TEXTURE_IMMUTABLE_FORMAT: *out = t->immutable; return true;
     case GL_TEXTURE_IMMUTABLE_LEVELS: *out = t->immutable_levels; return true;
-    case GL_TEXTURE_MAX_ANISOTROPY: *out = 1; return true;
+    case GL_TEXTURE_MAX_ANISOTROPY: *out = t->anisotropy; return true;
     default: break;
   }
   return gl_.get_tex_parameter(target, pname, out);
@@ -646,6 +666,7 @@ bool GlApi::tex_level_get(uint32_t target, int32_t level, uint32_t pname, double
   uint32_t w = 0, h = 0, d = 0, internal = 0;
   const webgl::FormatInfo* fi = nullptr;
   bool compressed = false;
+  uint32_t compressed_internal = 0;
   if (proxy_target(target, &real)) {
     const ProxyLevel& p = proxy_levels_[proxy_index(target)];
     w = p.w; h = p.h; d = p.d; internal = p.internal;
@@ -670,6 +691,7 @@ bool GlApi::tex_level_get(uint32_t target, int32_t level, uint32_t pname, double
       fi = im->info;
       internal = im->requested_internal ? im->requested_internal : (im->compressed ? im->compressed : im->info->internal);
       compressed = im->compressed != 0;
+      compressed_internal = im->compressed;
     }
   }
   const auto red_like = [&](uint32_t want_bits, bool has) { return has ? want_bits : 0u; };
@@ -692,6 +714,12 @@ bool GlApi::tex_level_get(uint32_t target, int32_t level, uint32_t pname, double
     case GL_TEXTURE_DEPTH_SIZE: *out = base == GL_DEPTH_COMPONENT || base == GL_DEPTH_STENCIL ? 24 : 0; return true;
     case GL_TEXTURE_STENCIL_SIZE: *out = base == GL_DEPTH_STENCIL ? 8 : 0; return true;
     case GL_TEXTURE_COMPRESSED: *out = compressed; return true;
+    case 0x86A0: {      // GL_TEXTURE_COMPRESSED_IMAGE_SIZE
+      const webgl::CompressedFormat* cf = compressed ? webgl::find_compressed(compressed_internal) : nullptr;
+      if (!cf) { error(GL_INVALID_OPERATION); return false; }
+      *out = static_cast<double>(webgl::compressed_size(*cf, w, h, d));
+      return true;
+    }
     case GL_TEXTURE_RED_TYPE: case GL_TEXTURE_GREEN_TYPE: case GL_TEXTURE_BLUE_TYPE: case GL_TEXTURE_ALPHA_TYPE: case GL_TEXTURE_LUMINANCE_TYPE: case GL_TEXTURE_INTENSITY_TYPE: case GL_TEXTURE_DEPTH_TYPE:
       *out = !fi ? GL_NONE : fi->store == webgl::Store::I32x4 ? GL_INT : fi->store == webgl::Store::U32x4 ? GL_UNSIGNED_INT : fi->is_float ? GL_FLOAT : fi->is_signed ? GL_SIGNED_NORMALIZED : GL_UNSIGNED_NORMALIZED;
       return true;
@@ -833,7 +861,7 @@ bool GlApi::sampler_get(uint32_t sampler, uint32_t pname, double* out, uint32_t*
     case GL_TEXTURE_MIN_LOD: *out = so->min_lod; return true;
     case GL_TEXTURE_MAX_LOD: *out = so->max_lod; return true;
     case GL_TEXTURE_LOD_BIAS: *out = so->lod_bias; return true;
-    case GL_TEXTURE_MAX_ANISOTROPY: *out = 1; return true;
+    case GL_TEXTURE_MAX_ANISOTROPY: *out = so->anisotropy; return true;
     case GL_TEXTURE_BORDER_COLOR: for (int i = 0; i < 4; ++i) out[i] = so->border[i]; *n = 4; return true;
     default: error(GL_INVALID_ENUM); return false;
   }
@@ -879,11 +907,22 @@ void GlApi::glSamplerParameterIuiv(GLuint sampler, GLenum pname, UserPtr param) 
 // No 1D compressed formats exist, and images are kept decoded: these say so as GL does for formats it does not take.
 void GlApi::glCompressedTexImage1D(GLenum, GLint, GLenum, GLsizei, GLint, GLsizei, UserPtr) { error(GL_INVALID_ENUM); }
 void GlApi::glCompressedTexSubImage1D(GLenum, GLint, GLint, GLsizei, GLenum, GLsizei, UserPtr) { error(GL_INVALID_ENUM); }
-void GlApi::glGetCompressedTexImage(GLenum target, GLint level, UserPtr) {
+// The blocks of a compressed level, as they were uploaded (the image keeps them: webgl::Image::blocks), to client memory or the pixel pack buffer.
+void GlApi::glGetCompressedTexImage(GLenum target, GLint level, UserPtr img) {
   uint32_t face;
-  webgl::Texture* t = texture_for_target(target, &face);
+  webgl::Texture* t = texture_for_target(target, &face, false);
   if (!t) return;
-  error(GL_INVALID_OPERATION);      // (the blocks a compressed image came in are not kept)
+  if (level < 0 || level >= static_cast<int32_t>(webgl::kMaxLevels)) { error(GL_INVALID_VALUE); return; }
+  webgl::Image* im = gl_.texture_image(t, target, level);
+  if (!im || !im->defined() || !im->compressed || !im->blocks_current()) { error(GL_INVALID_OPERATION); return; }
+  const ConstByteView blocks = im->blocks.view();
+  if (webgl::Buffer* pbo = gl_.buffer_at(gl_.pixel_pack_)) {
+    ByteView dst;
+    if (!pbo->data.writable_view().try_subview(img.address, blocks.size(), &dst)) { error(GL_INVALID_OPERATION); return; }
+    dst.copy_from(blocks);
+    return;
+  }
+  if (!write_client(img, blocks)) error(GL_INVALID_OPERATION);
 }
 
 }  // namespace opengl

@@ -1036,6 +1036,8 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
     Entry(Level::Info, "OpenGL").text("the device refused a program: ").text(why).text(" (stage ").dec(stage).text(", line ").dec(line).text(")");
     if (!text.empty()) Entry(Level::Info, "OpenGL").text("  ").text(text);
   });
+  // (a desktop GL program's textures and buffers may take half of the machine's memory: a game's are far larger than a web page's)
+  system_gl.set_memory_budget(ram.total_bytes() / 2);
   system_gl.set_report([](uint64_t pid, const webgl::GlContext::HardwareStats& stats, const char* what) {
     Entry(Level::Info, "OpenGL").text("process ").dec(pid).text(": ").text(what).dec(stats.gpu_draws).text(" draws on the GPU, ").dec(stats.cpu_draws).text(" on the CPU, ").dec(stats.gpu_clears).text(" framebuffer object clears on the GPU");
     for (const auto& r : stats.reasons)      // (a line each: a log entry has a length)

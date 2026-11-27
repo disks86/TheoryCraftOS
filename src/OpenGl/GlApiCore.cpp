@@ -61,6 +61,7 @@ GlApi::GlApi(allocators::IAllocator& allocator, ShareGroup& group, const Context
     : a_(allocator), group_(&group), config_(config), gl_(allocator, true, 1, 1, engine_attributes(config), &group.objects), client_strings_(allocator), renderer_(allocator), attrib_stack_(allocator), client_stack_(allocator),
       fixed_programs_(allocator), imm_(allocator), tri_edges_(allocator), vao_names_(allocator), fbo_names_(allocator), query_names_(allocator), tf_names_(allocator), mappings_(allocator), live_syncs_(allocator) {
   gl_.desktop.active = true;
+  gl_.set_max_texture_size(1u << (webgl::kMaxLevels - 1));      // (desktop GL: as large as the levels hold - GL_MAX_TEXTURE_SIZE)
   for (uint32_t& hint : fx_.hints) hint = GL_DONT_CARE;
   __builtin_memset(fx_.polygon_pattern, 0xFF, sizeof(fx_.polygon_pattern));
   gl_.desktop.point_max = 2047;

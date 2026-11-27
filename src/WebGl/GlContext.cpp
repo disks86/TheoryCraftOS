@@ -46,7 +46,12 @@ GlContext::GlContext(allocators::IAllocator& a, bool es3, uint32_t width, uint32
   valid_ = dcolor_->defined();
 }
 
-GlContext::~GlContext() { hw_drop(); }
+GlContext::~GlContext() {
+  hw_drop();
+  if (hw_incomplete_owner_)
+    for (uint32_t h : hw_incomplete_)
+      if (h) hw_incomplete_owner_->destroy_texture(h);
+}
 
 void GlContext::restore() { lost_ = false; }
 
@@ -121,6 +126,7 @@ uint32_t GlContext::create_framebuffer() {
 }
 uint32_t GlContext::create_renderbuffer() {
   UniquePointer<Renderbuffer> b = UniquePointer<Renderbuffer>::make(a_, a_);
+  if (b) b->image.set_budget(&objects_->budget);
   if (!b || !objects_->rbos.push_back(static_cast<UniquePointer<Renderbuffer>&&>(b))) { set_error(OUT_OF_MEMORY); return 0; }
   return static_cast<uint32_t>(objects_->rbos.count());
 }
@@ -165,7 +171,7 @@ void GlContext::delete_object(uint32_t kind, uint32_t id) {
   switch (kind) {
     case 'b':
       if (id <= objects_->buffers.count()) {
-        if (buffer_at(id)) { total_bytes_ -= buffer_at(id)->data.size() < total_bytes_ ? buffer_at(id)->data.size() : total_bytes_; }
+        if (buffer_at(id)) { const uint64_t n = buffer_at(id)->data.size(); objects_->budget.bytes -= n < objects_->budget.bytes ? n : objects_->budget.bytes; }
         objects_->buffers[id - 1].reset();
         if (array_buffer_ == id) array_buffer_ = 0;
         if (copy_read_ == id) copy_read_ = 0;
@@ -339,12 +345,11 @@ void GlContext::buffer_data(uint32_t target, ConstByteView data, uint64_t size, 
     return;
   }
   const uint64_t n = data.size() ? data.size() : size;
-  if (n > (256ull << 20) || total_bytes_ - (b->data.size() < total_bytes_ ? b->data.size() : total_bytes_) + n > kMaxTotalBytes) { set_error(OUT_OF_MEMORY); return; }
-  total_bytes_ -= b->data.size() < total_bytes_ ? b->data.size() : total_bytes_;
+  if (!budget_allows(n, b->data.size())) { set_error(OUT_OF_MEMORY); return; }
+  objects_->budget.bytes -= b->data.size() < objects_->budget.bytes ? b->data.size() : objects_->budget.bytes;
   b->data.clear();
-  if (data.size()) b->data.append(data);
-  else b->data.put_zeros(n);
-  total_bytes_ += n;
+  if (!(data.size() ? b->data.append(data) : b->data.put_zeros(n))) { b->data.clear(); set_error(OUT_OF_MEMORY); return; }
+  objects_->budget.bytes += n;
   b->usage = usage;
 }
 
@@ -458,7 +463,10 @@ Image* GlContext::texture_image(Texture* t, uint32_t target, int32_t level) {
 Image* GlContext::make_texture_image(Texture* t, uint32_t target, int32_t level) {
   const uint64_t idx = uint64_t{face_index(target)} * kMaxLevels + static_cast<uint32_t>(level);
   if (idx >= t->images.count()) return nullptr;
-  if (!t->images[idx]) t->images[idx] = UniquePointer<Image>::make(a_, a_);
+  if (!t->images[idx]) {
+    t->images[idx] = UniquePointer<Image>::make(a_, a_);
+    if (t->images[idx]) t->images[idx]->set_budget(&objects_->budget);
+  }
   return t->images[idx].get();
 }
 
@@ -481,7 +489,7 @@ void GlContext::tex_image(uint32_t target, int32_t level, uint32_t internal, uin
   if (border != 0 || level < 0 || level >= static_cast<int32_t>(kMaxLevels)) { set_error(INVALID_VALUE); return; }
   const bool layered = t->target == 0x806F || t->target == 0x8C1A;
   if (three_d != layered) { set_error(INVALID_ENUM); return; }
-  if (w > kMaxTextureSize || h > kMaxTextureSize || d > (t->target == 0x806F ? 256u : 2048u)) { set_error(INVALID_VALUE); return; }
+  if (w > max_texture_size_ || h > max_texture_size_ || d > (t->target == 0x806F ? 256u : 2048u)) { set_error(INVALID_VALUE); return; }
   if (t->target == 0x8513 && w != h) { set_error(INVALID_VALUE); return; }
   const FormatInfo* fi = resolve_format(es3_, internal, format, type);
   if (!fi) { set_error(INVALID_ENUM); return; }
@@ -493,16 +501,13 @@ void GlContext::tex_image(uint32_t target, int32_t level, uint32_t internal, uin
   Image* im = make_texture_image(t, target, level);
   if (!im) { set_error(INVALID_OPERATION); return; }
   const uint64_t need = uint64_t{w} * h * d * texel_bytes(fi->store);
-  if (need > (256ull << 20) || total_bytes_ + need > kMaxTotalBytes) { set_error(OUT_OF_MEMORY); return; }
-  if (im->defined()) total_bytes_ -= im->px.size() < total_bytes_ ? im->px.size() : total_bytes_;
+  if (!budget_allows(need, im->stored_bytes())) { set_error(OUT_OF_MEMORY); return; }
   if (w == 0 || h == 0 || d == 0) {
-    im->info = nullptr;
-    im->w = im->h = 0;
+    im->release();
     return;
   }
   if (!im->allocate(fi, w, h, d)) { set_error(OUT_OF_MEMORY); return; }
   im->compressed = 0;
-  total_bytes_ += im->px.size();
   if (has_data) {
     uint32_t err = 0;
     if (!write_region(*im, 0, 0, 0, w, h, d, format, type, data, unpack, &err)) set_error(err);
@@ -515,10 +520,11 @@ void GlContext::tex_image(uint32_t target, int32_t level, uint32_t internal, uin
 void GlContext::tex_sub_image(uint32_t target, int32_t level, int32_t xo, int32_t yo, int32_t zo, uint32_t w, uint32_t h, uint32_t d, uint32_t format, uint32_t type, ConstByteView data,
                               bool three_d) {
   uint32_t face;
-  Texture* t = bound_texture_for(target, &face);
+  Texture* t = bound_texture_for(target, &face, false);
   if (!t) return;
   Image* im = texture_image(t, target, level);
   if (!im || im->compressed) { set_error(INVALID_OPERATION); return; }
+  hw_sync_image(*im);      // (only this image's pixels are written)
   const bool layered = t->target == 0x806F || t->target == 0x8C1A;
   if (three_d != layered) { set_error(INVALID_ENUM); return; }
   if (xo < 0 || yo < 0 || zo < 0 || uint64_t{static_cast<uint32_t>(xo)} + w > im->w || uint64_t{static_cast<uint32_t>(yo)} + h > im->h || uint64_t{static_cast<uint32_t>(zo)} + d > im->d) {
@@ -532,32 +538,30 @@ void GlContext::tex_sub_image(uint32_t target, int32_t level, int32_t xo, int32_
 
 void GlContext::compressed_tex_image(uint32_t target, int32_t level, uint32_t internal, uint32_t w, uint32_t h, uint32_t d, int32_t border, ConstByteView data, bool three_d) {
   uint32_t face;
-  Texture* t = bound_texture_for(target, &face);
+  Texture* t = bound_texture_for(target, &face, false);      // (a new image: no pixels are read)
   if (!t) return;
   const CompressedFormat* cf = find_compressed(internal);
   if (!cf) { set_error(INVALID_ENUM); return; }
   const bool layered = t->target == 0x806F || t->target == 0x8C1A;
-  if (border != 0 || level < 0 || level >= static_cast<int32_t>(kMaxLevels) || w > kMaxTextureSize || h > kMaxTextureSize || three_d != layered) { set_error(INVALID_VALUE); return; }
+  if (border != 0 || level < 0 || level >= static_cast<int32_t>(kMaxLevels) || w > max_texture_size_ || h > max_texture_size_ || three_d != layered) { set_error(INVALID_VALUE); return; }
   if (t->target == 0x806F && !sliced_3d_codec(cf->codec)) { set_error(INVALID_OPERATION); return; }   // only RGTC and BPTC are allowed in a 3D texture
   if (t->immutable) { set_error(INVALID_OPERATION); return; }
   if (data.size() != compressed_size(*cf, w, h, d)) { set_error(INVALID_VALUE); return; }
   Image* im = make_texture_image(t, target, level);
   const FormatInfo* fi = find_format(cf->decoded);
   if (!im || !fi) { set_error(INVALID_OPERATION); return; }
-  const uint64_t need = uint64_t{w} * h * d * texel_bytes(fi->store);
-  if (need > (256ull << 20) || total_bytes_ + need > kMaxTotalBytes) { set_error(OUT_OF_MEMORY); return; }
-  if (im->defined()) total_bytes_ -= im->px.size() < total_bytes_ ? im->px.size() : total_bytes_;
-  if (w == 0 || h == 0 || d == 0) { im->info = nullptr; im->w = im->h = 0; return; }
-  if (!im->allocate(fi, w, h, d)) { set_error(OUT_OF_MEMORY); return; }
-  total_bytes_ += im->px.size();
+  // (kept as the blocks it came in: decoded only when the CPU needs its texels - Image::lazy -, the device takes them as they are)
+  if (!budget_allows(data.size(), im->stored_bytes())) { set_error(OUT_OF_MEMORY); return; }
+  if (w == 0 || h == 0 || d == 0) { im->release(); return; }
+  if (!im->set_blocks(fi, cf, w, h, d, data)) { set_error(OUT_OF_MEMORY); return; }
   im->compressed = internal;
-  if (!decode_compressed(*cf, data, w, h, d, im, 0, 0, 0)) set_error(INVALID_VALUE);
+  im->requested_internal = 0;      // (the format it reads back as is the compressed one)
   ++version_;
 }
 
 void GlContext::compressed_tex_sub_image(uint32_t target, int32_t level, int32_t xo, int32_t yo, int32_t zo, uint32_t w, uint32_t h, uint32_t d, uint32_t format, ConstByteView data, bool three_d) {
   uint32_t face;
-  Texture* t = bound_texture_for(target, &face);
+  Texture* t = bound_texture_for(target, &face, false);      // (the one image is synced below when it is not lazy)
   if (!t) return;
   const CompressedFormat* cf = find_compressed(format);
   if (!cf) { set_error(INVALID_ENUM); return; }
@@ -571,17 +575,21 @@ void GlContext::compressed_tex_sub_image(uint32_t target, int32_t level, int32_t
     return;
   }
   if (data.size() != compressed_size(*cf, w, h, d)) { set_error(INVALID_VALUE); return; }
-  decode_compressed(*cf, data, w, h, d, im, static_cast<uint32_t>(xo), static_cast<uint32_t>(yo), static_cast<uint32_t>(zo));
+  // (the blocks are kept: the image's blocks change, and it is lazy again - its decoded pixels, if it had them, go)
+  if (!im->replace_blocks(static_cast<uint32_t>(xo), static_cast<uint32_t>(yo), static_cast<uint32_t>(zo), w, h, d, data)) {
+    hw_sync_image(*im);
+    decode_compressed(*cf, data, w, h, d, im, static_cast<uint32_t>(xo), static_cast<uint32_t>(yo), static_cast<uint32_t>(zo));
+  }
   ++version_;
 }
 
 void GlContext::tex_storage(uint32_t target, uint32_t levels, uint32_t internal, uint32_t w, uint32_t h, uint32_t d) {
   uint32_t face;
-  Texture* t = bound_texture_for(target, &face);
+  Texture* t = bound_texture_for(target, &face, false);      // (new images: none is read)
   if (!t) return;
   const CompressedFormat* cf = find_compressed(internal);
   const FormatInfo* fi = cf ? find_format(cf->decoded) : find_format(internal);
-  if (!fi || levels == 0 || levels > kMaxLevels || w == 0 || h == 0 || d == 0 || w > kMaxTextureSize || h > kMaxTextureSize) { set_error(fi ? INVALID_VALUE : INVALID_ENUM); return; }
+  if (!fi || levels == 0 || levels > kMaxLevels || w == 0 || h == 0 || d == 0 || w > max_texture_size_ || h > max_texture_size_) { set_error(fi ? INVALID_VALUE : INVALID_ENUM); return; }
   if (t->immutable) { set_error(INVALID_OPERATION); return; }
   const uint32_t faces = t->target == 0x8513 ? 6 : 1;
   const bool layered = t->target == 0x806F;
@@ -589,9 +597,18 @@ void GlContext::tex_storage(uint32_t target, uint32_t levels, uint32_t internal,
     for (uint32_t l = 0; l < levels; ++l) {
       const uint32_t lw = w >> l ? w >> l : 1, lh = h >> l ? h >> l : 1, ld = layered ? (d >> l ? d >> l : 1) : d;
       Image* im = make_texture_image(t, t->target == 0x8513 ? 0x8515 + f : t->target, static_cast<int32_t>(l));
-      if (!im || !im->allocate(fi, lw, lh, ld)) { set_error(OUT_OF_MEMORY); return; }
-      if (cf) im->compressed = internal;
-      total_bytes_ += im->px.size();
+      if (!im) { set_error(OUT_OF_MEMORY); return; }
+      // (a compressed format's levels are zero blocks until written: the storage it is kept in)
+      const uint64_t need = cf ? compressed_size(*cf, lw, lh, ld) : uint64_t{lw} * lh * ld * texel_bytes(fi->store);
+      if (!budget_allows(need, im->stored_bytes())) { set_error(OUT_OF_MEMORY); return; }
+      if (cf) {
+        ByteBuffer zeros(a_);
+        if (!zeros.put_zeros(need) || !im->set_blocks(fi, cf, lw, lh, ld, zeros.view())) { set_error(OUT_OF_MEMORY); return; }
+        im->compressed = internal;
+      } else if (!im->allocate(fi, lw, lh, ld)) {
+        set_error(OUT_OF_MEMORY);
+        return;
+      }
     }
   t->immutable = true;
   t->immutable_levels = levels;
@@ -617,7 +634,10 @@ void GlContext::tex_parameter(uint32_t target, uint32_t pname, double value) {
     case 0x813D: t->max_level = static_cast<int32_t>(value); break;
     case 0x813A: t->min_lod = static_cast<float>(value); break;
     case 0x813B: t->max_lod = static_cast<float>(value); break;
-    case 0x84FE: break;   // anisotropy is accepted and ignored
+    case 0x84FE:      // GL_TEXTURE_MAX_ANISOTROPY: at least 1, at most what the implementation has (the CPU's sampler takes one sample: as anisotropy 1, which the extension allows)
+      if (!(value >= 1.0)) { set_error(INVALID_VALUE); return; }
+      t->anisotropy = value > kMaxAnisotropy ? kMaxAnisotropy : static_cast<float>(value);
+      break;
     default: set_error(INVALID_ENUM); break;
   }
   ++version_;
@@ -640,7 +660,7 @@ bool GlContext::get_tex_parameter(uint32_t target, uint32_t pname, double* out) 
     case 0x813D: *out = t->max_level; return true;
     case 0x813A: *out = t->min_lod; return true;
     case 0x813B: *out = t->max_lod; return true;
-    case 0x84FE: *out = 1; return true;
+    case 0x84FE: *out = t->anisotropy; return true;
     case 0x912F: *out = t->immutable; return true;
     case 0x82DF: *out = t->immutable_levels; return true;
     default: set_error(INVALID_ENUM); return false;
@@ -680,9 +700,8 @@ void GlContext::generate_mipmap(uint32_t target) {
       Image* src = texture_image(t, tgt, l - 1);
       Image* dst = make_texture_image(t, tgt, l);
       if (!src || !dst) break;
-      if (dst->defined()) total_bytes_ -= dst->px.size() < total_bytes_ ? dst->px.size() : total_bytes_;
+      if (!budget_allows(uint64_t{w} * h * d * texel_bytes(src->info->store), dst->stored_bytes())) { set_error(OUT_OF_MEMORY); return; }
       if (!dst->allocate(src->info, w, h, d)) { set_error(OUT_OF_MEMORY); return; }
-      total_bytes_ += dst->px.size();
       downsample(*src, dst);
     }
   }
@@ -703,6 +722,11 @@ void GlContext::sampler_parameter(uint32_t id, uint32_t pname, double value) {
     case 0x884D: s->compare_func = v; break;
     case 0x813A: s->min_lod = static_cast<float>(value); break;
     case 0x813B: s->max_lod = static_cast<float>(value); break;
+    case 0x8501: s->lod_bias = static_cast<float>(value); break;      // GL_TEXTURE_LOD_BIAS
+    case 0x84FE:
+      if (!(value >= 1.0)) { set_error(INVALID_VALUE); return; }
+      s->anisotropy = value > kMaxAnisotropy ? kMaxAnisotropy : static_cast<float>(value);
+      break;
     default: break;
   }
 }
@@ -740,13 +764,12 @@ void GlContext::renderbuffer_storage(uint32_t internal, uint32_t w, uint32_t h, 
   const FormatInfo* fi = find_format(internal);
   if (internal == 0x84F9) fi = find_format(0x88F0);
   if (!fi) { set_error(INVALID_ENUM); return; }
-  if (w > kMaxTextureSize || h > kMaxTextureSize) { set_error(INVALID_VALUE); return; }
-  if (rb->image.defined()) total_bytes_ -= rb->image.px.size() < total_bytes_ ? rb->image.px.size() : total_bytes_;
-  if (w == 0 || h == 0) { rb->image.info = nullptr; rb->image.w = rb->image.h = 0; return; }
+  if (w > max_texture_size_ || h > max_texture_size_) { set_error(INVALID_VALUE); return; }
+  if (w == 0 || h == 0) { rb->image.release(); return; }
   const uint32_t ss = samples > 1 ? 2 : 1;
+  if (!budget_allows(uint64_t{w} * ss * h * ss * texel_bytes(fi->store), rb->image.stored_bytes())) { set_error(OUT_OF_MEMORY); return; }
   if (!rb->image.allocate(fi, w * ss, h * ss, 1)) { set_error(OUT_OF_MEMORY); return; }
   rb->image.ss = ss;
-  total_bytes_ += rb->image.px.size();
   rb->internal = internal;
   rb->samples = samples;
 }
@@ -1251,9 +1274,10 @@ uint32_t GlContext::current_query(uint32_t target, uint32_t index) const {
 bool GlContext::get_integer(uint32_t pname, double* o, uint32_t* count) {
   *count = 1;
   switch (pname) {
-    case 0x0D33: *o = kMaxTextureSize; return true;
-    case 0x851C: *o = kMaxTextureSize; return true;
-    case 0x84E8: *o = kMaxTextureSize; return true;
+    case 0x0D33: *o = max_texture_size_; return true;
+    case 0x84FF: *o = static_cast<int64_t>(kMaxAnisotropy); return true;      // GL_MAX_TEXTURE_MAX_ANISOTROPY
+    case 0x851C: *o = max_texture_size_; return true;
+    case 0x84E8: *o = max_texture_size_; return true;
     case 0x8073: *o = 256; return true;
     case 0x88FF: *o = 2048; return true;
     case 0x8869: *o = kMaxAttribs; return true;

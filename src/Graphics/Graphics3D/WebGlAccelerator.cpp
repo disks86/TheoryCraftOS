@@ -17,6 +17,7 @@
  */
 
 #include "Graphics/Graphics3D/WebGlAccelerator.hpp"
+#include "Graphics/BlockCompression.hpp"
 #include "Utility/AllocatedView.hpp"
 #include "Utility/ByteStream.hpp"
 #include "WebGl/TgsiTranslator.hpp"
@@ -27,6 +28,7 @@ WebGlAccelerator::WebGlAccelerator(IGraphicsDevice& device, allocators::IAllocat
     : blanks_(allocator), device_(device), allocator_(allocator), programs_(allocator), targets_(allocator), textures_(allocator) {}
 
 WebGlAccelerator::~WebGlAccelerator() {
+  (void)flush_pending();      // (the draws not yet sent go before what they use)
   for (auto& p : programs_)
     if (p) destroy_program_locked(*p);
   for (auto& t : textures_)
@@ -86,7 +88,131 @@ webgl::AccelLimits WebGlAccelerator::limits() const {
   l.depth_bias = info.limits.depth_bias;
   l.layered_textures = (info.features & kFeatureTextureKinds) != 0;
   l.stencil = info.limits.stencil;
+  // (the GL path's samplers: border colours and mirror-once need the address modes, a separate magnification filter and anisotropy the sampler state)
+  l.sampler_state = (info.features & kFeatureAddressModes) && (info.features2 & kFeature2SamplerState) && (info.features2 & kFeature2SeparateFilters);
+  l.max_anisotropy = l.sampler_state ? kMaxAnisotropy : 1;
+  l.texture_levels = (info.features & kFeatureTextureKinds) && (info.features2 & kFeature2MipmappedLayers);
   return l;
+}
+
+namespace {
+// The device's format of a block-compressed AccelBlocks (Undefined for None).
+Format blocks_format(webgl::AccelBlocks b) {
+  using B = webgl::AccelBlocks;
+  switch (b) {
+    case B::Bc1: return Format::Bc1Unorm;
+    case B::Bc1Srgb: return Format::Bc1Srgb;
+    case B::Bc2: return Format::Bc2Unorm;
+    case B::Bc2Srgb: return Format::Bc2Srgb;
+    case B::Bc3: return Format::Bc3Unorm;
+    case B::Bc3Srgb: return Format::Bc3Srgb;
+    case B::Bc4U: return Format::Bc4Unorm;
+    case B::Bc4S: return Format::Bc4Snorm;
+    case B::Bc5U: return Format::Bc5Unorm;
+    case B::Bc5S: return Format::Bc5Snorm;
+    case B::Bc6U: return Format::Bc6hUfloat;
+    case B::Bc6S: return Format::Bc6hSfloat;
+    case B::Bc7: return Format::Bc7Unorm;
+    case B::Bc7Srgb: return Format::Bc7Srgb;
+    case B::None: break;
+  }
+  return Format::Undefined;
+}
+}  // namespace
+
+bool WebGlAccelerator::takes_blocks(webgl::AccelBlocks blocks) const {
+  const Format f = blocks_format(blocks);
+  if (f == Format::Undefined) return false;
+  // (BC1-3 are the device's with kFeatureCompressedFormats; the others when it keeps them as blocks - kFormatNative - and samples them)
+  if (static_cast<uint32_t>(f) < static_cast<uint32_t>(Format::R8Unorm)) return (device_.info().features & kFeatureCompressedFormats) != 0;
+  const uint32_t caps = device_.format_caps(f);
+  return (caps & kFormatSampled) && (caps & kFormatNative) && (caps & kFormatMipmaps);
+}
+
+uint32_t WebGlAccelerator::create_texture_levels(const webgl::AccelTextureDesc& desc) {
+  const webgl::AccelLimits l = limits();
+  using webgl::AccelKind;
+  if (!l.texture_levels || desc.w == 0 || desc.h == 0 || desc.levels == 0 || desc.levels > mip_level_limit({desc.w, desc.h}) || desc.layers == 0 || desc.layers > kMaxTextureLayers) return 0;
+  if (desc.kind == AccelKind::Plain && desc.layers != 1) return 0;
+  if (desc.kind == AccelKind::Cube && (desc.layers != 6 || desc.w != desc.h)) return 0;
+  ImageDesc d;
+  d.extent = {desc.w, desc.h};
+  d.mip_levels = desc.levels;
+  d.usage = kImageSampled;
+  d.kind = desc.kind == AccelKind::Volume ? TextureKind::Texture3D : desc.kind == AccelKind::Cube ? TextureKind::TextureCube : desc.kind == AccelKind::Array ? TextureKind::Texture2DArray : TextureKind::Texture2D;
+  d.layers = desc.layers;
+  if (desc.blocks != webgl::AccelBlocks::None) {
+    if (!takes_blocks(desc.blocks)) return 0;
+    d.format = blocks_format(desc.blocks);
+  } else {
+    switch (desc.format) {
+      case webgl::AccelFormat::Rgba8: d.format = Format::B8G8R8A8Unorm; break;
+      case webgl::AccelFormat::Rgba8Srgb:
+        if (!l.srgb_images) return 0;
+        d.format = Format::B8G8R8A8Srgb;
+        break;
+      case webgl::AccelFormat::Rgba16F:
+      case webgl::AccelFormat::Rgba32F:
+        if (!l.float_textures) return 0;
+        d.format = desc.format == webgl::AccelFormat::Rgba16F ? Format::R16G16B16A16Float : Format::R32G32B32A32Float;
+        break;
+      default: return 0;
+    }
+  }
+  kernel::ScopedMutex guard(lock_);
+  UniquePointer<Texture> t = UniquePointer<Texture>::make(allocator_);
+  if (!t) return 0;
+  t->width = desc.w;
+  t->height = desc.h;
+  t->format = desc.format;
+  t->levels = desc.levels;
+  t->layers = desc.layers;
+  t->kind = desc.kind;
+  t->blocks = desc.blocks;
+  t->sampled_levels = true;
+  t->image = device_.create_image(d);
+  if (!t->image) return 0;
+  return add_texture(static_cast<UniquePointer<Texture>&&>(t));
+}
+
+bool WebGlAccelerator::write_level(uint32_t handle, uint32_t level, uint32_t layer, ConstByteView data) {
+  kernel::ScopedMutex guard(lock_);
+  if (!flush_pending()) return false;
+  Texture* t = texture_at(handle);
+  if (!t || !t->sampled_levels || level >= t->levels) return false;
+  const uint32_t w = mip_extent(t->width, level), h = mip_extent(t->height, level);
+  // (a volume's level has fewer slices: each a layer here)
+  const uint32_t layers = t->kind == webgl::AccelKind::Volume ? (t->layers >> level ? t->layers >> level : 1u) : t->layers;
+  if (layer >= layers) return false;
+  if (t->blocks != webgl::AccelBlocks::None) {
+    if (data.size() != compressed_image_bytes(blocks_format(t->blocks), w, h)) return false;
+    return t->image->write_compressed(level, layer, data);
+  }
+  const uint64_t texels = uint64_t{w} * h;
+  const bool floats = t->format == webgl::AccelFormat::Rgba16F || t->format == webgl::AccelFormat::Rgba32F;
+  if (data.size() != texels * (floats ? 16 : 4)) return false;
+  bool ok = false;
+  if (floats) {
+    ArrayView<Vec4> scratch = allocate_view<Vec4>(allocator_, texels);
+    if (scratch.empty()) return false;
+    ByteReader r(data);
+    for (Vec4& v : scratch) {
+      v.x = __builtin_bit_cast(float, r.le32());      // (the size was checked: every read is inside)
+      v.y = __builtin_bit_cast(float, r.le32());
+      v.z = __builtin_bit_cast(float, r.le32());
+      v.w = __builtin_bit_cast(float, r.le32());
+    }
+    ok = t->image->write_subresource_float(level, layer, scratch);
+    release_view(allocator_, scratch);
+    return ok;
+  }
+  ArrayView<uint32_t> scratch = allocate_view<uint32_t>(allocator_, texels);
+  if (scratch.empty()) return false;
+  for (uint64_t i = 0; i < texels; ++i)   // 0xAARRGGBB
+    scratch[i] = (uint32_t{data[i * 4 + 3]} << 24) | (uint32_t{data[i * 4]} << 16) | (uint32_t{data[i * 4 + 1]} << 8) | data[i * 4 + 2];
+  ok = t->image->write_subresource(level, layer, scratch);
+  release_view(allocator_, scratch);
+  return ok;
 }
 
 uint32_t WebGlAccelerator::create_program(const char* vs_tgsi, const char* fs_tgsi, uint32_t attributes, uint32_t varyings, uint32_t textures) {
@@ -182,6 +308,7 @@ uint32_t WebGlAccelerator::create_program_stages(const char* vs_tgsi, const char
 
 void WebGlAccelerator::destroy_program(uint32_t handle) {
   kernel::ScopedMutex guard(lock_);
+  (void)flush_pending();      // (what it is about to change may be read by draws not yet sent)
   Program* p = program_at(handle);
   if (!p) return;
   destroy_program_locked(*p);
@@ -247,6 +374,7 @@ uint32_t WebGlAccelerator::make_texture(uint32_t w, uint32_t h, webgl::AccelForm
 
 void WebGlAccelerator::destroy_texture(uint32_t handle) {
   kernel::ScopedMutex guard(lock_);
+  (void)flush_pending();      // (what it is about to change may be read by draws not yet sent)
   Texture* t = texture_at(handle);
   if (!t) return;
   if (t->image) device_.destroy_image(t->image);
@@ -255,6 +383,7 @@ void WebGlAccelerator::destroy_texture(uint32_t handle) {
 
 bool WebGlAccelerator::write_texture(uint32_t handle, ConstByteView rgba) {
   kernel::ScopedMutex guard(lock_);
+  if (!flush_pending()) return false;
   Texture* t = texture_at(handle);
   if (!t || (t->format != webgl::AccelFormat::Rgba8 && t->format != webgl::AccelFormat::Rgba8Srgb)) return false;
   const uint64_t texels = uint64_t{t->width} * t->height;
@@ -270,6 +399,7 @@ bool WebGlAccelerator::write_texture(uint32_t handle, ConstByteView rgba) {
 
 bool WebGlAccelerator::write_texture_float(uint32_t handle, ConstByteView rgba32f) {
   kernel::ScopedMutex guard(lock_);
+  if (!flush_pending()) return false;
   Texture* t = texture_at(handle);
   if (!t || (t->format != webgl::AccelFormat::Rgba16F && t->format != webgl::AccelFormat::Rgba32F)) return false;
   const uint64_t texels = uint64_t{t->width} * t->height;
@@ -314,6 +444,7 @@ uint32_t WebGlAccelerator::create_target(uint32_t w, uint32_t h) {
 
 void WebGlAccelerator::destroy_target(uint32_t handle) {
   kernel::ScopedMutex guard(lock_);
+  (void)flush_pending();      // (what it is about to change may be read by draws not yet sent)
   Target* t = target_at(handle);
   if (!t) return;
   if (t->color) device_.destroy_image(t->color);
@@ -462,61 +593,112 @@ bool WebGlAccelerator::run_pass(Target& t, bool clear_color, const Vec4& color, 
   return run_pass_on(pass, t.width, t.height, 1, program, state, vertices, vertex_count, constants);
 }
 
+// Whether two passes draw into the same images, levels and layers (and neither clears): draws into one go into one command buffer.
+static bool same_targets(const RenderPassBegin& a, const RenderPassBegin& b) {
+  if (a.color != b.color || a.depth != b.depth) return false;
+  for (uint32_t i = 0; i + 1 < kMaxColorTargets; ++i)
+    if (a.extra_colors[i] != b.extra_colors[i]) return false;
+  for (uint32_t i = 0; i <= kMaxColorTargets; ++i)
+    if (a.first_layer[i] != b.first_layer[i] || a.layer_count[i] != b.layer_count[i] || a.level[i] != b.level[i]) return false;
+  return true;
+}
+
+bool WebGlAccelerator::flush_pending() {
+  if (!pending_) return true;
+  pending_ = false;
+  pending_draws_ = 0;
+  vertex_used_ = 0;      // (the batch's vertex data is the GPU's now: the next batch starts the buffer again - unmap_range moves it to a new host resource)
+  commands_->end_render_pass();
+  if (!commands_->end()) return failed("the device's command buffer refused the commands");
+  if (!device_.submit(commands_)) return failed("the device's submit failed");
+  return true;
+}
+
 bool WebGlAccelerator::run_pass_on(const RenderPassBegin& pass, uint32_t width, uint32_t height, uint32_t color_count, Program* program, const webgl::AccelState* state,
                                    ConstByteView vertices, uint32_t vertex_count, ConstByteView constants) {
   if (!commands_) commands_ = device_.create_command_buffer();
-  if (!commands_) return false;
+  if (!commands_) return failed("no command buffer");
+  // A draw that clears nothing joins the draws before it into the same images (one command buffer, submitted when something else needs the device: flush_pending);
+  // a clear, or a pass without a program, is submitted on its own.
+  const bool batched = program && !pass.clear_color && !pass.clear_depth && !pass.clear_stencil;
+  if (!batched || (pending_ && !same_targets(pass, pending_pass_))) {
+    if (!flush_pending()) return false;
+  }
   IPipeline* pipeline = nullptr;
   uint64_t per_vertex_bytes = vertices.size();      // (the per-instance values follow the vertices: AccelState::instanced)
+  uint64_t vertex_at = 0;      // (where the draw's vertex data is in vertex_buffer_)
   if (program) {
     pipeline = pipeline_for(*program, *state, color_count);
-    if (!pipeline) return false;
-    if (state->texture_count != program->textures) return false;
+    if (!pipeline) return failed("the device refused the pipeline");
+    if (state->texture_count != program->textures) return failed("a texture count the program has not");
     for (uint32_t i = 0; i < program->textures; ++i) {
       const Texture* tex = texture_at(state->textures[i]);
-      if (!tex) return false;
+      if (!tex) return failed("a texture that is not there");
       // (an image the pass draws into is not also read by it)
-      if (tex->image == pass.depth || tex->image == pass.color) return false;
+      if (tex->image == pass.depth || tex->image == pass.color) return failed("a texture the draw also renders into");
       for (IImage* extra : pass.extra_colors)
-        if (extra && tex->image == extra) return false;
+        if (extra && tex->image == extra) return failed("a texture the draw also renders into");
     }
     if (state->instanced) {
       const uint32_t instanced = static_cast<uint32_t>(__builtin_popcount(state->instanced));
       const uint64_t instance_bytes = uint64_t{state->instances} * instanced * 16;
-      if (instance_bytes > vertices.size()) return false;
+      if (instance_bytes > vertices.size()) return failed("instances past the vertices");
       per_vertex_bytes = vertices.size() - instance_bytes;
     }
-    if (vertices.size() > vertex_capacity_) {
-      if (vertex_buffer_) device_.destroy_buffer(vertex_buffer_);
-      vertex_buffer_ = nullptr;
-      vertex_capacity_ = 0;
-      uint64_t want = 64 * 1024;
-      while (want < vertices.size()) want *= 2;
-      vertex_buffer_ = device_.create_buffer(want, kBufferVertex);
-      if (!vertex_buffer_) return false;
-      vertex_capacity_ = want;
+    // The vertex data goes after the batch's (16-byte aligned); a buffer too small for it ends the batch, and grows when the draw alone does not fit.
+    vertex_at = (vertex_used_ + 15) & ~uint64_t{15};
+    if (!vertex_buffer_ || vertex_at > vertex_capacity_ || vertices.size() > vertex_capacity_ - vertex_at) {
+      if (!flush_pending()) return false;
+      vertex_at = 0;
+      if (vertices.size() > vertex_capacity_) {
+        if (vertex_buffer_) device_.destroy_buffer(vertex_buffer_);
+        vertex_buffer_ = nullptr;
+        vertex_capacity_ = 0;
+        uint64_t want = 1024 * 1024;
+        while (want < vertices.size()) want *= 2;
+        vertex_buffer_ = device_.create_buffer(want, kBufferVertex);
+        if (!vertex_buffer_) return failed("the device refused a vertex buffer");
+        vertex_capacity_ = want;
+      }
     }
     ByteView mapped = vertex_buffer_->map();
-    if (mapped.size() < vertices.size()) {
+    ByteView region;
+    if (!mapped.try_subview(vertex_at, vertices.size(), &region)) {
       vertex_buffer_->unmap();
-      return false;
+      return failed("a vertex buffer the device would not map");
     }
-    mapped.first(vertices.size()).copy_from(vertices);
-    vertex_buffer_->unmap();
+    region.copy_from(vertices);
+    vertex_buffer_->unmap_range(vertex_at, vertices.size(), /*others_unused=*/vertex_at == 0);
+    vertex_used_ = vertex_at + vertices.size();
   }
-  commands_->begin();
-  commands_->begin_render_pass(pass);
+  if (!pending_) {
+    commands_->begin();
+    commands_->begin_render_pass(pass);
+    if (batched) {
+      pending_ = true;
+      pending_pass_ = pass;
+    }
+  }
   if (program) {
     commands_->bind_pipeline(pipeline);
-    commands_->bind_vertex_buffer(vertex_buffer_);
-    if (state->instanced) commands_->bind_vertex_buffer_slot(1, vertex_buffer_, per_vertex_bytes);
+    commands_->bind_vertex_buffer(vertex_buffer_, vertex_at);
+    if (state->instanced) commands_->bind_vertex_buffer_slot(1, vertex_buffer_, vertex_at + per_vertex_bytes);
     for (uint32_t i = 0; i < program->textures; ++i) {
       const webgl::AccelSampler& as = state->samplers[i];
       SamplerDesc sampler;
       sampler.filter = as.linear ? Filter::Linear : Filter::Nearest;
-      const auto mode = [](bool repeat, bool mirror) { return mirror ? AddressMode::MirrorRepeat : (repeat ? AddressMode::Repeat : AddressMode::ClampToEdge); };
-      sampler.address_u = mode(as.repeat_s, as.mirror_s);
-      sampler.address_v = mode(as.repeat_t, as.mirror_t);
+      const auto mode = [](bool repeat, bool mirror, bool border, bool mirror_once) {
+        return border ? AddressMode::ClampToBorder : mirror_once ? AddressMode::MirrorOnce : mirror ? AddressMode::MirrorRepeat : (repeat ? AddressMode::Repeat : AddressMode::ClampToEdge);
+      };
+      sampler.address_u = mode(as.repeat_s, as.mirror_s, as.border_s, as.mirror_once_s);
+      sampler.address_v = mode(as.repeat_t, as.mirror_t, as.border_t, as.mirror_once_t);
+      if (as.border_s || as.border_t) {
+        sampler.custom_border = true;
+        for (uint32_t k = 0; k < 4; ++k) sampler.border_rgba[k] = as.border[k];
+      }
+      sampler.separate_mag = as.separate_mag;
+      sampler.mag_filter = as.mag_linear ? Filter::Linear : Filter::Nearest;
+      sampler.max_anisotropy = as.anisotropy < 1 ? 1 : (as.anisotropy > kMaxAnisotropy ? kMaxAnisotropy : as.anisotropy);
       sampler.mip_filter = as.mip == 2 ? MipFilter::Linear : (as.mip == 1 ? MipFilter::Nearest : MipFilter::None);
       sampler.min_lod = as.min_lod;
       sampler.max_lod = as.max_lod;
@@ -541,8 +723,15 @@ bool WebGlAccelerator::run_pass_on(const RenderPassBegin& pass, uint32_t width, 
     if (state->topology) commands_->set_primitive_topology(kTopologies[state->topology]);
     commands_->draw(vertex_count, 0, state->instances ? state->instances : 1);
   }
+  if (batched) {
+    // (a long batch goes now: the command buffer holds every draw's constants until it is submitted)
+    if (++pending_draws_ >= kMaxBatchedDraws && !flush_pending()) return false;
+    return true;
+  }
   commands_->end_render_pass();
-  return commands_->end() && device_.submit(commands_);
+  if (!commands_->end()) return failed("the device's command buffer refused the commands");
+  if (!device_.submit(commands_)) return failed("the device's submit failed");
+  return true;
 }
 
 bool WebGlAccelerator::clear(uint32_t handle, bool color, const float rgba[4], bool depth, float depth_value) {
@@ -559,26 +748,26 @@ bool WebGlAccelerator::clear(uint32_t handle, bool color, const float rgba[4], b
 }
 
 bool WebGlAccelerator::draw_checks(Program& p, const webgl::AccelState& state, ConstByteView vertices, uint32_t vertex_count, ConstByteView constants) {
-  if (vertex_count == 0 || constants.size() > kMaxShaderConstantBytes || constants.size() % 16) return false;
+  if (vertex_count == 0 || constants.size() > kMaxShaderConstantBytes || constants.size() % 16) return failed("no vertices, or constants of a size the device has not");
   const DeviceInfo info = device_.info();
   // the vertex data: per vertex the attributes that are not per instance, then (AccelState::instanced) per instance the others
-  if (p.attributes > 16 || (state.instanced >> p.attributes)) return false;
+  if (p.attributes > 16 || (state.instanced >> p.attributes)) return failed("attributes the device has not");
   const uint32_t instanced = static_cast<uint32_t>(__builtin_popcount(state.instanced));
-  if ((state.instanced || state.instances != 1) && (!(info.features & kFeatureInstancing) || info.limits.vertex_buffers < 2 || state.instances == 0)) return false;
-  if (instanced && instanced == p.attributes) return false;      // (a vertex has at least one attribute of its own)
+  if ((state.instanced || state.instances != 1) && (!(info.features & kFeatureInstancing) || info.limits.vertex_buffers < 2 || state.instances == 0)) return failed("instancing the device has not");
+  if (instanced && instanced == p.attributes) return failed("no per-vertex attribute");      // (a vertex has at least one attribute of its own)
   const uint64_t expected = uint64_t{vertex_count} * (p.attributes - instanced) * 16 + uint64_t{state.instances} * instanced * 16;
-  if (vertices.size() != expected) return false;
-  if (constants.size() > (info.limits.shader_constant_bytes > info.max_push_constant_bytes ? info.limits.shader_constant_bytes : info.max_push_constant_bytes)) return false;
-  if (state.topology > 5 || (state.topology && !(info.features & kFeatureLines))) return false;
+  if (vertices.size() != expected) return failed("vertex data of the wrong size");
+  if (constants.size() > (info.limits.shader_constant_bytes > info.max_push_constant_bytes ? info.limits.shader_constant_bytes : info.max_push_constant_bytes)) return failed("more constants than the device takes");
+  if (state.topology > 5 || (state.topology && !(info.features & kFeatureLines))) return failed("a topology the device has not");
   // (patches go to the tessellation stages and only there, with as many vertices as the program was made for; adjacency only to a geometry stage that takes it)
-  if ((state.topology == 3) != (p.hs != nullptr) || (state.topology == 3 && (state.patch_vertices != p.patch_vertices || vertex_count % p.patch_vertices))) return false;
+  if ((state.topology == 3) != (p.hs != nullptr) || (state.topology == 3 && (state.patch_vertices != p.patch_vertices || vertex_count % p.patch_vertices))) return failed("patches the program does not take");
   if (p.gs && !p.hs) {
     static constexpr uint8_t kTakes[6] = {2, 1, 0, 0xFF, 3, 4};   // (the GeometryPrimitive each topology makes)
-    if (kTakes[state.topology] != p.gs_input) return false;
+    if (kTakes[state.topology] != p.gs_input) return failed("primitives the geometry stage does not take");
   }
-  if ((state.topology == 4 || state.topology == 5) && !p.gs) return false;
-  if (state.custom_blend && !(info.features & kFeatureBlendState)) return false;
-  if (state.clip_mask && !(info.features & kFeatureClipDistances)) return false;
+  if ((state.topology == 4 || state.topology == 5) && !p.gs) return failed("adjacency without a geometry stage");
+  if (state.custom_blend && !(info.features & kFeatureBlendState)) return failed("blending the device has not");
+  if (state.clip_mask && !(info.features & kFeatureClipDistances)) return failed("clip distances the device has not");
   return true;
 }
 
@@ -586,7 +775,8 @@ bool WebGlAccelerator::draw(uint32_t handle, uint32_t program, const webgl::Acce
   kernel::ScopedMutex guard(lock_);
   Target* t = target_at(handle);
   Program* p = program_at(program);
-  if (!t || !p || !draw_checks(*p, state, vertices, vertex_count, constants)) return false;
+  if (!t || !p) return failed("no such target or program");
+  if (!draw_checks(*p, state, vertices, vertex_count, constants)) return false;
   return run_pass(*t, false, Vec4(), false, 1.0f, p, &state, vertices, vertex_count, constants);
 }
 
@@ -609,9 +799,9 @@ IImage* WebGlAccelerator::blank_color(uint32_t w, uint32_t h) {
 }
 
 bool WebGlAccelerator::images_pass(const webgl::AccelAttachments& a, RenderPassBegin* pass, uint32_t* width, uint32_t* height) {
-  if (a.color_count > kMaxColorTargets || a.color_count > webgl::kAccelMaxColors) return false;
+  if (a.color_count > kMaxColorTargets || a.color_count > webgl::kAccelMaxColors) return failed("more colour images than the device draws into");
   const DeviceInfo info = device_.info();
-  if (a.color_count > 1 && (!(info.features & kFeatureMultipleTargets) || a.color_count > info.limits.color_targets)) return false;
+  if (a.color_count > 1 && (!(info.features & kFeatureMultipleTargets) || a.color_count > info.limits.color_targets)) return failed("more colour images than the device draws into");
   uint32_t w = 0, h = 0;
   const auto same_size = [&](const Texture& t) {
     if (w == 0) {
@@ -622,18 +812,18 @@ bool WebGlAccelerator::images_pass(const webgl::AccelAttachments& a, RenderPassB
   };
   for (uint32_t i = 0; i < a.color_count; ++i) {
     const Texture* t = texture_at(a.colors[i]);
-    if (!t || !t->renderable || t->format == webgl::AccelFormat::Depth || t->format == webgl::AccelFormat::DepthStencil || !same_size(*t)) return false;
+    if (!t || !t->renderable || t->format == webgl::AccelFormat::Depth || t->format == webgl::AccelFormat::DepthStencil || !same_size(*t)) return failed(t && t->renderable && !same_size(*t) ? "colour images of different sizes" : "a colour image the device cannot draw into");
     if (i == 0) pass->color = t->image;
     else pass->extra_colors[i - 1] = t->image;
   }
   if (a.depth) {
     const Texture* t = texture_at(a.depth);
-    if (!t || (t->format != webgl::AccelFormat::Depth && t->format != webgl::AccelFormat::DepthStencil) || !same_size(*t)) return false;
+    if (!t || (t->format != webgl::AccelFormat::Depth && t->format != webgl::AccelFormat::DepthStencil) || !same_size(*t)) return failed("a depth image of another size, or not a depth image");
     pass->depth = t->image;
   }
-  if (w == 0) return false;
+  if (w == 0) return failed("no image to draw into");
   if (!pass->color) pass->color = blank_color(w, h);
-  if (!pass->color) return false;
+  if (!pass->color) return failed("the device refused a blank colour image");
   *width = w;
   *height = h;
   return true;
@@ -660,12 +850,13 @@ bool WebGlAccelerator::draw_images(const webgl::AccelAttachments& a, uint32_t pr
   Program* p = program_at(program);
   RenderPassBegin pass;
   uint32_t w = 0, h = 0;
-  if (!p || !draw_checks(*p, state, vertices, vertex_count, constants) || !images_pass(a, &pass, &w, &h)) return false;
+  if (!p) return failed("no such program");
+  if (!draw_checks(*p, state, vertices, vertex_count, constants) || !images_pass(a, &pass, &w, &h)) return false;
   pass.clear_color = false;
   pass.clear_depth = false;
   pass.clear_stencil = false;
   // (a depth-only draw has the blank colour image, which must never be written: the colour mask is the device's blend state, so such a draw needs it)
-  if (a.color_count == 0 && (!state.custom_blend || state.color_mask != 0)) return false;
+  if (a.color_count == 0 && (!state.custom_blend || state.color_mask != 0)) return failed("a depth-only draw that writes colour");
   return run_pass_on(pass, w, h, a.color_count ? a.color_count : 1, p, &state, vertices, vertex_count, constants);
 }
 
@@ -702,6 +893,7 @@ uint32_t WebGlAccelerator::create_layered(uint32_t w, uint32_t h, uint32_t layer
 
 bool WebGlAccelerator::write_layer(uint32_t handle, uint32_t layer, ConstByteView rgba) {
   kernel::ScopedMutex guard(lock_);
+  if (!flush_pending()) return false;
   Texture* t = texture_at(handle);
   if (!t || !t->layers || layer >= t->layers) return false;
   const uint64_t texels = uint64_t{t->width} * t->height;
@@ -717,6 +909,7 @@ bool WebGlAccelerator::write_layer(uint32_t handle, uint32_t layer, ConstByteVie
 
 bool WebGlAccelerator::write_image(uint32_t handle, uint32_t level, ConstByteView pixels) {
   kernel::ScopedMutex guard(lock_);
+  if (!flush_pending()) return false;
   Texture* t = texture_at(handle);
   if (!t || level >= t->levels) return false;
   if (t->format == webgl::AccelFormat::Depth || t->format == webgl::AccelFormat::DepthStencil) return level == 0 && depth_planes(*t->image, t->format == webgl::AccelFormat::DepthStencil, pixels, nullptr);
@@ -750,6 +943,7 @@ bool WebGlAccelerator::write_image(uint32_t handle, uint32_t level, ConstByteVie
 
 bool WebGlAccelerator::read_image(uint32_t handle, ByteView pixels) {
   kernel::ScopedMutex guard(lock_);
+  if (!flush_pending()) return false;
   Texture* t = texture_at(handle);
   if (!t) return false;
   if (t->format == webgl::AccelFormat::Depth || t->format == webgl::AccelFormat::DepthStencil) return depth_planes(*t->image, t->format == webgl::AccelFormat::DepthStencil, ConstByteView(), &pixels);
@@ -822,18 +1016,21 @@ bool WebGlAccelerator::depth_planes(IImage& image, bool stencil, ConstByteView i
 
 bool WebGlAccelerator::write_depth(uint32_t handle, ConstByteView depth) {
   kernel::ScopedMutex guard(lock_);
+  if (!flush_pending()) return false;
   Target* t = target_at(handle);
   return t && t->depth && depth_planes(*t->depth, false, depth, nullptr);
 }
 
 bool WebGlAccelerator::read_depth(uint32_t handle, ByteView depth) {
   kernel::ScopedMutex guard(lock_);
+  if (!flush_pending()) return false;
   Target* t = target_at(handle);
   return t && t->depth && depth_planes(*t->depth, false, ConstByteView(), &depth);
 }
 
 bool WebGlAccelerator::write_color(uint32_t handle, ConstByteView rgba) {
   kernel::ScopedMutex guard(lock_);
+  if (!flush_pending()) return false;
   Target* t = target_at(handle);
   if (!t) return false;
   const uint64_t pixels = uint64_t{t->width} * t->height;
@@ -849,6 +1046,7 @@ bool WebGlAccelerator::write_color(uint32_t handle, ConstByteView rgba) {
 
 bool WebGlAccelerator::read_color(uint32_t handle, ByteView rgba) {
   kernel::ScopedMutex guard(lock_);
+  if (!flush_pending()) return false;
   Target* t = target_at(handle);
   if (!t) return false;
   const uint64_t pixels = uint64_t{t->width} * t->height;

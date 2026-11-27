@@ -29,6 +29,7 @@
 #include "WebGl/GpuDevice.hpp"
 #include "WebGl/Raster.hpp"
 #include "Graphics/Graphics3D/Software/Tessellator.hpp"
+#include "Graphics/BlockCompression.hpp"
 #include "TgsiMachine.hpp"
 
 namespace webgl {
@@ -44,7 +45,7 @@ struct TgsiAccel : IAccelerator {
   };
   struct Prog { std::string vs, fs, gs, tcs, tes; uint32_t attributes = 0, varyings = 0, textures = 0; bool flat[16] = {}; int position = -1, face = -1; bool depth_out = false, derivatives = false; int depth_reg = 1; AccelStages st; };
   // A texture or a device image (create_image: renderable unless mipmapped; a Depth image keeps its depth in `f`, one float per texel). Mipmapped images keep level 0 only.
-  struct Tex { uint32_t w = 0, h = 0; std::vector<uint8_t> rgba; std::vector<float> f; bool floats = false; bool image = false, depth = false; uint32_t levels = 1; uint32_t layers = 0; AccelKind kind = AccelKind::Volume; std::vector<uint8_t> stencil; };
+  struct Tex { uint32_t w = 0, h = 0; std::vector<uint8_t> rgba; std::vector<float> f; bool floats = false; bool image = false, depth = false; uint32_t levels = 1; uint32_t layers = 0; AccelKind kind = AccelKind::Volume; std::vector<uint8_t> stencil; uint8_t blocks = 0; };
   struct Tgt { uint32_t w = 0, h = 0; std::vector<uint8_t> rgba; std::vector<float> depth; };
   struct Surfaces;
   std::vector<Prog> progs;
@@ -65,12 +66,58 @@ struct TgsiAccel : IAccelerator {
     l.layered_textures = true;
     l.stencil = true;
     l.depth_transfer = depth_transfer;
+    l.texture_levels = texture_levels;
+    l.sampler_state = sampler_state;
     return l;
   }
   uint32_t images = 4;   // (0: a device without device images)
   int image_reads = 0, image_writes = 0, image_draws = 0, image_clears = 0;
   bool upload = true;   // (false: a device without write_color)
   bool depth_transfer = false;   // (true: write_image/read_image of depth images and write_depth/read_depth of targets)
+  // (true: create_texture_levels / write_level, BC1-3 blocks taken as they are - kept decoded here; level 0 is what the tests sample)
+  bool texture_levels = false;
+  bool sampler_state = false;
+  int level_writes = 0, block_writes = 0;
+  bool takes_blocks(AccelBlocks b) const override { return texture_levels && (b == AccelBlocks::Bc1 || b == AccelBlocks::Bc2 || b == AccelBlocks::Bc3); }
+  uint32_t create_texture_levels(const AccelTextureDesc& d) override {
+    if (!texture_levels || d.w == 0 || d.h == 0 || d.levels == 0 || d.layers == 0) return 0;
+    if (d.blocks != AccelBlocks::None && !takes_blocks(d.blocks)) return 0;
+    Tex t;
+    t.w = d.w;
+    t.h = d.h;
+    t.levels = d.levels;
+    t.layers = d.kind == AccelKind::Plain ? 0 : d.layers;
+    t.kind = d.kind == AccelKind::Plain ? AccelKind::Volume : d.kind;
+    t.floats = d.blocks == AccelBlocks::None && (d.format == AccelFormat::Rgba16F || d.format == AccelFormat::Rgba32F);
+    t.blocks = static_cast<uint8_t>(d.blocks);
+    const uint64_t n = uint64_t{d.w} * d.h * 4 * (t.layers ? t.layers : 1);
+    if (t.floats) t.f.assign(n, 0.0f);
+    else t.rgba.assign(n, 0);
+    texs.push_back(t);
+    return static_cast<uint32_t>(texs.size());
+  }
+  bool write_level(uint32_t image, uint32_t level, uint32_t layer, ConstByteView data) override {
+    Tex& t = texs.at(image - 1);
+    if (level >= t.levels || layer >= (t.layers ? t.layers : 1)) return false;
+    ++level_writes;
+    if (level) return true;      // (only level 0 is kept: the tests sample at the texture's own size)
+    const uint64_t texels = uint64_t{t.w} * t.h;
+    if (t.blocks) {
+      ++block_writes;
+      const graphics::Format f = t.blocks == uint8_t(AccelBlocks::Bc1) ? graphics::Format::Bc1Unorm : t.blocks == uint8_t(AccelBlocks::Bc2) ? graphics::Format::Bc2Unorm : graphics::Format::Bc3Unorm;
+      std::vector<uint32_t> px(texels);
+      if (!graphics::decode_blocks(f, data, t.w, t.h, ArrayView<uint32_t>(px.data(), px.size()))) return false;
+      for (uint64_t i = 0; i < texels; ++i) {
+        uint8_t* o = t.rgba.data() + (uint64_t{layer} * texels + i) * 4;
+        o[0] = static_cast<uint8_t>(px[i] >> 16), o[1] = static_cast<uint8_t>(px[i] >> 8), o[2] = static_cast<uint8_t>(px[i]), o[3] = static_cast<uint8_t>(px[i] >> 24);
+      }
+      return true;
+    }
+    if (data.size() != texels * (t.floats ? 16 : 4)) return false;
+    if (t.floats) memcpy(t.f.data() + uint64_t{layer} * texels * 4, data.data(), data.size());
+    else memcpy(t.rgba.data() + uint64_t{layer} * texels * 4, data.data(), data.size());
+    return true;
+  }
   int depth_reads = 0, depth_writes = 0;
   bool write_depth(uint32_t target, ConstByteView d) override {
     if (!depth_transfer) return false;
@@ -323,6 +370,17 @@ struct TgsiAccel : IAccelerator {
       const graphics::Vec4 r = sample(unit, u, v);
       layer_ = 0;
       return r;
+    }
+    // (TXF: a texel of level 0 - the one level kept here -; outside it, or another level, transparent black)
+    graphics::Vec4 fetch(uint32_t unit, int32_t x, int32_t y, uint32_t level) const override {
+      const Tex& t = acc->texs.at(st->textures[unit] - 1);
+      if (level != 0 || x < 0 || y < 0 || x >= static_cast<int32_t>(t.w) || y >= static_cast<int32_t>(t.h)) return {0, 0, 0, 0};
+      float r[4];
+      for (int k = 0; k < 4; ++k) {
+        const uint64_t at = (uint64_t(y) * t.w + uint64_t(x)) * 4 + k;
+        r[k] = t.depth ? (k == 0 ? t.f[uint64_t(y) * t.w + uint64_t(x)] : (k == 3 ? 1.0f : 0.0f)) : t.floats ? t.f[at] : t.rgba[at] / 255.0f;
+      }
+      return {r[0], r[1], r[2], r[3]};
     }
     graphics::Vec4 sample(uint32_t unit, float u, float v) const override {
       const Tex& t = acc->texs.at(st->textures[unit] - 1);

@@ -61,6 +61,10 @@ class WebGlAccelerator final : public webgl::IAccelerator {
   uint32_t create_layered(uint32_t w, uint32_t h, uint32_t layers, webgl::AccelKind kind) override;
   bool write_layer(uint32_t image, uint32_t layer, ConstByteView rgba) override;
   bool read_image(uint32_t image, ByteView pixels) override;
+  bool takes_blocks(webgl::AccelBlocks blocks) const override;
+  const char* last_failure() const override { return failure_; }
+  uint32_t create_texture_levels(const webgl::AccelTextureDesc& desc) override;
+  bool write_level(uint32_t texture, uint32_t level, uint32_t layer, ConstByteView data) override;
   bool clear_images(const webgl::AccelAttachments& a, bool color, const float rgba[4], bool depth, float depth_value) override;
   bool draw_images(const webgl::AccelAttachments& a, uint32_t program, const webgl::AccelState& state, ConstByteView vertices, uint32_t vertex_count, ConstByteView constants) override;
 
@@ -94,6 +98,10 @@ class WebGlAccelerator final : public webgl::IAccelerator {
     uint32_t levels = 1;
     bool renderable = false;   // a colour or depth attachment as well
     uint32_t layers = 0;       // create_layered: its layers (0: a 2D texture)
+    // create_texture_levels: a sampled texture of `kind` with levels (write_level), of `blocks` when not None
+    bool sampled_levels = false;
+    webgl::AccelKind kind = webgl::AccelKind::Plain;
+    webgl::AccelBlocks blocks = webgl::AccelBlocks::None;
   };
   uint32_t make_texture(uint32_t w, uint32_t h, webgl::AccelFormat format, uint32_t levels, bool renderable);
   uint32_t add_texture(UniquePointer<Texture>&& t);
@@ -132,6 +140,20 @@ class WebGlAccelerator final : public webgl::IAccelerator {
   List<UniquePointer<Target>> targets_;
   List<UniquePointer<Texture>> textures_;
   ICommandBuffer* commands_ = nullptr;
+  // Draws into the same images go into one command buffer (run_pass_on), submitted by flush_pending - when another pass, a clear, or a read, write or destroy of
+  // something the draws use comes, or after kMaxBatchedDraws. Their vertex data is one after the other in vertex_buffer_ (vertex_used_ bytes of it so far).
+  bool flush_pending();
+  static constexpr uint32_t kMaxBatchedDraws = 256;
+  bool pending_ = false;
+  RenderPassBegin pending_pass_;
+  uint32_t pending_draws_ = 0;
+  uint64_t vertex_used_ = 0;
+  // (why the last draw or clear failed: IAccelerator::last_failure)
+  const char* failure_ = nullptr;
+  bool failed(const char* why) {
+    failure_ = why;
+    return false;
+  }
   IBuffer* vertex_buffer_ = nullptr;
   uint64_t vertex_capacity_ = 0;
 };

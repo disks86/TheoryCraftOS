@@ -107,7 +107,9 @@ bool GlContext::texture_complete(const Texture& t, const SamplerObj& s, bool* is
   *is_cube = t.target == 0x8513;
   const int32_t base = t.base_level < 0 ? 0 : t.base_level;
   const uint32_t faces = *is_cube ? 6 : 1;
-  const bool mips = s.min_filter >= 0x2700 && s.min_filter <= 0x2703;
+  // (a multisampled texture has one level and no filtering: the sampler's state does not apply to it)
+  const bool multisampled = t.target == 0x9100 || t.target == 0x9102;
+  const bool mips = !multisampled && s.min_filter >= 0x2700 && s.min_filter <= 0x2703;
   for (uint32_t f = 0; f < faces; ++f) {
     const uint64_t idx = uint64_t{f} * kMaxLevels + static_cast<uint32_t>(base);
     if (base >= static_cast<int32_t>(kMaxLevels) || idx >= t.images.count() || !t.images[idx] || !t.images[idx]->defined()) return false;
@@ -145,6 +147,8 @@ void GlContext::sample(const shader::SampleRequest& rq, uint32_t out[4]) {
     case shader::kDim1D: id = u.tex1d; break;
     case shader::kDim1DArray: id = u.array1d; break;
     case shader::kDimRect: id = u.rect; break;
+    case shader::kDimMultisampled: id = u.ms2d; break;
+    case shader::kDimMultisampledArray: id = u.ms2d_array; break;
     default: id = (desktop.ff_1d_mask >> unit) & 1 ? u.tex1d : ((desktop.ff_rect_mask >> unit) & 1 ? u.rect : u.tex2d); break;
   }
   const Texture* t = texture_at(id);

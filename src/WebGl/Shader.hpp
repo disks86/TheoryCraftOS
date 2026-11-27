@@ -48,7 +48,8 @@ enum class Stage : uint8_t { Vertex, Fragment, Compute, Geometry, TessControl, T
 enum class Base : uint8_t { Void, Bool, Int, Uint, Float, Sampler, Texture, SamplerState, Struct };
 enum : uint8_t { kDim2D = 0, kDimCube = 1, kDim3D = 2, kDim2DArray = 3, kDimCubeArray = 4, kDim1D = 5, kDimMultisampled = 6, kDimDepth2D = 7,
                  kDim1DArray = 8,   // desktop GLSL: (s, layer); a 1D array texture is kept as a 2D image, one row per layer
-                 kDimRect = 9 };    // desktop GLSL: coordinates in texels, the host normalises them
+                 kDimRect = 9,      // desktop GLSL: coordinates in texels, the host normalises them
+                 kDimMultisampledArray = 10 };   // GLSL sampler2DMSArray: (x, y, layer) in texels, read by texelFetch
 
 struct Type {
   Base base = Base::Void;

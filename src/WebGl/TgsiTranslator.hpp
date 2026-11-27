@@ -105,6 +105,8 @@ struct TgsiSampler {
   // taps then), (w, h, 1 / w, 1 / h), and the vec4 that shadow1D / shadow2D give, r * row 2 + row 3 (GL_DEPTH_TEXTURE_MODE).
   bool shadow = false;
   int32_t params = -1;   // the first of those rows, when the sampler has them (shadow, or a rectangle: row 1 turns texels into the device's coordinates)
+  // texelFetch reads it (TXF of a level, a sample of a multisampled texture): the device's texture has all of the texture's levels, whatever its filter
+  bool fetch = false;
 };
 // TgsiConstant::stage of the samplers' rows (TgsiSampler::params): slot 4 i + r is row r of sampler i.
 constexpr uint8_t kTgsiSamplerParams = 7;

@@ -194,6 +194,11 @@ const TypeName kTypes[] = {
     {"isampler1DArray", Base::Sampler, 1, 1, kDim1DArray, false, Base::Int}, {"usampler1DArray", Base::Sampler, 1, 1, kDim1DArray, false, Base::Uint},
     {"isampler2DRect", Base::Sampler, 1, 1, kDimRect, false, Base::Int}, {"usampler2DRect", Base::Sampler, 1, 1, kDimRect, false, Base::Uint},
     {"samplerCubeArray", Base::Sampler, 1, 1, kDimCubeArray, false, Base::Float}, {"samplerCubeArrayShadow", Base::Sampler, 1, 1, kDimCubeArray, true, Base::Float},
+    // GLSL 1.50 (ARB_texture_multisample): read with texelFetch(s, P, sample) and textureSize(s)
+    {"sampler2DMS", Base::Sampler, 1, 1, kDimMultisampled, false, Base::Float}, {"isampler2DMS", Base::Sampler, 1, 1, kDimMultisampled, false, Base::Int},
+    {"usampler2DMS", Base::Sampler, 1, 1, kDimMultisampled, false, Base::Uint},
+    {"sampler2DMSArray", Base::Sampler, 1, 1, kDimMultisampledArray, false, Base::Float}, {"isampler2DMSArray", Base::Sampler, 1, 1, kDimMultisampledArray, false, Base::Int},
+    {"usampler2DMSArray", Base::Sampler, 1, 1, kDimMultisampledArray, false, Base::Uint},
 };
 
 struct BuiltinName {
