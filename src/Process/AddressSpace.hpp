@@ -126,8 +126,9 @@ class AddressSpace final : public IUserMemory {
   bool find_free_in(uint64_t size, uint64_t low, uint64_t high, uint64_t alignment, bool top_down, uint64_t* out) const;
   // Where Windows puts memory it chooses the place of in a 32-bit program, which runs out of addresses long before memory: allocations and views from the bottom
   // up (the lowest 64 KiB-aligned place at or above 64 KiB), MEM_TOP_DOWN ones and moved images from the top down, so the middle stays one large free range.
-  bool find_free_windows32(uint64_t size, bool top_down, uint64_t* out) const { return find_free_in(size, kWindowsLowest, top_, kWindowsGranularity, top_down, out); }
-  static constexpr uint64_t kWindowsLowest = 0x10000, kWindowsGranularity = 0x10000;
+  // (Below the shared user data page at 0x7FFE0000, which is mapped there after the libraries are loaded.)
+  bool find_free_windows32(uint64_t size, bool top_down, uint64_t* out) const { return find_free_in(size, kWindowsLowest, kWindowsHighest32, kWindowsGranularity, top_down, out); }
+  static constexpr uint64_t kWindowsLowest = 0x10000, kWindowsGranularity = 0x10000, kWindowsHighest32 = 0x7FFE0000;
   // Changes the permissions of a range, cutting regions at its ends. Every page of the range must be mapped, or nothing changes.
   bool protect(uint64_t address, uint64_t size, uint8_t protection);
   // Makes the region that starts at `base` exactly `size` bytes (rounded up to pages) long: new pages are zero, a size of 0 removes it. Fails if the pages

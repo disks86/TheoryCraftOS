@@ -36,6 +36,7 @@ constexpr uint64_t kTeb32Size = kPage;
 uint64_t teb_bytes(const AddressSpace& space) { return space.is_32bit() ? kTebSize + kTeb32Size : kTebSize; }
 constexpr uint64_t kMaxStartupBytes = 1ull << 20;
 constexpr uint64_t kPlacementHint = 0x00007FF000000000ull;
+static_assert(kSharedUserDataAddress == AddressSpace::kWindowsHighest32, "a 32-bit program's top-down places end below the shared user data page");
 constexpr uint32_t kTlsDirectory = 9;      // IMAGE_DIRECTORY_ENTRY_TLS
 
 // Writes numbers into the new region through the privileged path (little endian).
