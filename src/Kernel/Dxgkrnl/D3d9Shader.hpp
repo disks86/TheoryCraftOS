@@ -41,6 +41,9 @@
 
 namespace dxgk {
 
+// The line of D3d9Dxbc.cpp where the last Direct3D 10/11/12 shader was refused as not supported (0: none yet): for the log of refused shaders.
+uint32_t dxbc_refused_line();
+
 // Which of the two fixed pixel kernels of a device without a shader compiler (Intel Gen9) a pixel shader is exactly: the interpolated varying as the colour, or one texture sample at
 // the interpolated varying (first two components) with unit 0.
 enum class FragmentKernel : uint8_t { None, Colored, Textured };
@@ -56,7 +59,7 @@ class D3d9Program {
   static constexpr uint32_t kMaxInstructions = 65536;
   static constexpr uint32_t kMaxSteps = 1u << 20;   // instructions one run may execute
   static constexpr uint32_t kPushConstantRegisters = 8;
-  static constexpr uint32_t kMaxConstantRegisters = 256;   // 4096 bytes: a program made from DXBC may declare constant buffers up to this much in all
+  static constexpr uint32_t kMaxConstantRegisters = graphics::kMaxPushConstantBytes / 16;   // a program made from DXBC may declare constant buffers up to this much in all (the push constants: 960 vec4s)
 
   // Decodes and checks the token stream (little-endian words). kInvalidParameter for a malformed stream, kNotSupported for one that is fine but uses something not supported.
   static NtStatus compile(allocators::IAllocator& allocator, ConstByteView tokens, UniquePointer<D3d9Program>* out);

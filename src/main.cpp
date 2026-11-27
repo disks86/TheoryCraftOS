@@ -999,12 +999,12 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
     }
     console::puts(")\n");
   });
-  // (and a pipeline it refuses: the program gets an error code, the log says which check)
+  // (and a shader or pipeline it refuses: the program gets an error code, the log says which check)
   dxgk::set_pipeline_trace([](uint32_t status, uint32_t line) {
-    console::puts("direct3d pipeline refused: status ");
+    console::puts("direct3d shader or pipeline refused: status ");
     console::put_hex(status);
-    console::puts(" (Adapter.cpp line ");
-    console::put_dec(static_cast<int64_t>(line));
+    console::puts(line >= 2000000 ? " (D3d9Dxbc.cpp line " : " (Adapter.cpp line ");      // (dxgk's kDxbcLineBase: the shader compiler's own refusal)
+    console::put_dec(static_cast<int64_t>(line >= 2000000 ? line - 2000000 : line));
     console::puts(")\n");
   });
   // (and the first few draws left out for a texture of another kind than the shader declares)

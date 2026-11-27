@@ -2012,7 +2012,11 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
       const uint64_t start = hardware::uptime_us();
       while (!(held = mutex.try_lock()) && hardware::uptime_us() - start < 50000) hardware::delay_spin_us(20);
     }
-    ~SubmitLock() { if (held) mutex.unlock(); }
+    ~SubmitLock() { release(); }
+    void release() {
+      if (held) mutex.unlock();
+      held = false;
+    }
   } submit_lock(submit_lock_);
   if (!submit_lock.held) return submit_failed(__LINE__);
   CommandRecorder& recorder = *static_cast<CommandRecorder*>(commands);
@@ -3075,6 +3079,9 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
   }
   const bool asked = queries.host.count() != 0;
   if (asked && !flush()) return submit_failed(__LINE__);
+  // (every command of this submit has gone to the host: what follows waits for the GPU and reads the results, which another thread's submit cannot disturb - the lock goes,
+  // so the desktop and other programs are not held up for a heavy frame's time)
+  submit_lock.release();
   // (the host writes each result - state, size, count - straight into the buffer's guest memory when its GL says the query is complete. It checks as it polls, which it does while
   // commands with fences are coming in: so keep it busy with empty ones until every state reads DONE. Pulling a buffer from the host would overwrite what it wrote.)
   const uint64_t waiting_since = asked ? hardware::uptime_us() : 0;

@@ -39,6 +39,8 @@ void set_stream_trace(StreamTrace trace) { g_stream_trace = trace; }
 void set_pipeline_trace(PipelineTrace trace) { g_pipeline_trace = trace; }
 void set_texture_kind_trace(TextureKindTrace trace) { g_texture_kind_trace = trace; }
 // (a pipeline the adapter refuses: its line goes to the trace)
+// (a line from kDxbcLineBase on is D3d9Dxbc.cpp's: dxbc_refused_line)
+constexpr uint32_t kDxbcLineBase = 2000000;
 NtStatus pipeline_refused(NtStatus status, uint32_t line) {
   if (g_pipeline_trace) g_pipeline_trace(status, line);
   return status;
@@ -3149,14 +3151,14 @@ NtStatus Adapter::create_shader(const ShaderDesc& desc, SharedPointer<ShaderObje
     case ShaderKind::Dxbc: {
       UniquePointer<D3d9Program> program;
       const NtStatus s = desc.kind == ShaderKind::Dxbc ? D3d9Program::compile_dxbc(allocator_, desc.code, &program, desc.constant_base) : D3d9Program::compile(allocator_, desc.code, &program);
-      if (s != status::kSuccess) return s;
-      if (program->constant_bytes() > caps_.max_push_constant_bytes) return status::kNotSupported;
-      if (program->attributes_used() > caps_.max_vertex_attributes) return status::kNotSupported;      // (a vertex input the device does not have)
-      if (program->texture_unit_mask() >> caps_.max_texture_units) return status::kNotSupported;      // (a texture unit the device does not have)
-      if (program->stage() == graphics::ShaderStage::Fragment && program->color_output_count() > caps_.max_color_targets) return status::kNotSupported;
-      if (program->required_features() & ~caps_.features) return status::kNotSupported;   // (system values, texel access: the device must have them)   // (more constants than this device is given)
-      if (program->required_features2() & ~caps_.features2) return status::kNotSupported;   // (storage images, the layer output)
-      if (program->required_features3() & ~caps_.features3) return status::kNotSupported;
+      if (s != status::kSuccess) return pipeline_refused(s, desc.kind == ShaderKind::Dxbc && s == status::kNotSupported ? kDxbcLineBase + dxbc_refused_line() : __LINE__);   // (the program's code: D3d9Dxbc says where)
+      if (program->constant_bytes() > caps_.max_push_constant_bytes) return pipeline_refused(status::kNotSupported, __LINE__);
+      if (program->attributes_used() > caps_.max_vertex_attributes) return pipeline_refused(status::kNotSupported, __LINE__);      // (a vertex input the device does not have)
+      if (program->texture_unit_mask() >> caps_.max_texture_units) return pipeline_refused(status::kNotSupported, __LINE__);      // (a texture unit the device does not have)
+      if (program->stage() == graphics::ShaderStage::Fragment && program->color_output_count() > caps_.max_color_targets) return pipeline_refused(status::kNotSupported, __LINE__);
+      if (program->required_features() & ~caps_.features) return pipeline_refused(status::kNotSupported, __LINE__);   // (system values, texel access: the device must have them)   // (more constants than this device is given)
+      if (program->required_features2() & ~caps_.features2) return pipeline_refused(status::kNotSupported, __LINE__);   // (storage images, the layer output)
+      if (program->required_features3() & ~caps_.features3) return pipeline_refused(status::kNotSupported, __LINE__);
       // A GPU device (virgl) takes the shader as TGSI text; the others run it through the interpreter's native function. Both are given: each device uses what it understands.
       // A shader the text cannot say (see D3d9Tgsi.cpp) is still fine for the interpreter.
       const graphics::ShaderStage stage = program->stage();

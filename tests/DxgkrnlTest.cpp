@@ -9185,8 +9185,8 @@ void test_dxbc_constant_buffers() {
     {
       NtStatus st = 0;
       DxbcAsm big = dx_pixel_shader();
-      big.constant_buffer = 200;
-      big.raw({0x04000059, 0x208E46, 1, 100});   // 300 vec4s in all: more than 256
+      big.constant_buffer = 600;
+      big.raw({0x04000059, 0x208E46, 1, 400});   // 1000 vec4s in all: more than the 960 of the push constants
       big.ins(54, {dx_dst(kOpOut, 0, 0xF), dx_cb(0, 1)});
       big.ins(62, {});
       compile_dxbc(allocator, big.build(), &st);

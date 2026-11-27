@@ -35,6 +35,16 @@
 
 namespace dxgk {
 
+// The line of this file where the last Direct3D 10/11/12 shader was refused (dxbc_refused_line: the adapter's trace of refused shaders names it).
+namespace {
+uint32_t g_dxbc_refused_line = 0;
+NtStatus dxbc_refused(uint32_t line) {
+  __atomic_store_n(&g_dxbc_refused_line, line, __ATOMIC_RELAXED);
+  return status::kNotSupported;
+}
+}  // namespace
+uint32_t dxbc_refused_line() { return __atomic_load_n(&g_dxbc_refused_line, __ATOMIC_RELAXED); }
+
 namespace {
 
 constexpr uint32_t kRegisters = 32;   // input and output registers v0 .. v31, o0 .. o31 (what Shader Model 4 and 5 have)
@@ -268,14 +278,14 @@ class Flattener {
       at += length;
     }
     if (!needed) return status::kSuccess;
-    if (declared_ > kMaxTemps) return status::kNotSupported;
+    if (declared_ > kMaxTemps) return dxbc_refused(__LINE__);
     // The subroutines: each from after its label to the next label (or the end); the main program up to the first.
     main_end_ = static_cast<uint32_t>(at_.count());
     for (uint32_t i = 0; i < at_.count(); ++i) {
       if (op(i) != kLabel) continue;
       if (length(i) != 3) return status::kInvalidParameter;
       const uint32_t operand = w_[at_[i] + 1];
-      if (((operand >> 12) & 0xFF) == kTypeFunctionBody) return status::kNotSupported;   // (an interface's function body: the shader is not specialised)
+      if (((operand >> 12) & 0xFF) == kTypeFunctionBody) return dxbc_refused(__LINE__);   // (an interface's function body: the shader is not specialised)
       if (operand != kLabelOperand) return status::kInvalidParameter;
       const uint32_t number = w_[at_[i] + 2];
       for (const Label& l : labels_.view())
@@ -290,7 +300,7 @@ class Flattener {
     // The temporaries the pass added.
     if (extra_temps_) {
       const uint64_t total = uint64_t{declared_} + extra_temps_;
-      if (total > kMaxTemps - 3) return status::kNotSupported;   // (the compiler keeps the last three for itself)
+      if (total > kMaxTemps - 3) return dxbc_refused(__LINE__);   // (the compiler keeps the last three for itself)
       for (uint32_t at : temps_at_.view()) out_[at] = static_cast<uint32_t>(total);
       if (!temps_at_.count() && (!out_.insert(0, kDclTemps | 2u << 24) || !out_.insert(1, static_cast<uint32_t>(total)))) return status::kNoMemory;
     }
@@ -343,7 +353,7 @@ class Flattener {
   NtStatus copy(uint32_t i) {
     const uint32_t n = length(i);
     for (uint32_t k = 0; k < n; ++k)
-      if (!put(w_[at_[i] + k])) return status::kNotSupported;
+      if (!put(w_[at_[i] + k])) return dxbc_refused(__LINE__);
     return status::kSuccess;
   }
   NtStatus emit0(uint32_t opcode) { return put(opcode | 1u << 24) ? status::kSuccess : status::kNotSupported; }
@@ -359,9 +369,9 @@ class Flattener {
     if (k == ~0u) return status::kInvalidParameter;
     const uint32_t n = operand_words(k, at_[i] + length(i));
     if (!n) return status::kInvalidParameter;
-    if (!put(kIf | (w_[at_[i]] & kNonZero) | (1u + n) << 24)) return status::kNotSupported;
+    if (!put(kIf | (w_[at_[i]] & kNonZero) | (1u + n) << 24)) return dxbc_refused(__LINE__);
     for (uint32_t m = 0; m < n; ++m)
-      if (!put(w_[k + m])) return status::kNotSupported;
+      if (!put(w_[k + m])) return dxbc_refused(__LINE__);
     return status::kSuccess;
   }
   // mov rT.c, l(v)
@@ -539,7 +549,7 @@ class Flattener {
       const uint32_t n = operand_words(k, at_[i] + length(i));
       if (!n || !put(kMov | (3u + n) << 24) || !put(dst(0)) || !put(temp_number)) return status::kInvalidParameter;
       for (uint32_t m = 0; m < n; ++m)
-        if (!put(w_[k + m])) return status::kNotSupported;
+        if (!put(w_[k + m])) return dxbc_refused(__LINE__);
     }
     // rS.y |= (the selector is one of the group's values); with `none` (the default's group) also when it is none of the switch's (rS.w)
     auto match = [&](const Group& g, bool accumulate) -> NtStatus {
@@ -644,7 +654,7 @@ class Flattener {
           else if (i + 1 != end) s = emit_return();   // (the last instruction of a subroutine: its end)
           break;
         case kRetc:
-          if (!in_sub && hull_) return status::kNotSupported;   // (a hull shader's ret ends its phase)
+          if (!in_sub && hull_) return dxbc_refused(__LINE__);   // (a hull shader's ret ends its phase)
           if ((s = emit_if_of(i)) != status::kSuccess) return s;
           if (!push(Kind::If)) return status::kNoMemory;
           s = in_sub ? emit_return() : emit0(kRet);
@@ -788,9 +798,9 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   }
   ByteReader in(shader);
   in.skip(8);
-  if (program_type != 0 && program_type != 1 && program_type != 2 && program_type != 3 && program_type != 4 && program_type != 5) return status::kNotSupported;   // pixel, vertex, geometry, hull, domain and compute shaders
-  if (program_type == 5 && major != 5) return status::kNotSupported;
-  if (!((major == 4 && minor <= 1) || (major == 5 && minor <= 1))) return status::kNotSupported;
+  if (program_type != 0 && program_type != 1 && program_type != 2 && program_type != 3 && program_type != 4 && program_type != 5) return dxbc_refused(__LINE__);   // pixel, vertex, geometry, hull, domain and compute shaders
+  if (program_type == 5 && major != 5) return dxbc_refused(__LINE__);
+  if (!((major == 4 && minor <= 1) || (major == 5 && minor <= 1))) return dxbc_refused(__LINE__);
   const bool v51 = major == 5 && minor == 1;   // (constant buffers, textures and samplers are ranges with a space: cb[ID][index][element], t[ID][index])
   const bool major_at_least_41 = major == 5 || (major == 4 && minor >= 1);   // (samplepos, sampleinfo, the eval_* of 5.0: of 4.1 and later)
   int32_t cb_register[8], texture_register[8], sampler_register[8];   // by range ID: the register the range starts at, or -1
@@ -894,7 +904,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     const uint32_t selection = (t >> 2) & 3, bits = (t >> 4) & 0xFF;
     o->type = (t >> 12) & 0xFF;
     o->dims = (t >> 20) & 3;
-    if (o->components == 3) return status::kNotSupported;   // N components
+    if (o->components == 3) return dxbc_refused(__LINE__);   // N components
     if (o->components == 2) {
       if (selection == 0) o->mask = static_cast<uint8_t>(bits & 0xF);
       else if (selection == 1)
@@ -906,9 +916,9 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     }
     if (t >> 31) {
       const uint32_t e = p.le32();
-      if (!p.ok() || (e >> 31)) return status::kNotSupported;
+      if (!p.ok() || (e >> 31)) return dxbc_refused(__LINE__);
       if ((e & 0x3F) == 1) o->modifier = static_cast<uint8_t>((e >> 6) & 0xF);
-      if (o->modifier > 3) return status::kNotSupported;
+      if (o->modifier > 3) return dxbc_refused(__LINE__);
     }
     if (o->dims > 3) return status::kInvalidParameter;
     for (uint32_t i = 0; i < o->dims; ++i) {
@@ -919,11 +929,11 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         // The last index is relative: an immediate (representation 3), then the operand that gives the rest - a temporary's component, as fxc writes it.
         o->index[i] = representation == 3 ? p.le32() : 0;
         const uint32_t sub = p.le32();
-        if (!p.ok() || ((sub >> 12) & 0xFF) != kOpTemp || ((sub >> 20) & 3) != 1 || ((sub >> 22) & 7) != 0 || (sub >> 31)) return status::kNotSupported;
+        if (!p.ok() || ((sub >> 12) & 0xFF) != kOpTemp || ((sub >> 20) & 3) != 1 || ((sub >> 22) & 7) != 0 || (sub >> 31)) return dxbc_refused(__LINE__);
         o->relative = true;
         o->relative_component = static_cast<uint8_t>(((sub >> 2) & 3) == 2 ? (sub >> 4) & 3 : (sub >> 4) & 3);   // (select_1, or the first of a swizzle)
         const uint32_t temp = p.le32();
-        if (!p.ok() || temp >= kMaxTemps) return status::kNotSupported;
+        if (!p.ok() || temp >= kMaxTemps) return dxbc_refused(__LINE__);
         o->relative_temp = static_cast<uint16_t>(temp);
       } else if ((representation == 2 || representation == 3) && i == 0 && o->dims == 2 && (patch_stage || geometry) && (o->type == kOpInput || o->type == kOpInputControlPoint)) {
         // vicp[vOutputControlPointID][register]: the control point being made - or vicp[rN.c + 0][register] with rN.c holding vOutputControlPointID (moved there in the same
@@ -931,11 +941,11 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         // or control point at run time: v[r0.x + 1][2] of a geometry shader's loop over its vertices (vertex_relative: emit chooses among them)
         const uint32_t offset = representation == 3 ? p.le32() : 0;
         const uint32_t sub = p.le32();
-        if (!p.ok() || (sub >> 31)) return status::kNotSupported;
+        if (!p.ok() || (sub >> 31)) return dxbc_refused(__LINE__);
         if (((sub >> 12) & 0xFF) == kOpTemp && ((sub >> 20) & 3) == 1 && ((sub >> 22) & 7) == 0 && (sub & 3) == 2) {
           const uint32_t temp = p.le32();
           const uint8_t component = static_cast<uint8_t>(((sub >> 2) & 3) == 0 ? 0 : (sub >> 4) & 3);
-          if (!p.ok() || temp >= kMaxTemps) return status::kNotSupported;
+          if (!p.ok() || temp >= kMaxTemps) return dxbc_refused(__LINE__);
           if (patch_stage && offset == 0 && cp_id_marked(temp, component)) {
             o->vertex_from_id = true;
             o->index[0] = 0;
@@ -948,10 +958,10 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
           o->vertex_from_id = true;
           o->index[0] = 0;
         } else {
-          return status::kNotSupported;
+          return dxbc_refused(__LINE__);
         }
       } else {
-        return status::kNotSupported;   // 64-bit indices, relative anywhere else
+        return dxbc_refused(__LINE__);   // 64-bit indices, relative anywhere else
       }
     }
     if (o->type == kOpImmediate) {
@@ -980,7 +990,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     uint32_t literals = 0;
     for (const Def& d : program->defs_.view())
       if (d.number >= kLiteralBase && d.number < kImmediateBufferBase) ++literals;
-    if (literals >= 256) return status::kNotSupported;
+    if (literals >= 256) return dxbc_refused(__LINE__);
     *number = static_cast<uint16_t>(kLiteralBase + literals);
     return program->defs_.push_back({*number, {v[0], v[1], v[2], v[3]}}) ? status::kSuccess : status::kNoMemory;
   };
@@ -990,34 +1000,34 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     s->modifier = o.modifier == 1 ? kModNeg : o.modifier == 2 ? kModAbs : o.modifier == 3 ? kModAbsNeg : kModNone;
     switch (o.type) {
       case kOpTemp:
-        if (o.dims != 1 || o.index[0] >= kMaxTemps) return status::kNotSupported;
+        if (o.dims != 1 || o.index[0] >= kMaxTemps) return dxbc_refused(__LINE__);
         s->type = kTemp, s->number = static_cast<uint16_t>(o.index[0]);
         return status::kSuccess;
       case kOpViewIdPrivate:   // (SV_ViewID: any graphics stage; a device without view instancing draws every draw as view 0, as Direct3D 12 lets a driver without it do)
-        if (compute || o.dims != 0) return status::kNotSupported;
+        if (compute || o.dims != 0) return dxbc_refused(__LINE__);
         s->type = kSysValue, s->number = kSysViewId;
         program->uses_system_values_ = true;
         return status::kSuccess;
       case kOpSampleIndexPrivate:   // (SV_SampleIndex of a pixel shader from the DXIL translator, which has no input register for it: the shader runs for each sample)
-        if (!pixel || o.dims != 0) return status::kNotSupported;
+        if (!pixel || o.dims != 0) return dxbc_refused(__LINE__);
         s->type = kSysValue, s->number = kSysSampleIndex;
         program->uses_system_values_ = true;
         program->sample_shading_ = true;
         program->extra_features3_ |= graphics::kFeature3SampleShading;
         return status::kSuccess;
       case kOpInputCoverage: case kOpInnerCoverage:   // (vCoverage, vInnerCoverage: a pixel shader's)
-        if (!pixel || o.dims != 0) return status::kNotSupported;
+        if (!pixel || o.dims != 0) return dxbc_refused(__LINE__);
         s->type = kSysValue, s->number = o.type == kOpInputCoverage ? kSysCoverage : kSysInnerCoverage;
         program->uses_system_values_ = true;
         program->extra_features3_ |= o.type == kOpInputCoverage ? graphics::kFeature3Coverage : graphics::kFeature3InnerCoverage;
         return status::kSuccess;
       case kOpHelperLanePrivate:   // (IsHelperLane: a pixel shader's)
-        if (vertex || geometry || patch_stage || compute || o.dims != 0) return status::kNotSupported;
+        if (vertex || geometry || patch_stage || compute || o.dims != 0) return dxbc_refused(__LINE__);
         s->type = kSysValue, s->number = kSysHelperLane;
         program->uses_system_values_ = true;
         return status::kSuccess;
       case kOpBarycentricsPrivate: case kOpBarycentricsLinearPrivate:   // (SV_Barycentrics: a pixel shader's)
-        if (vertex || geometry || patch_stage || compute || o.dims != 0) return status::kNotSupported;
+        if (vertex || geometry || patch_stage || compute || o.dims != 0) return dxbc_refused(__LINE__);
         s->type = kSysValue, s->number = o.type == kOpBarycentricsPrivate ? kSysBarycentrics : kSysBarycentricsLinear;
         program->uses_system_values_ = true;
         program->extra_features2_ |= graphics::kFeature2Barycentrics;
@@ -1026,7 +1036,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       case kOpInput: {
         if (!vertex && !geometry && !patch_stage && !compute && o.type == kOpInput && o.dims == 2) {
           // v[vertex][register] of a pixel shader: the input as vertex 0, 1 or 2 of the primitive made it (GetAttributeAtVertex, from the DXIL translator)
-          if (o.index[0] >= 3 || o.index[1] >= kRegisters || in_slot[o.index[1]] < 0) return status::kNotSupported;
+          if (o.index[0] >= 3 || o.index[1] >= kRegisters || in_slot[o.index[1]] < 0) return dxbc_refused(__LINE__);
           s->type = kInput, s->number = static_cast<uint16_t>(o.index[1]), s->slot = in_slot[o.index[1]], s->vertex = static_cast<uint8_t>(o.index[0]);
           s->at_vertex = true;
           program->uses_system_values_ = true;
@@ -1036,9 +1046,9 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         if (geometry || patch_stage) {
           // v[vertex][register]: the vertex immediate, or for a hull shader's control point phase the control point being made
           const uint32_t limit = geometry ? geometry_vertices : input_points;
-          if (o.dims != 2 || (!o.vertex_from_id && !o.vertex_relative && o.index[0] >= limit) || o.index[1] >= kRegisters || in_slot[o.index[1]] == kSlotNone) return status::kNotSupported;
-          if (o.vertex_from_id && !(hull && phase == 1)) return status::kNotSupported;
-          if (o.vertex_relative && (limit == 0 || limit > graphics::kMaxPatchControlPoints || o.index[0] >= 256)) return status::kNotSupported;
+          if (o.dims != 2 || (!o.vertex_from_id && !o.vertex_relative && o.index[0] >= limit) || o.index[1] >= kRegisters || in_slot[o.index[1]] == kSlotNone) return dxbc_refused(__LINE__);
+          if (o.vertex_from_id && !(hull && phase == 1)) return dxbc_refused(__LINE__);
+          if (o.vertex_relative && (limit == 0 || limit > graphics::kMaxPatchControlPoints || o.index[0] >= 256)) return dxbc_refused(__LINE__);
           s->type = kInput, s->number = static_cast<uint16_t>(o.index[1]), s->slot = in_slot[o.index[1]], s->vertex = static_cast<uint8_t>(o.index[0]);
           s->vertex_from_id = o.vertex_from_id;
           if (o.vertex_relative) s->vertex_temp = static_cast<int16_t>(o.vertex_temp), s->vertex_component = o.vertex_component;
@@ -1049,33 +1059,33 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
           program->uses_system_values_ = true;
           return status::kSuccess;
         }
-        if (o.dims != 1 || o.index[0] >= kRegisters || in_slot[o.index[0]] < 0) return status::kNotSupported;
+        if (o.dims != 1 || o.index[0] >= kRegisters || in_slot[o.index[0]] < 0) return dxbc_refused(__LINE__);
         s->type = kInput, s->number = static_cast<uint16_t>(o.index[0]), s->slot = in_slot[o.index[0]];
         return status::kSuccess;
       }
       case kOpInputPatchConstant:
-        if (!domain || o.dims != 1 || o.index[0] >= graphics::kMaxPatchRegisters) return status::kNotSupported;
+        if (!domain || o.dims != 1 || o.index[0] >= graphics::kMaxPatchRegisters) return dxbc_refused(__LINE__);
         s->type = kPatchIn, s->number = static_cast<uint16_t>(o.index[0]);
         return status::kSuccess;
       case kOpOutputControlPointId:
-        if (!hull || phase != 1) return status::kNotSupported;
+        if (!hull || phase != 1) return dxbc_refused(__LINE__);
         s->type = kSysValue, s->number = kSysOutputControlPointId;
         return status::kSuccess;
       case kOpGsInstanceId:
-        if (!geometry) return status::kNotSupported;
+        if (!geometry) return dxbc_refused(__LINE__);
         s->type = kSysValue, s->number = kSysGsInstanceId;
         return status::kSuccess;
       case kOpInputPrimitiveId:   // (a geometry shader's vPrim: the primitive's number in the draw)
-        if (!geometry) return status::kNotSupported;
+        if (!geometry) return dxbc_refused(__LINE__);
         s->type = kSysValue, s->number = kSysPrimitiveId;
         program->uses_system_values_ = true;
         return status::kSuccess;
       case kOpDomainPoint:
-        if (!domain) return status::kNotSupported;
+        if (!domain) return dxbc_refused(__LINE__);
         s->type = kSysValue, s->number = kSysDomainLocation;
         return status::kSuccess;
       case kOpThreadId: case kOpThreadGroupId: case kOpThreadIdInGroup: case kOpThreadIdFlat:
-        if (!compute) return status::kNotSupported;
+        if (!compute) return dxbc_refused(__LINE__);
         s->type = kSysValue;
         s->number = o.type == kOpThreadId ? kSysDispatchThreadId : o.type == kOpThreadGroupId ? kSysGroupId : o.type == kOpThreadIdInGroup ? kSysGroupThreadId : kSysGroupIndex;
         return status::kSuccess;
@@ -1083,17 +1093,17 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         uint32_t slot, element;
         if (v51) {
           // cb[range][index][element]: the range declared as b<slot>, its one register, an element
-          if (o.dims != 3 || o.index[0] >= 8 || cb_register[o.index[0]] < 0 || cb_register[o.index[0]] >= static_cast<int32_t>(kMaxConstantBuffers)) return status::kNotSupported;
+          if (o.dims != 3 || o.index[0] >= 8 || cb_register[o.index[0]] < 0 || cb_register[o.index[0]] >= static_cast<int32_t>(kMaxConstantBuffers)) return dxbc_refused(__LINE__);
           slot = static_cast<uint32_t>(cb_register[o.index[0]]);
-          if (o.index[1] != slot) return status::kNotSupported;
+          if (o.index[1] != slot) return dxbc_refused(__LINE__);
           element = o.index[2];
         } else {
-          if (o.dims != 2 || o.index[0] >= kMaxConstantBuffers) return status::kNotSupported;
+          if (o.dims != 2 || o.index[0] >= kMaxConstantBuffers) return dxbc_refused(__LINE__);
           slot = o.index[0];
           element = o.index[1];
         }
         const uint32_t size = cb_size[slot];
-        if (size == 0 || (!o.relative && element >= size) || element > size) return status::kNotSupported;
+        if (size == 0 || (!o.relative && element >= size) || element > size) return dxbc_refused(__LINE__);
         const uint32_t base = cb_base(slot);
         s->type = kConst, s->number = static_cast<uint16_t>(base + element);
         if (o.relative) {
@@ -1102,7 +1112,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         return status::kSuccess;
       }
       case kOpImmediateConstantBuffer:
-        if (o.dims != 1 || immediate_buffer_size == 0 || (!o.relative && o.index[0] >= immediate_buffer_size) || o.index[0] > immediate_buffer_size) return status::kNotSupported;
+        if (o.dims != 1 || immediate_buffer_size == 0 || (!o.relative && o.index[0] >= immediate_buffer_size) || o.index[0] > immediate_buffer_size) return dxbc_refused(__LINE__);
         s->type = kConst, s->number = static_cast<uint16_t>(kImmediateBufferBase + o.index[0]);
         if (o.relative) {
           s->relative = true, s->relative_temp = static_cast<int16_t>(o.relative_temp), s->relative_component = o.relative_component;
@@ -1115,7 +1125,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         s->type = kConst, s->number = number;
         return r;
       }
-      default: return status::kNotSupported;
+      default: return dxbc_refused(__LINE__);
     }
   };
 
@@ -1126,34 +1136,34 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     else if (o.components != 2) return status::kInvalidParameter;
     switch (o.type) {
       case kOpTemp:
-        if (o.dims != 1 || o.index[0] >= kMaxTemps) return status::kNotSupported;
+        if (o.dims != 1 || o.index[0] >= kMaxTemps) return dxbc_refused(__LINE__);
         d->type = kTemp, d->number = static_cast<uint16_t>(o.index[0]);
         return status::kSuccess;
       case kOpOutputCoverage:   // (oMask: the samples a pixel shader's result reaches)
-        if (!pixel || o.dims != 0) return status::kNotSupported;
+        if (!pixel || o.dims != 0) return dxbc_refused(__LINE__);
         d->type = kCoverageOut, d->number = 0;
         program->writes_coverage_ = true;
         program->extra_features3_ |= graphics::kFeature3Coverage;
         return status::kSuccess;
       case kOpOutput: {
-        if (o.dims != 1 || o.index[0] >= kRegisters) return status::kNotSupported;
+        if (o.dims != 1 || o.index[0] >= kRegisters) return dxbc_refused(__LINE__);
         if (hull && (phase == 2 || phase == 3)) {   // (a patch constant register)
-          if (o.index[0] >= graphics::kMaxPatchRegisters) return status::kNotSupported;
+          if (o.index[0] >= graphics::kMaxPatchRegisters) return dxbc_refused(__LINE__);
           d->type = kPatchOut, d->number = static_cast<uint16_t>(o.index[0]);
           return status::kSuccess;
         }
         if (!vertex && !geometry && !patch_stage) {
-          if (o.index[0] >= graphics::kMaxColorTargets) return status::kNotSupported;   // (SV_Target0..3)
+          if (o.index[0] >= graphics::kMaxColorTargets) return dxbc_refused(__LINE__);   // (SV_Target0..3)
           d->type = kColorOut, d->slot = static_cast<int8_t>(o.index[0]);
           if (o.index[0] + 1 > color_outputs) color_outputs = o.index[0] + 1;
           return status::kSuccess;
         }
         const int8_t slot = out_slot[o.index[0]];
-        if (slot == kSlotNone) return status::kNotSupported;
+        if (slot == kSlotNone) return dxbc_refused(__LINE__);
         if (slot == kSlotLayer || slot == kSlotViewport) {
           // (from a geometry shader; from a vertex or domain shader it is Direct3D 11.3's VPAndRTArrayIndexFromAnyShaderFeedingRasterizer: kFeature2LayerFromAnyStage. A hull shader's
           // outputs do not reach the rasterizer)
-          if (!geometry && !vertex && !(patch_stage && !hull)) return status::kNotSupported;
+          if (!geometry && !vertex && !(patch_stage && !hull)) return dxbc_refused(__LINE__);
           d->type = kRastOut, d->slot = slot;
           d->number = static_cast<uint16_t>(o.index[0]);
           (slot == kSlotLayer ? program->writes_layer_ : program->writes_viewport_) = true;
@@ -1162,7 +1172,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
           return status::kSuccess;
         }
         if (slot == kSlotShadingRate) {
-          if (!geometry && !vertex) return status::kNotSupported;   // (a domain shader's does not reach the rasterizer as a rate: Direct3D says vertex and geometry shaders)
+          if (!geometry && !vertex) return dxbc_refused(__LINE__);   // (a domain shader's does not reach the rasterizer as a rate: Direct3D says vertex and geometry shaders)
           d->type = kRastOut, d->slot = slot;
           d->number = static_cast<uint16_t>(o.index[0]);
           program->extra_features2_ |= graphics::kFeature2ShadingRate;
@@ -1173,7 +1183,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         d->number = static_cast<uint16_t>(o.index[0]);
         return status::kSuccess;
       }
-      default: return status::kNotSupported;
+      default: return dxbc_refused(__LINE__);
     }
   };
 
@@ -1216,12 +1226,12 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   List<uint64_t> pending_exits(allocator), pending_continues(allocator);   // (loop depth << 32) | instruction index
   uint32_t tail_block = 0, tail_start = 0;   // (kDxbcTailBegin: the block + 1 of the copy being read, and where its instructions began)
   auto emit_one = [&](Instr& ins) -> NtStatus {
-    if (program->code_.count() >= kMaxInstructions) return status::kNotSupported;
+    if (program->code_.count() >= kMaxInstructions) return dxbc_refused(__LINE__);
     const uint32_t index = static_cast<uint32_t>(program->code_.count());
     ins.tail = tail_block;
     ins.tail_at = tail_block ? index - tail_start : 0;
     if (ins.op == kLoopBegin) {
-      if (loops.count() >= kMaxNesting || !loops.push_back({index, static_cast<uint32_t>(open_ifs.count())})) return status::kNotSupported;
+      if (loops.count() >= kMaxNesting || !loops.push_back({index, static_cast<uint32_t>(open_ifs.count())})) return dxbc_refused(__LINE__);
     } else if (ins.op == kLoopEnd) {
       if (!loops.count() || loops[loops.count() - 1].ifs != open_ifs.count()) return status::kInvalidParameter;   // (an if that straddles the end)
       const LoopFrame frame = loops[loops.count() - 1];
@@ -1245,7 +1255,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       if (!loops.count() || !pending_continues.push_back((uint64_t{loops.count()} << 32) | index)) return status::kInvalidParameter;
     }
     if (ins.op == kIfNz || ins.op == kIfZ) {
-      if (open_ifs.count() >= kMaxNesting || !open_ifs.push_back(index)) return status::kNotSupported;
+      if (open_ifs.count() >= kMaxNesting || !open_ifs.push_back(index)) return dxbc_refused(__LINE__);
     } else if (ins.op == kElse) {
       if (!open_ifs.count()) return status::kInvalidParameter;
       Instr& open = program->code_[open_ifs[open_ifs.count() - 1]];
@@ -1271,7 +1281,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       if (src.type != kInput || src.vertex_temp < 0) continue;
       const uint32_t limit = geometry ? geometry_vertices : input_points;
       const uint32_t value_temp = declared_temps + 2 * gathered, cond_temp = value_temp + 1;
-      if (limit == 0 || cond_temp >= kMaxTemps - 3) return status::kNotSupported;   // (the last three are the one-dimensional textures')
+      if (limit == 0 || cond_temp >= kMaxTemps - 3) return dxbc_refused(__LINE__);   // (the last three are the one-dimensional textures')
       ++gathered;
       Instr::Src vertex_input = src;
       vertex_input.vertex_temp = -1;
@@ -1331,7 +1341,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   uint32_t one_d_units = 0;
   auto one_d_fix = [&](Instr& ins) -> NtStatus {
     constexpr uint16_t kScratch = static_cast<uint16_t>(kMaxTemps - 1), kGradX = static_cast<uint16_t>(kMaxTemps - 2), kGradY = static_cast<uint16_t>(kMaxTemps - 3);
-    if (declared_temps > kMaxTemps - 3) return status::kNotSupported;
+    if (declared_temps > kMaxTemps - 3) return dxbc_refused(__LINE__);
     const bool array = program->texture_kind_[ins.src[1].number] == graphics::TextureKind::Texture2DArray;
     auto set_literal = [&](uint16_t temp, uint8_t mask, float value) -> NtStatus {
       Instr m;
@@ -1403,19 +1413,19 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   // other sampler a unit of that pair's own, the first no t# is declared at (the declarations come before the code), so that the units a pipeline has stay few. kNotSupported
   // when the units run out.
   auto sampler_number = [&](const Operand& sampler, uint32_t* number) -> NtStatus {
-    if (sampler.type != kOpSampler) return status::kNotSupported;
+    if (sampler.type != kOpSampler) return dxbc_refused(__LINE__);
     if (v51) {
-      if (sampler.dims != 2 || sampler.index[0] >= 8 || sampler_register[sampler.index[0]] < 0 || sampler.index[1] != static_cast<uint32_t>(sampler_register[sampler.index[0]])) return status::kNotSupported;
+      if (sampler.dims != 2 || sampler.index[0] >= 8 || sampler_register[sampler.index[0]] < 0 || sampler.index[1] != static_cast<uint32_t>(sampler_register[sampler.index[0]])) return dxbc_refused(__LINE__);
       *number = sampler.index[1];
     } else {
-      if (sampler.dims != 1) return status::kNotSupported;
+      if (sampler.dims != 1) return dxbc_refused(__LINE__);
       *number = sampler.index[0];
     }
     return *number < graphics::kMaxTextureUnits ? status::kSuccess : status::kNotSupported;
   };
   uint32_t paired_textures = 0;   // (bit n: t<n>'s own unit has the sampler of its first lookup)
   auto pair_unit = [&](uint32_t texture, uint32_t sampler, uint32_t* unit) -> NtStatus {
-    if (texture >= graphics::kMaxTextureUnits || sampler >= graphics::kMaxTextureUnits) return status::kNotSupported;
+    if (texture >= graphics::kMaxTextureUnits || sampler >= graphics::kMaxTextureUnits) return dxbc_refused(__LINE__);
     if (!(paired_textures >> texture & 1) && program->unit_texture_[texture] == texture) {
       paired_textures |= 1u << texture;
       program->unit_sampler_[texture] = static_cast<uint8_t>(sampler);
@@ -1442,7 +1452,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       *unit = u;
       return status::kSuccess;
     }
-    return status::kNotSupported;
+    return dxbc_refused(__LINE__);
   };
 
   // The residency feedback forms of the lookups (Shader Model 5 for tiled resources: the ones that end in _s, D3DWDDM1_3_SB_OPCODE_*_FEEDBACK) and the instruction they are a form of:
@@ -1511,9 +1521,9 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
 
   // --- the instructions
   while (!in.at_end()) {
-    if (feedback_unchecked) return status::kNotSupported;   // (a status of an instruction that has none)
+    if (feedback_unchecked) return dxbc_refused(__LINE__);   // (a status of an instruction that has none)
     const uint32_t token = in.le32();
-    if (returned && (token & 0x7FF) != kDxbcTailEnd) return status::kNotSupported;   // (code after a ret; the end of the copy of a return block it ends may follow)
+    if (returned && (token & 0x7FF) != kDxbcTailEnd) return dxbc_refused(__LINE__);   // (code after a ret; the end of the copy of a return block it ends may follow)
     uint32_t words = (token >> 24) & 0x7F;
     const uint32_t raw_opcode = token & 0x7FF;
     FeedbackForm form;
@@ -1526,7 +1536,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       if (!in.ok() || total_words < 2) return status::kInvalidParameter;
       const uint32_t payload = total_words - 2;
       if (data_class == 3) {
-        if (payload % 4 || payload / 4 > kMaxImmediateBuffer || immediate_buffer_size != 0) return status::kNotSupported;
+        if (payload % 4 || payload / 4 > kMaxImmediateBuffer || immediate_buffer_size != 0) return dxbc_refused(__LINE__);
         immediate_buffer_size = payload / 4;
         for (uint32_t i = 0; i < immediate_buffer_size; ++i) {
           float v[4];
@@ -1565,7 +1575,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
           sample_offset[k] = value >= 8 ? value - 16 : value;
         }
         const bool gather = opcode == 109 || opcode == 126, compare = opcode == 70 || opcode == 71;   // (and sample_c / sample_c_lz: a shadow map's taps)
-        if ((sample_offset[0] || sample_offset[1] || sample_offset[2]) && (!(gather || compare) || sample_offset[2])) return status::kNotSupported;
+        if ((sample_offset[0] || sample_offset[1] || sample_offset[2]) && (!(gather || compare) || sample_offset[2])) return dxbc_refused(__LINE__);
       }
     }
     NtStatus s = status::kSuccess;
@@ -1589,7 +1599,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       const ConstByteView rest = p.rest();
       if (!plain_operands.append(rest.first(after_dst)) || !plain_operands.append(rest.subview(after_status, after_operands - after_status))) return status::kNoMemory;
       p = ByteReader(plain_operands.view());
-      if (feedback_status.type != kOpNull && (feedback_status.type != kOpTemp || feedback_status.components != 2)) return status::kNotSupported;
+      if (feedback_status.type != kOpNull && (feedback_status.type != kOpTemp || feedback_status.components != 2)) return dxbc_refused(__LINE__);
       feedback_unchecked = true;
     }
     if (opcode == kDxbcTailBegin || opcode == kDxbcTailEnd) {
@@ -1660,13 +1670,13 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         if (s != status::kSuccess) return s;
         const uint32_t space = p.le32();
         if (!p.ok() || o.type != kOpSampler || o.dims != 3) return status::kInvalidParameter;
-        if (o.index[0] >= 8 || o.index[1] != o.index[2] || o.index[1] >= graphics::kMaxTextureUnits || space != 0) return status::kNotSupported;
+        if (o.index[0] >= 8 || o.index[1] != o.index[2] || o.index[1] >= graphics::kMaxTextureUnits || space != 0) return dxbc_refused(__LINE__);
         sampler_register[o.index[0]] = static_cast<int32_t>(o.index[1]);
         continue;
       }
       case kDclTemps4: {
         const uint32_t n = p.le32();
-        if (!p.ok() || n > kMaxTemps) return status::kNotSupported;
+        if (!p.ok() || n > kMaxTemps) return dxbc_refused(__LINE__);
         declared_temps = n;
         continue;
       }
@@ -1679,13 +1689,13 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
           const uint32_t size = p.le32(), space = p.le32();
           (void)size;
           if (!p.ok() || o.type != kOpConstantBuffer || o.dims != 3) return status::kInvalidParameter;
-          if (o.index[0] >= 8 || o.index[1] != o.index[2] || o.index[1] >= kMaxConstantBuffers || space != 0 || size == 0 || size > kMaxConstantRegisters) return status::kNotSupported;
+          if (o.index[0] >= 8 || o.index[1] != o.index[2] || o.index[1] >= kMaxConstantBuffers || space != 0 || size == 0 || size > kMaxConstantRegisters) return dxbc_refused(__LINE__);
           cb_register[o.index[0]] = static_cast<int32_t>(o.index[1]);
           cb_size[o.index[1]] = size;
           continue;
         }
         if (o.type != kOpConstantBuffer || o.dims != 2) return status::kInvalidParameter;
-        if (o.index[0] >= kMaxConstantBuffers || o.index[1] == 0 || o.index[1] > kMaxConstantRegisters) return status::kNotSupported;
+        if (o.index[0] >= kMaxConstantBuffers || o.index[1] == 0 || o.index[1] > kMaxConstantRegisters) return dxbc_refused(__LINE__);
         cb_size[o.index[0]] = o.index[1];
         continue;
       }
@@ -1698,11 +1708,11 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
           // dcl_resource_buffer (return types) t#: a typed view of a buffer (Buffer<>), read with ld - a read-only storage image of the slots after the u# ones
           const uint32_t returns = p.le32();
           if (!p.ok()) return status::kInvalidParameter;
-          if (o.type != kOpResource || o.dims != 1 || o.index[0] >= graphics::kMaxTexelBufferViews) return status::kNotSupported;
+          if (o.type != kOpResource || o.dims != 1 || o.index[0] >= graphics::kMaxTexelBufferViews) return dxbc_refused(__LINE__);
           const uint32_t slot = graphics::kTexelBufferSlotBase + o.index[0];
           if (program->image_mask_.test(slot)) return status::kInvalidParameter;
           const uint32_t type = returns & 0xF;   // (D3D10_SB_RESOURCE_RETURN_TYPE of the first component: 1 unorm, 2 snorm, 5 float - floats; 3 sint; 4 uint)
-          if (type != 1 && type != 2 && type != 3 && type != 4 && type != 5) return status::kNotSupported;
+          if (type != 1 && type != 2 && type != 3 && type != 4 && type != 5) return dxbc_refused(__LINE__);
           program->image_dim_[slot] = D3d9Program::ImageDim::Buffer;
           program->image_return_[slot] = type == 3 ? D3d9Program::ImageReturn::Sint : type == 4 ? D3d9Program::ImageReturn::Uint : D3d9Program::ImageReturn::Float;
           program->image_mask_.set(slot);
@@ -1714,7 +1724,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
           const uint32_t return_type = p.le32(), space = p.le32();
           (void)return_type;
           if (!p.ok() || o.type != kOpResource || o.dims != 3) return status::kInvalidParameter;
-          if (!resource_kind((token >> 11) & 0x1F, &kind) || o.index[0] >= 8 || o.index[1] != o.index[2] || o.index[1] >= graphics::kMaxTextureUnits || space != 0) return status::kNotSupported;
+          if (!resource_kind((token >> 11) & 0x1F, &kind) || o.index[0] >= 8 || o.index[1] != o.index[2] || o.index[1] >= graphics::kMaxTextureUnits || space != 0) return dxbc_refused(__LINE__);
           texture_register[o.index[0]] = static_cast<int32_t>(o.index[1]);
           if (((token >> 11) & 0x1F) == 2 || ((token >> 11) & 0x1F) == 7) one_d_units |= 1u << o.index[1];
           program->texture_unit_mask_ |= 1u << o.index[1];
@@ -1723,7 +1733,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
           if (graphics::is_multisampled_kind(kind)) program->extra_features3_ |= multisample_features(kind);
           continue;
         }
-        if (o.type != kOpResource || o.dims != 1 || !resource_kind((token >> 11) & 0x1F, &kind) || o.index[0] >= graphics::kMaxTextureUnits) return status::kNotSupported;   // two units
+        if (o.type != kOpResource || o.dims != 1 || !resource_kind((token >> 11) & 0x1F, &kind) || o.index[0] >= graphics::kMaxTextureUnits) return dxbc_refused(__LINE__);   // two units
         if (((token >> 11) & 0x1F) == 2 || ((token >> 11) & 0x1F) == 7) one_d_units |= 1u << o.index[0];
         program->texture_unit_mask_ |= 1u << o.index[0];
         program->texture_kind_[o.index[0]] = kind;
@@ -1739,7 +1749,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         if (geometry && (opcode == kDclInput4 || opcode == kDclInputSiv4) && o.type == kOpInput) {
           // v[N][register] (and for the _siv form the system value after it): the signature says what the register is
           // (the vertex count is the input primitive's, which Microsoft's compiler may declare after the inputs: checked there, or here when it came first)
-          if (o.dims != 2 || o.index[0] == 0 || (geometry_input_declared && o.index[0] != geometry_vertices) || o.index[1] >= kRegisters || in_slot[o.index[1]] == kSlotNone) return status::kNotSupported;
+          if (o.dims != 2 || o.index[0] == 0 || (geometry_input_declared && o.index[0] != geometry_vertices) || o.index[1] >= kRegisters || in_slot[o.index[1]] == kSlotNone) return dxbc_refused(__LINE__);
           if (declared_input_vertices && declared_input_vertices != o.index[0]) return status::kInvalidParameter;
           declared_input_vertices = o.index[0];
           continue;
@@ -1747,17 +1757,17 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         if (patch_stage && (opcode == kDclInput4 || opcode == kDclInputSiv4)) {
           // control points (v[N][register] of a hull shader, vicp[N][register] of a domain shader), the control point being made, the domain location, the patch constants
           if (o.type == kOpInput || o.type == kOpInputControlPoint) {
-            if (o.dims != 2 || o.index[0] != input_points || o.index[1] >= kRegisters || in_slot[o.index[1]] == kSlotNone) return status::kNotSupported;
+            if (o.dims != 2 || o.index[0] != input_points || o.index[1] >= kRegisters || in_slot[o.index[1]] == kSlotNone) return dxbc_refused(__LINE__);
             continue;
           }
           if (o.type == kOpOutputControlPointId || o.type == kOpDomainPoint || o.type == kOpInputPatchConstant || o.type == kOpForkInstanceId || o.type == kOpJoinInstanceId) continue;
-          return status::kNotSupported;
+          return dxbc_refused(__LINE__);
         }
         if (hull && opcode == kDclOutputSiv4 && o.type == kOpOutput && (phase == 2 || phase == 3)) {
           // a tessellation factor: the register of the patch constant outputs it is in (D3D_NAME 11..14 a quad's edges, 15 and 16 its inside, 17..19 a triangle's edges, 20 its inside, 21 an
           // isoline's detail, 22 its density)
           const uint32_t name = p.le32() & 0xFFFF;
-          if (!p.ok() || o.dims != 1 || o.index[0] >= graphics::kMaxPatchRegisters) return status::kNotSupported;
+          if (!p.ok() || o.dims != 1 || o.index[0] >= graphics::kMaxPatchRegisters) return dxbc_refused(__LINE__);
           const int8_t reg = static_cast<int8_t>(o.index[0]);
           uint32_t factor_domain = 0;
           if (name >= 11 && name <= 14) program->outer_factor_reg_[name - 11] = reg, factor_domain = 3;
@@ -1766,7 +1776,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
           else if (name == 20) program->inner_factor_reg_[0] = reg, factor_domain = 2;
           else if (name == 21) program->outer_factor_reg_[1] = reg, factor_domain = 1;   // (the detail: the second factor)
           else if (name == 22) program->outer_factor_reg_[0] = reg, factor_domain = 1;   // (the density: the first)
-          else return status::kNotSupported;
+          else return dxbc_refused(__LINE__);
           if (factors_domain != 0 && factors_domain != factor_domain) return status::kInvalidParameter;
           factors_domain = factor_domain;
           continue;
@@ -1783,7 +1793,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
           program->extra_features3_ |= graphics::kFeature3Coverage;
           continue;
         }
-        if ((o.type != kOpInput && o.type != kOpOutput) || o.dims != 1 || o.index[0] >= kRegisters) return status::kNotSupported;   // (depth and the like)
+        if ((o.type != kOpInput && o.type != kOpOutput) || o.dims != 1 || o.index[0] >= kRegisters) return dxbc_refused(__LINE__);   // (depth and the like)
         // How a pixel shader's input is interpolated (D3D10_SB_INTERPOLATION_MODE in the declaration: 1 constant, 2 linear, 3 linear centroid, 4 linear noperspective, 5 linear
         // noperspective centroid, 6 linear sample, 7 linear noperspective sample; 0 is the _sgv / _siv forms' undefined): the varying's, or the position's location.
         uint8_t interpolation = 0;
@@ -1818,39 +1828,39 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
           else if (!vertex && name == 24) sys = kSysShadingRate, program->extra_features2_ |= graphics::kFeature2ShadingRate;   // SV_ShadingRate
           else if (vertex && name == 6) sys = kSysVertexId;        // SV_VertexID
           else if (vertex && name == 8) sys = kSysInstanceId;      // SV_InstanceID
-          if (sys < 0) return status::kNotSupported;
+          if (sys < 0) return dxbc_refused(__LINE__);
           in_sys[o.index[0]] = static_cast<int8_t>(sys);
           continue;
         }
         if (o.type == kOpInput && vertex) {
-          if (o.index[0] >= graphics::kMaxVertexAttributes) return status::kNotSupported;
+          if (o.index[0] >= graphics::kMaxVertexAttributes) return dxbc_refused(__LINE__);
           if (o.index[0] + 1 > program->attributes_used_) program->attributes_used_ = o.index[0] + 1;
         }
         continue;
       }
-      case kDclIndexableTemp4: return status::kNotSupported;
+      case kDclIndexableTemp4: return dxbc_refused(__LINE__);
       case kHsDecls4:
-        if (!hull) return status::kNotSupported;
+        if (!hull) return dxbc_refused(__LINE__);
         phase = 0;
         continue;
       case kHsControlPointPhase4: case kHsForkPhase4: case kHsJoinPhase4: {
-        if (!hull) return status::kNotSupported;
+        if (!hull) return dxbc_refused(__LINE__);
         const int next = opcode == kHsControlPointPhase4 ? 1 : opcode == kHsForkPhase4 ? 2 : 3;
-        if (next <= phase) return status::kNotSupported;   // (the phases come once each, in order)
+        if (next <= phase) return dxbc_refused(__LINE__);   // (the phases come once each, in order)
         phase = next;
         (next == 1 ? program->hs_cp_begin_ : next == 2 ? program->hs_fork_begin_ : program->hs_join_begin_) = program->code_.count();
         continue;
       }
       case kDclInputControlPointCount4: case kDclOutputControlPointCount4: {
         const uint32_t n = (token >> 11) & 0x3F;
-        if (!patch_stage || n == 0 || n > graphics::kMaxPatchControlPoints || (opcode == kDclOutputControlPointCount4 && !hull)) return status::kNotSupported;
+        if (!patch_stage || n == 0 || n > graphics::kMaxPatchControlPoints || (opcode == kDclOutputControlPointCount4 && !hull)) return dxbc_refused(__LINE__);
         (opcode == kDclInputControlPointCount4 ? input_points : output_points) = n;
         continue;
       }
       case kDclTessDomain4: {
         // (D3D11_SB_TESSELLATOR_DOMAIN: 1 isoline, 2 triangle, 3 quad)
         const uint32_t mode = (token >> 11) & 7;
-        if (!patch_stage || mode < 1 || mode > 3) return status::kNotSupported;
+        if (!patch_stage || mode < 1 || mode > 3) return dxbc_refused(__LINE__);
         program->tess_domain_ = mode == 1 ? graphics::TessDomain::Isoline : mode == 2 ? graphics::TessDomain::Triangle : graphics::TessDomain::Quad;
         tess_domain_declared = true;
         continue;
@@ -1858,14 +1868,14 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       case kDclTessPartitioning4: {
         // (D3D11_SB_TESSELLATOR_PARTITIONING: 1 integer, 2 power of two, 3 fractional odd, 4 fractional even)
         const uint32_t mode = (token >> 11) & 7;
-        if (!hull || mode < 1 || mode > 4) return status::kNotSupported;
+        if (!hull || mode < 1 || mode > 4) return dxbc_refused(__LINE__);
         program->tess_partitioning_ = mode == 1 ? graphics::TessPartitioning::Integer : mode == 2 ? graphics::TessPartitioning::Pow2 : mode == 3 ? graphics::TessPartitioning::FractionalOdd : graphics::TessPartitioning::FractionalEven;
         continue;
       }
       case kDclTessOutputPrimitive4: {
         // (D3D11_SB_TESSELLATOR_OUTPUT_PRIMITIVE: 1 point, 2 line, 3 triangle_cw, 4 triangle_ccw)
         const uint32_t mode = (token >> 11) & 7;
-        if (!hull || mode < 1 || mode > 4) return status::kNotSupported;
+        if (!hull || mode < 1 || mode > 4) return dxbc_refused(__LINE__);
         program->tess_output_ = mode == 1 ? graphics::TessOutput::Point : mode == 2 ? graphics::TessOutput::Line : mode == 3 ? graphics::TessOutput::TriangleCw : graphics::TessOutput::TriangleCcw;
         tess_output_declared = true;
         continue;
@@ -1874,23 +1884,23 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         p.le32();
         continue;
       case kDclHsForkInstances4: case kDclHsJoinInstances4:
-        if (!hull || p.le32() != 1 || !p.ok()) return status::kNotSupported;   // (one instance of a phase)
+        if (!hull || p.le32() != 1 || !p.ok()) return dxbc_refused(__LINE__);   // (one instance of a phase)
         continue;
       case kDclInputPrimitive4: {
         // (D3D10_SB_PRIMITIVE: 1 point, 2 line, 3 triangle, 6 line with adjacency, 7 triangle with adjacency)
         const uint32_t primitive = (token >> 11) & 0x3F;
-        if (!geometry || !((primitive >= 1 && primitive <= 3) || primitive == 6 || primitive == 7)) return status::kNotSupported;
+        if (!geometry || !((primitive >= 1 && primitive <= 3) || primitive == 6 || primitive == 7)) return dxbc_refused(__LINE__);
         program->geometry_input_ = primitive == 1 ? graphics::GeometryPrimitive::Point : primitive == 2 ? graphics::GeometryPrimitive::Line : primitive == 3 ? graphics::GeometryPrimitive::Triangle
                                    : primitive == 6 ? graphics::GeometryPrimitive::LineAdjacency : graphics::GeometryPrimitive::TriangleAdjacency;
         geometry_vertices = primitive == 6 ? 4 : primitive == 7 ? 6 : primitive;
-        if (declared_input_vertices && declared_input_vertices != geometry_vertices) return status::kNotSupported;
+        if (declared_input_vertices && declared_input_vertices != geometry_vertices) return dxbc_refused(__LINE__);
         geometry_input_declared = true;
         continue;
       }
       case kDclOutputTopology4: {
         // (D3D10_SB_PRIMITIVE_TOPOLOGY: 1 point list, 3 line strip, 5 triangle strip)
         const uint32_t topology = (token >> 11) & 0x3F;
-        if (!geometry || (topology != 1 && topology != 3 && topology != 5)) return status::kNotSupported;
+        if (!geometry || (topology != 1 && topology != 3 && topology != 5)) return dxbc_refused(__LINE__);
         program->geometry_output_ = topology == 1 ? graphics::GeometryTopology::PointList : topology == 3 ? graphics::GeometryTopology::LineStrip : graphics::GeometryTopology::TriangleStrip;
         geometry_output_declared = true;
         continue;
@@ -1899,24 +1909,24 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         Operand o;
         s = read_operand(p, &o);
         if (s != status::kSuccess) return s;
-        if (!geometry || o.type != 16 || o.dims != 1 || o.index[0] >= graphics::kMaxGeometryStreams || o.index[0] != streams_declared) return status::kNotSupported;
+        if (!geometry || o.type != 16 || o.dims != 1 || o.index[0] >= graphics::kMaxGeometryStreams || o.index[0] != streams_declared) return dxbc_refused(__LINE__);
         ++streams_declared;
         continue;
       }
       case kDclGsInstanceCount4: {
         const uint32_t n = p.le32();
-        if (!geometry || !p.ok() || n == 0 || n > 32) return status::kNotSupported;
+        if (!geometry || !p.ok() || n == 0 || n > 32) return dxbc_refused(__LINE__);
         program->geometry_instances_ = n;
         continue;
       }
       case kDclMaxOutputVertices4: {
         const uint32_t n = p.le32();
-        if (!geometry || !p.ok() || n == 0 || n > graphics::kMaxGeometryVertices) return status::kNotSupported;
+        if (!geometry || !p.ok() || n == 0 || n > graphics::kMaxGeometryVertices) return dxbc_refused(__LINE__);
         program->geometry_max_vertices_ = n;
         continue;
       }
       case kDclThreadGroup4: {
-        if (!compute) return status::kNotSupported;
+        if (!compute) return dxbc_refused(__LINE__);
         const uint32_t x = p.le32(), y = p.le32(), z = p.le32();
         if (!p.ok() || x == 0 || y == 0 || z == 0 || x > graphics::kMaxThreadsPerGroup || y > graphics::kMaxThreadsPerGroup || z > graphics::kMaxThreadsPerGroup ||
             uint64_t{x} * y * z > graphics::kMaxThreadsPerGroup)
@@ -1931,14 +1941,14 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         s = read_operand(p, &o);
         if (s != status::kSuccess) return s;
         const uint32_t first = p.le32(), second = opcode == kDclTgsmStructured4 ? p.le32() : 0;
-        if (!compute || !p.ok() || o.type != kOpTgsm || o.dims != 1 || o.index[0] >= graphics::kMaxSharedMemories || program->shared_bytes_[o.index[0]] != 0) return status::kNotSupported;
+        if (!compute || !p.ok() || o.type != kOpTgsm || o.dims != 1 || o.index[0] >= graphics::kMaxSharedMemories || program->shared_bytes_[o.index[0]] != 0) return dxbc_refused(__LINE__);
         const uint32_t slot = graphics::kMaxStorageBuffers + o.index[0];
         uint64_t bytes = first;
         if (opcode == kDclTgsmStructured4) {
-          if (first == 0 || first > 2048 || first % 4 || second == 0) return status::kNotSupported;
+          if (first == 0 || first > 2048 || first % 4 || second == 0) return dxbc_refused(__LINE__);
           bytes = uint64_t{first} * second;
         }
-        if (bytes == 0 || bytes % 4 || bytes > graphics::kMaxSharedBytes || program->shared_total_bytes() + bytes > graphics::kMaxSharedBytes) return status::kNotSupported;
+        if (bytes == 0 || bytes % 4 || bytes > graphics::kMaxSharedBytes || program->shared_total_bytes() + bytes > graphics::kMaxSharedBytes) return dxbc_refused(__LINE__);
         program->shared_bytes_[o.index[0]] = static_cast<uint32_t>(bytes);
         program->uav_kind_[slot] = opcode == kDclTgsmRaw4 ? D3d9Program::BufferKind::Raw : D3d9Program::BufferKind::Structured;
         program->uav_stride_[slot] = opcode == kDclTgsmStructured4 ? first : 0;
@@ -1951,7 +1961,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         if (s != status::kSuccess) return s;
         const uint32_t returns = p.le32();
         if (!p.ok()) return status::kInvalidParameter;
-        if (o.type != kOpUav || o.dims != 1 || o.index[0] >= graphics::kMaxStorageImages) return status::kNotSupported;
+        if (o.type != kOpUav || o.dims != 1 || o.index[0] >= graphics::kMaxStorageImages) return dxbc_refused(__LINE__);
         const uint32_t slot = o.index[0];
         if (program->image_mask_.test(slot) || (slot < graphics::kMaxUavBuffers && program->uav_kind_[slot] != D3d9Program::BufferKind::None)) return status::kInvalidParameter;
         D3d9Program::ImageDim dim;
@@ -1962,7 +1972,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
           case 5: dim = D3d9Program::ImageDim::Texture3D; break;
           case 7: dim = D3d9Program::ImageDim::Texture1DArray; break;
           case 8: dim = D3d9Program::ImageDim::Texture2DArray; break;
-          default: return status::kNotSupported;
+          default: return dxbc_refused(__LINE__);
         }
         // (D3D10_SB_RESOURCE_RETURN_TYPE of the first component: 1 unorm, 2 snorm, 5 float - floats; 3 sint; 4 uint)
         const uint32_t type = returns & 0xF;
@@ -1970,7 +1980,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         if (type == 1 || type == 2 || type == 5) ret = D3d9Program::ImageReturn::Float;
         else if (type == 3) ret = D3d9Program::ImageReturn::Sint;
         else if (type == 4) ret = D3d9Program::ImageReturn::Uint;
-        else return status::kNotSupported;
+        else return dxbc_refused(__LINE__);
         // (D3D11_SB_RASTERIZER_ORDERED_ACCESS, bit 17: a rasterizer ordered view - a pixel shader's, on a device that orders them; bit 16, globally coherent, asks for what every
         // device's storage already is)
         if (token & kUavRasterizerOrdered) {
@@ -1994,10 +2004,10 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         s = read_operand(p, &o);
         if (s != status::kSuccess) return s;
         const uint32_t stride = structured_decl ? p.le32() : 0;
-        if ((!compute && !srv && !pixel && !vertex && !geometry && !hull && !domain) || !p.ok() || o.type != (srv ? kOpResource : kOpUav) || o.dims != 1 || o.index[0] >= (srv ? graphics::kMaxSrvBuffers : graphics::kMaxUavBuffers)) return status::kNotSupported;
+        if ((!compute && !srv && !pixel && !vertex && !geometry && !hull && !domain) || !p.ok() || o.type != (srv ? kOpResource : kOpUav) || o.dims != 1 || o.index[0] >= (srv ? graphics::kMaxSrvBuffers : graphics::kMaxUavBuffers)) return dxbc_refused(__LINE__);
         const uint32_t slot = srv ? graphics::kMaxUavBuffers + o.index[0] : o.index[0];
-        if (program->uav_kind_[slot] != D3d9Program::BufferKind::None || (!srv && program->image_mask_.test(slot))) return status::kNotSupported;
-        if (structured_decl && (stride == 0 || stride > 2048 || stride % 4)) return status::kNotSupported;
+        if (program->uav_kind_[slot] != D3d9Program::BufferKind::None || (!srv && program->image_mask_.test(slot))) return dxbc_refused(__LINE__);
+        if (structured_decl && (stride == 0 || stride > 2048 || stride % 4)) return dxbc_refused(__LINE__);
         if (!srv && (token & kUavRasterizerOrdered)) {   // (a rasterizer ordered buffer: RasterizerOrderedBuffer / ByteAddressBuffer / StructuredBuffer)
           if (!pixel) return status::kInvalidParameter;
           program->extra_features3_ |= graphics::kFeature3RasterizerOrderedViews;
@@ -2049,20 +2059,20 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       s = read_operand(p, &c);
       if (s != status::kSuccess) return s;
       const bool nonzero = ((token >> 18) & 1) != 0;
-      if (opcode == kDiscard4 && vertex) return status::kNotSupported;
+      if (opcode == kDiscard4 && vertex) return dxbc_refused(__LINE__);
       ins.op = opcode == kIf4 ? (nonzero ? kIfNz : kIfZ) : (nonzero ? kDiscardNz : kDiscardZ);
       s = to_src(c, &ins.src[0]);
       if (s != status::kSuccess) return s;
       ins.src_count = 1;
     } else if (!compute && opcode == kSync4) {
       // sync_uglobal in a shader of a draw (the only sync it may have): what it wrote is in memory before what follows - one invocation runs at a time here, a GPU's is a memory barrier
-      if (((token >> 11) & 0xF) != 8) return status::kNotSupported;
+      if (((token >> 11) & 0xF) != 8) return dxbc_refused(__LINE__);
       ins.op = kNop;
     } else if (opcode == 178 || opcode == 179) {
       // imm_atomic_alloc / imm_atomic_consume dst, u#: the hidden counter of a structured unordered access view (an append, consume or counter view)
       Operand d, uav;
       if ((s = read_operand(p, &d)) != status::kSuccess || (s = read_operand(p, &uav)) != status::kSuccess) return s;
-      if (uav.type != kOpUav || uav.dims != 1 || uav.index[0] >= graphics::kMaxUavBuffers || program->uav_kind_[uav.index[0]] != D3d9Program::BufferKind::Structured) return status::kNotSupported;
+      if (uav.type != kOpUav || uav.dims != 1 || uav.index[0] >= graphics::kMaxUavBuffers || program->uav_kind_[uav.index[0]] != D3d9Program::BufferKind::Structured) return dxbc_refused(__LINE__);
       const uint32_t slot = graphics::kCounterSlotBase + uav.index[0];
       program->uav_kind_[slot] = D3d9Program::BufferKind::Raw;   // (the counter's word: a buffer the draw or dispatch must bind)
       ins.op = kBufCounter;
@@ -2078,10 +2088,10 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       // bufinfo dst, t# / u#: the size of a buffer view - in elements for a typed one, structures for a structured one, bytes for a raw one
       Operand d, resource;
       if ((s = read_operand(p, &d)) != status::kSuccess || (s = read_operand(p, &resource)) != status::kSuccess) return s;
-      if ((resource.type != kOpUav && resource.type != kOpResource) || resource.dims != 1) return status::kNotSupported;
+      if ((resource.type != kOpUav && resource.type != kOpResource) || resource.dims != 1) return dxbc_refused(__LINE__);
       const bool view = resource.type == kOpResource;
       const uint32_t n = resource.index[0];
-      if (n >= (view ? graphics::kMaxSrvBuffers : graphics::kMaxUavBuffers)) return status::kNotSupported;
+      if (n >= (view ? graphics::kMaxSrvBuffers : graphics::kMaxUavBuffers)) return dxbc_refused(__LINE__);
       const uint32_t image_slot = view ? graphics::kTexelBufferSlotBase + n : n, storage_slot = view ? graphics::kMaxUavBuffers + n : n;
       if (image_slot < graphics::kMaxImageSlots && program->image_mask_.test(image_slot) && program->image_dim_[image_slot] == D3d9Program::ImageDim::Buffer) {
         ins.control = 1;
@@ -2091,7 +2101,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         ins.uav = static_cast<uint16_t>(storage_slot);
         ins.stride = program->uav_stride_[storage_slot];
       } else {
-        return status::kNotSupported;   // (not a buffer the shader declared)
+        return dxbc_refused(__LINE__);   // (not a buffer the shader declared)
       }
       ins.op = kBufInfo;
       if ((s = to_dst(d, &ins.dst)) != status::kSuccess) return s;
@@ -2112,7 +2122,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       Operand m;
       s = read_operand(p, &m);
       if (s != status::kSuccess) return s;
-      if (m.type != 16 || m.dims != 1 || m.index[0] >= graphics::kMaxGeometryStreams) return status::kNotSupported;
+      if (m.type != 16 || m.dims != 1 || m.index[0] >= graphics::kMaxGeometryStreams) return dxbc_refused(__LINE__);
       ins.control = static_cast<uint8_t>(m.index[0]);
       ins.op = opcode == 118 ? kGsCut : kGsEmit;
       if (opcode == 119) {
@@ -2181,11 +2191,11 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     } else if (opcode == 203 || opcode == 204 || opcode == 205) {
       // eval_snapped (dst, input, offset), eval_sample_index (dst, input, sample), eval_centroid (dst, input): a pixel shader's input taken at another point of the pixel (Shader
       // Model 5's EvaluateAttributeSnapped / AtSample / AtCentroid). The input is a v# register of an interpolated varying.
-      if (!pixel || major < 5) return status::kNotSupported;
+      if (!pixel || major < 5) return dxbc_refused(__LINE__);
       Operand d, input, where;
       if ((s = read_operand(p, &d)) != status::kSuccess || (s = read_operand(p, &input)) != status::kSuccess) return s;
       if (opcode != 205 && (s = read_operand(p, &where)) != status::kSuccess) return s;
-      if (input.type != kOpInput || input.dims != 1 || input.index[0] >= kRegisters || in_slot[input.index[0]] < 0 || in_sys[input.index[0]] >= 0) return status::kNotSupported;
+      if (input.type != kOpInput || input.dims != 1 || input.index[0] >= kRegisters || in_slot[input.index[0]] < 0 || in_sys[input.index[0]] >= 0) return dxbc_refused(__LINE__);
       ins.op = opcode == 203 ? kEvalSnapped : opcode == 204 ? kEvalSample : kEvalCentroid;
       if ((s = to_dst(d, &ins.dst)) != status::kSuccess || (s = to_src(input, &ins.src[0])) != status::kSuccess) return s;
       ins.src_count = 1;
@@ -2214,7 +2224,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       if ((opcode == 110 || opcode == 111) && !major_at_least_41) return status::kInvalidParameter;   // (Shader Model 4.1 instructions)
       if ((opcode == 110 || opcode == 111) && resource.type == kOpRasterizer) {
         // Of the rasterizer: the pass's sample count, or the position of one of its samples (Direct3D's GetRenderTargetSampleCount / GetRenderTargetSamplePosition), in a pixel shader
-        if (!pixel || resource.dims != 0) return status::kNotSupported;
+        if (!pixel || resource.dims != 0) return dxbc_refused(__LINE__);
         ins.op = opcode == 111 ? kTexSamples : kSamplePos;
         ins.control = 1;
         ins.vector = opcode == 111 && ((token >> 11) & 1) != 0;   // (sampleinfo_uint)
@@ -2239,9 +2249,9 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         // resinfo of a storage image: its size (the level operand names the view's one level)
         if (v51 || resource.dims != 1 || resource.index[0] >= graphics::kMaxStorageImages || !program->image_mask_.test(resource.index[0]) ||
             program->image_dim_[resource.index[0]] == D3d9Program::ImageDim::Buffer)
-          return status::kNotSupported;   // (a buffer's size is bufinfo's)
+          return dxbc_refused(__LINE__);   // (a buffer's size is bufinfo's)
         const uint32_t mode = (token >> 11) & 3;
-        if (mode > 2) return status::kNotSupported;
+        if (mode > 2) return dxbc_refused(__LINE__);
         ins.op = kImgSize;
         ins.control = static_cast<uint8_t>(mode);
         ins.uav = static_cast<uint16_t>(resource.index[0]);
@@ -2269,19 +2279,19 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       uint32_t unit = resource.index[0];
       if (v51) {
         if (resource.type != kOpResource || resource.dims != 2 || resource.index[0] >= 8 || texture_register[resource.index[0]] < 0 || resource.index[1] != static_cast<uint32_t>(texture_register[resource.index[0]]))
-          return status::kNotSupported;
+          return dxbc_refused(__LINE__);
         unit = resource.index[1];
       } else if (resource.type != kOpResource || resource.dims != 1) {
-        return status::kNotSupported;
+        return dxbc_refused(__LINE__);
       }
-      if (resource.type != kOpResource || unit >= graphics::kMaxTextureUnits || (opcode == 72 && sampler.type != kOpSampler)) return status::kNotSupported;
+      if (resource.type != kOpResource || unit >= graphics::kMaxTextureUnits || (opcode == 72 && sampler.type != kOpSampler)) return dxbc_refused(__LINE__);
       if (opcode == 72) {   // (sample_l: the unit of the texture and sampler pair)
         uint32_t sampler_reg = 0;
         if ((s = sampler_number(sampler, &sampler_reg)) != status::kSuccess || (s = pair_unit(unit, sampler_reg, &unit)) != status::kSuccess) return s;
       }
-      if (opcode == 45 && (program->texture_kind_[unit] == graphics::TextureKind::TextureCube || program->texture_kind_[unit] == graphics::TextureKind::TextureCubeArray)) return status::kNotSupported;   // (a cube has no Load)
+      if (opcode == 45 && (program->texture_kind_[unit] == graphics::TextureKind::TextureCube || program->texture_kind_[unit] == graphics::TextureKind::TextureCubeArray)) return dxbc_refused(__LINE__);   // (a cube has no Load)
       const bool multisampled = graphics::is_multisampled_kind(program->texture_kind_[unit]);
-      if ((opcode == 46 || opcode == 111 || opcode == 110) != multisampled && (opcode == 46 || opcode == 111 || opcode == 110 || opcode == 45 || opcode == 72)) return status::kNotSupported;   // (ld_ms, sampleinfo and samplepos go with a multisampled texture, and ld and sample_l do not)
+      if ((opcode == 46 || opcode == 111 || opcode == 110) != multisampled && (opcode == 46 || opcode == 111 || opcode == 110 || opcode == 45 || opcode == 72)) return dxbc_refused(__LINE__);   // (ld_ms, sampleinfo and samplepos go with a multisampled texture, and ld and sample_l do not)
       ins.op = opcode == 45 ? kTexFetch : opcode == 46 ? kTexFetchMs : opcode == 111 ? kTexSamples : opcode == 110 ? kSamplePos : opcode == 72 ? kTexLod : kTexSize;
       if (opcode == 111 || opcode == 110) {
         // sampleinfo: the sample count of the texture bound (an unsigned result when the instruction says so; `stride` the count it was declared with, 0 when it declared none);
@@ -2310,7 +2320,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       }
       if (opcode == 61) {
         const uint32_t mode = (token >> 11) & 3;
-        if (mode > 2) return status::kNotSupported;
+        if (mode > 2) return dxbc_refused(__LINE__);
         ins.control = static_cast<uint8_t>(mode);
       }
       s = to_dst(d, &ins.dst);
@@ -2343,7 +2353,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         if (exchange && (s = read_operand(p, &compare)) != status::kSuccess) return s;
         if ((s = read_operand(p, &value)) != status::kSuccess) return s;
       }
-      if (uav.type != kOpUav || uav.dims != 1 || uav.index[0] >= graphics::kMaxStorageImages || !program->image_mask_.test(uav.index[0])) return status::kNotSupported;
+      if (uav.type != kOpUav || uav.dims != 1 || uav.index[0] >= graphics::kMaxStorageImages || !program->image_mask_.test(uav.index[0])) return dxbc_refused(__LINE__);
       ins.uav = static_cast<uint16_t>(uav.index[0]);
       if (load) {
         ins.op = kImgLoad;
@@ -2388,13 +2398,13 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       }
       const bool group_shared = uav.type == kOpTgsm;
       const bool read_only_view = uav.type == kOpResource && load;   // (t#: a load only)
-      if (!compute && !pixel && !vertex && !geometry && !hull && !domain && !read_only_view) return status::kNotSupported;
-      if (!compute && uav.type == kOpTgsm) return status::kNotSupported;       // (group-shared memory is a compute shader's)
+      if (!compute && !pixel && !vertex && !geometry && !hull && !domain && !read_only_view) return dxbc_refused(__LINE__);
+      if (!compute && uav.type == kOpTgsm) return dxbc_refused(__LINE__);       // (group-shared memory is a compute shader's)
       if ((uav.type != kOpUav && !group_shared && !read_only_view) || uav.dims != 1 || uav.index[0] >= (group_shared ? graphics::kMaxSharedMemories : read_only_view ? graphics::kMaxSrvBuffers : graphics::kMaxUavBuffers))
-        return status::kNotSupported;
+        return dxbc_refused(__LINE__);
       const uint32_t slot = group_shared ? graphics::kMaxStorageBuffers + uav.index[0] : read_only_view ? graphics::kMaxUavBuffers + uav.index[0] : uav.index[0];
       const D3d9Program::BufferKind kind = program->uav_kind_[slot];
-      if (kind == D3d9Program::BufferKind::None || ((load || store) && structured != (kind == D3d9Program::BufferKind::Structured))) return status::kNotSupported;   // (an atomic works on either kind)
+      if (kind == D3d9Program::BufferKind::None || ((load || store) && structured != (kind == D3d9Program::BufferKind::Structured))) return dxbc_refused(__LINE__);   // (an atomic works on either kind)
       ins.uav = static_cast<uint16_t>(slot);
       ins.stride = program->uav_stride_[slot];
       if (load) {
@@ -2430,7 +2440,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       }
     } else if (opcode == kSample4 || opcode == 109 || opcode == 73 || opcode == 74 || opcode == 108 || opcode == 70 || opcode == 71 || opcode == 126 || opcode == 127 || opcode == 128) {   // (sample, gather4 and its variants, sample_d, sample_b, lod, sample_c, sample_c_lz)
       // (a vertex or compute shader has no derivatives: the lookups that take the level from them are refused there; gather4, sample_d and sample_c_lz are fine)
-      if ((vertex || compute) && (opcode == kSample4 || opcode == 74 || opcode == 108 || opcode == 70)) return status::kNotSupported;
+      if ((vertex || compute) && (opcode == kSample4 || opcode == 74 || opcode == 108 || opcode == 70)) return dxbc_refused(__LINE__);
       Operand d, coordinate, resource, sampler, gather_offset;
       const bool gather_op = opcode == 109 || opcode == 126 || opcode == 127 || opcode == 128;
       if ((s = read_operand(p, &d)) != status::kSuccess || (s = read_operand(p, &coordinate)) != status::kSuccess) return s;
@@ -2441,31 +2451,31 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         // t[range][index]: the range's register, indexed from it
         if (resource.type != kOpResource || resource.dims != 2 || resource.index[0] >= 8 || texture_register[resource.index[0]] < 0 ||
             resource.index[1] != static_cast<uint32_t>(texture_register[resource.index[0]]))
-          return status::kNotSupported;
+          return dxbc_refused(__LINE__);
         unit = resource.index[1];
       } else if (resource.type != kOpResource || resource.dims != 1) {
-        return status::kNotSupported;
+        return dxbc_refused(__LINE__);
       }
-      if (resource.type != kOpResource || unit >= graphics::kMaxTextureUnits || sampler.type != kOpSampler) return status::kNotSupported;
+      if (resource.type != kOpResource || unit >= graphics::kMaxTextureUnits || sampler.type != kOpSampler) return dxbc_refused(__LINE__);
       {
         // (the unit of the texture and sampler pair: a texture sampled with two samplers is read through two units)
         uint32_t sampler_reg = 0;
         if ((s = sampler_number(sampler, &sampler_reg)) != status::kSuccess || (s = pair_unit(unit, sampler_reg, &unit)) != status::kSuccess) return s;
       }
       Operand extra[2];
-      if (opcode == 108 && program->texture_kind_[unit] != graphics::TextureKind::Texture2D) return status::kNotSupported;
+      if (opcode == 108 && program->texture_kind_[unit] != graphics::TextureKind::Texture2D) return dxbc_refused(__LINE__);
       // (sample_c / sample_c_lz: of a 2D texture, an array of them (a one-dimensional texture or array is one of those) or a cube; with an offset in texels on all but a cube)
       if ((opcode == 70 || opcode == 71) && program->texture_kind_[unit] != graphics::TextureKind::Texture2D && program->texture_kind_[unit] != graphics::TextureKind::Texture2DArray &&
           program->texture_kind_[unit] != graphics::TextureKind::TextureCube)
-        return status::kNotSupported;
-      if ((opcode == 70 || opcode == 71) && (sample_offset[0] || sample_offset[1]) && program->texture_kind_[unit] == graphics::TextureKind::TextureCube) return status::kNotSupported;
+        return dxbc_refused(__LINE__);
+      if ((opcode == 70 || opcode == 71) && (sample_offset[0] || sample_offset[1]) && program->texture_kind_[unit] == graphics::TextureKind::TextureCube) return dxbc_refused(__LINE__);
       if (opcode == 70 || opcode == 71 || opcode == 126 || opcode == 128) {   // sample_c, gather4_c: the reference value
         if ((s = read_operand(p, &extra[0])) != status::kSuccess) return s;
       }
       if (opcode == 73 || opcode == 74) {   // sample_d: the two gradients, sample_b: the bias (2D textures only)
         for (uint32_t k = 0; k < (opcode == 73 ? 2u : 1u); ++k)
           if ((s = read_operand(p, &extra[k])) != status::kSuccess) return s;
-        if (program->texture_kind_[unit] != graphics::TextureKind::Texture2D) return status::kNotSupported;
+        if (program->texture_kind_[unit] != graphics::TextureKind::Texture2D) return dxbc_refused(__LINE__);
       }
       ins.op = gather_op ? kTexGather : opcode == 73 ? kTexGrad : opcode == 74 ? kTexBias : opcode == 108 ? kTexQueryLod : (opcode == 70 || opcode == 71) ? kTexCompare : kTexLd;
       s = to_dst(d, &ins.dst);
@@ -2505,8 +2515,8 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         const graphics::TextureKind kind = program->texture_kind_[unit];
         const bool compare = opcode == 126 || opcode == 128, programmable = opcode == 127 || opcode == 128, offset_static = sample_offset[0] || sample_offset[1];
         const bool cube_kind = kind == graphics::TextureKind::TextureCube || kind == graphics::TextureKind::TextureCubeArray;
-        if ((kind != graphics::TextureKind::Texture2D && kind != graphics::TextureKind::Texture2DArray && !cube_kind) || resource.components != 2) return status::kNotSupported;
-        if ((programmable || offset_static) && cube_kind) return status::kNotSupported;
+        if ((kind != graphics::TextureKind::Texture2D && kind != graphics::TextureKind::Texture2DArray && !cube_kind) || resource.components != 2) return dxbc_refused(__LINE__);
+        if ((programmable || offset_static) && cube_kind) return dxbc_refused(__LINE__);
         const uint8_t channel = resource.swizzle[sampler.components == 2 ? sampler.swizzle[0] & 3 : 0];
         ins.control = static_cast<uint8_t>((compare ? 0 : channel) | (compare ? 4 : 0) | (programmable ? 8 : 0) | (offset_static ? 16 : 0));
         if (compare) program->compare_units_ |= 1u << unit;
@@ -2529,7 +2539,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       const Alu* alu = nullptr;
       for (const Alu& a : kAlu)
         if (a.dxbc == opcode) alu = &a;
-      if (!alu) return status::kNotSupported;
+      if (!alu) return dxbc_refused(__LINE__);
       Operand d;
       s = read_operand(p, &d);
       if (s != status::kSuccess) return s;
@@ -2567,12 +2577,12 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     s = emit(ins);
     if (s != status::kSuccess) return s;
   }
-  if (feedback_unchecked) return status::kNotSupported;
+  if (feedback_unchecked) return dxbc_refused(__LINE__);
   if (open_ifs.count() || loops.count() || tail_block) return status::kInvalidParameter;
   {
     uint32_t total = 0;
     for (uint32_t size : cb_size) total += size;
-    if (total > kMaxConstantRegisters - constant_base) return status::kNotSupported;
+    if (total > kMaxConstantRegisters - constant_base) return dxbc_refused(__LINE__);
     if (total) program->constant_registers_ = constant_base + total;
     program->color_outputs_ = color_outputs;
   }
@@ -2586,12 +2596,12 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     }
   }
   if (compute && (!thread_group_declared || program->code_.count() == 0)) return status::kInvalidParameter;
-  if (compute && program->keeps_group() && program->thread_group_[0] * program->thread_group_[1] * program->thread_group_[2] > graphics::kMaxBarrierThreads) return status::kNotSupported;   // (a thread that waits keeps registers of its own)
+  if (compute && program->keeps_group() && program->thread_group_[0] * program->thread_group_[1] * program->thread_group_[2] > graphics::kMaxBarrierThreads) return dxbc_refused(__LINE__);   // (a thread that waits keeps registers of its own)
   if (geometry && (!geometry_input_declared || !geometry_output_declared || program->geometry_max_vertices_ == 0)) return status::kInvalidParameter;
   if (geometry) {
     program->geometry_streams_ = streams_declared ? streams_declared : 1;
     // (several streams are lists of points)
-    if (program->geometry_streams_ > 1 && program->geometry_output_ != graphics::GeometryTopology::PointList) return status::kNotSupported;
+    if (program->geometry_streams_ > 1 && program->geometry_output_ != graphics::GeometryTopology::PointList) return dxbc_refused(__LINE__);
     if (program->geometry_streams_ > 1) {
       // What an output register means depends on the stream of the emit it is written for: the next one after the instruction.
       uint32_t stream_after = 0;
