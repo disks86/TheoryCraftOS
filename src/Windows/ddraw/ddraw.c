@@ -64,6 +64,8 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 typedef struct DDraw DDraw;
 typedef struct Surface Surface;
 typedef struct SurfaceGroup SurfaceGroup;
+/* One AddAttachedSurface: the surface attached and the interface of it the attachment holds a reference of. */
+typedef struct AttachLink { Surface *child; IUnknown *iface; struct AttachLink *next; } AttachLink;
 typedef struct Palette Palette;
 typedef struct Clipper Clipper;
 
@@ -124,9 +126,9 @@ struct Surface {
   SurfaceGroup *group;
   /* attachments */
   Surface *complex[MAX_COMPLEX];   /* the surfaces made with this one: the next back buffer, the next mipmap level, a cube map's faces */
-  Surface *next_attached;    /* attached with AddAttachedSurface: a list from first_attached */
-  Surface *first_attached;
-  IUnknown *attached_iface;  /* the interface of this surface its attachment holds a reference of */
+  struct AttachLink *attached;   /* what AddAttachedSurface attached to this one (not flipping chains), newest first */
+  UINT parents;              /* the surfaces this one is attached to that way (Windows lets one surface be attached to several) */
+  IUnknown *attached_iface;  /* the interface of this surface an attachment holds a reference of (a flipping chain's, or the first of its parents') */
   DWORD attach_saved_caps;   /* caps AddAttachedSurface changed (a version 1 surface joining a flipping chain) */
   BOOL implicit;             /* made by a complex CreateSurface, not its root: lives as long as the group */
   BOOL flip_chain_start;
@@ -205,9 +207,12 @@ struct DDraw {
   HWND focus_window, device_window, dest_window;
   HWND hooked_window;        /* the window whose procedure ddraw watches for this object (exclusive mode: display.inc's table of hooked windows) */
   Surface *primary;
+  const BYTE *gdi_mem;        /* the memory the primary surface was made with: the GDI's, which Flip passes round the chain (GetGDISurface) */
   RECT primary_lock;
   Surface *surfaces;         /* list of every surface (list_next) */
   int d3d_version;           /* the IDirect3D version asked for last (1, 2, 3 or 7) */
+  int d3d_family;            /* which IDirect3D interfaces QueryInterface gives: 7 (made by DirectDrawCreateEx) only IDirect3D7, 1 (DirectDrawCreate) all but
+                              * IDirect3D7, as Windows (Wine's refcount test); 0 (the class factory's) every one */
   void *d3d;                 /* the Direct3D part's state of this object (opaque here) */
   /* StartModeTest / EvaluateMode */
   SIZE *test_modes;
@@ -419,6 +424,7 @@ EXPORT HRESULT WINAPI DirectDrawCreate(GUID *driver, IDirectDraw **out, IUnknown
   /* (the object's one reference moves to IDirectDraw) */
   dd->ref7 = 0;
   dd->ref1 = 1;
+  dd->d3d_family = 1;
   *out = DDI1(dd);
   return DD_OK;
 }
@@ -432,6 +438,7 @@ EXPORT HRESULT WINAPI DirectDrawCreateEx(GUID *driver, void **out, REFIID iid, I
   DDraw *dd;
   HRESULT hr = ddraw_create(&dd, TRUE); if (SUCCEEDED(hr)) dd->kind = driver_kind(driver);
   if (FAILED(hr)) return hr;
+  dd->d3d_family = 7;
   *out = DDI7(dd);
   return DD_OK;
 }

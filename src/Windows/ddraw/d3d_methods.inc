@@ -121,6 +121,9 @@ static HRESULT STDMETHODCALLTYPE dev7_SetLight(IDirect3DDevice7 *i, DWORD index,
   if (!light) hr = DDERR_INVALIDPARAMS;
   else if (light->dltType < D3DLIGHT_POINT || light->dltType > D3DLIGHT_DIRECTIONAL) hr = DDERR_INVALIDPARAMS;
   else if (light->dvRange < 0.0f) hr = DDERR_INVALIDPARAMS;
+  /* (a negative attenuation of a light that has a position: Wine's d3d test records DDERR_INVALIDPARAMS) */
+  else if (light->dltType != D3DLIGHT_DIRECTIONAL && (light->dvAttenuation0 < 0.0f || light->dvAttenuation1 < 0.0f || light->dvAttenuation2 < 0.0f))
+    hr = DDERR_INVALIDPARAMS;
   else hr = d3_light(dev, index, light, -1);
   D7_END();
 }
@@ -320,8 +323,12 @@ static void load_chain(Surface *dst, Surface *src, POINT at, RECT sr) {
     memcpy(dst->palette->entries, src->palette->entries, sizeof dst->palette->entries);
     surfaces_palette_changed(dst->palette);
   }
+  /* (IDirect3DDevice7::Load takes the source's colour keys: one the source has not is deleted from the destination - Wine's test_texture_load_ckey;
+   * IDirect3DTexture::Load keeps it) */
   if (src->desc.dwFlags & DDSD_CKSRCBLT) { dst->desc.dwFlags |= DDSD_CKSRCBLT; dst->desc.ddckCKSrcBlt = src->desc.ddckCKSrcBlt; }
+  else dst->desc.dwFlags &= ~(DWORD)DDSD_CKSRCBLT;
   if (src->desc.dwFlags & DDSD_CKDESTBLT) { dst->desc.dwFlags |= DDSD_CKDESTBLT; dst->desc.ddckCKDestBlt = src->desc.ddckCKDestBlt; }
+  else dst->desc.dwFlags &= ~(DWORD)DDSD_CKDESTBLT;
   Surface *s = src, *d = dst;
   while (s && d) {
     if (s->desc.dwWidth == d->desc.dwWidth && s->desc.dwHeight == d->desc.dwHeight) {

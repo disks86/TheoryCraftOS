@@ -380,7 +380,7 @@ static void test_palettes_and_formats(void) {
     check(IDirectDrawSurface7_SetPalette(s8, p) == DD_OK && refs(p) == 2, "SetPalette holds the palette");
     fill(s8, NULL, 200);
     hr = IDirectDrawSurface7_Blt(s32, NULL, s8, NULL, DDBLT_WAIT, NULL);
-    check(hr == DD_OK && get_pixel(s32, 1, 1) == 0xC83700, "a blit from an 8-bit surface goes through its palette");
+    check(hr == DD_OK && get_pixel(s32, 1, 1) == 0xC8C8C8, "a blit from an 8-bit surface copies the index into every channel (as Windows' blitter)");
   }
   if (s8) IDirectDrawSurface7_Release(s8);
   if (s32) IDirectDrawSurface7_Release(s32);

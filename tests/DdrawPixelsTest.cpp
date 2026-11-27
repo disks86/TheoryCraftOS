@@ -244,8 +244,11 @@ static void test_blits() {
   CHECK(dd_blit(&c32.im, &d, &c16.im, &s, NULL) == DD_PIX_OK && dd_get_raw(&c32.im, 0, 0) == 0xFF0000 && dd_get_raw(&c32.im, 1, 0) == 0x00FF00);
   Image pal(DD_FMT_P8, 2, 1);
   pal.palette[1] = 0xFFFF0000u; pal.palette[2] = 0xFF0000FFu;
-  dd_put_raw(&pal.im, 0, 0, 1); dd_put_raw(&pal.im, 1, 0, 2);
-  CHECK(dd_blit(&c16.im, &d, &pal.im, &s, NULL) == DD_PIX_OK && dd_get_raw(&c16.im, 0, 0) == 0xF800 && dd_get_raw(&c16.im, 1, 0) == 0x001F);
+  // (P8 into a colour format: the index in every channel, as Windows' blitter - not the palette's colour)
+  dd_put_raw(&pal.im, 0, 0, 0xFF); dd_put_raw(&pal.im, 1, 0, 0x00);
+  CHECK(dd_blit(&c16.im, &d, &pal.im, &s, NULL) == DD_PIX_OK && dd_get_raw(&c16.im, 0, 0) == 0xFFFF && dd_get_raw(&c16.im, 1, 0) == 0x0000);
+  dd_put_raw(&pal.im, 0, 0, 0x10);
+  CHECK(dd_blit(&c32.im, &d, &pal.im, &s, NULL) == DD_PIX_OK && dd_get_raw(&c32.im, 0, 0) == 0x101010);
   dd_put_raw(&c32.im, 0, 0, 0x0000F0); dd_put_raw(&c32.im, 1, 0, 0xF00000);
   CHECK(dd_blit(&pal.im, &d, &c32.im, &s, NULL) == DD_PIX_OK && dd_get_raw(&pal.im, 0, 0) == 2 && dd_get_raw(&pal.im, 1, 0) == 1);
   // YUY2 into x8r8g8b8 (a video frame onto the screen) and stretched
@@ -258,16 +261,68 @@ static void test_blits() {
   for (size_t i = 0; i < b1.bytes.size(); ++i) b1.bytes[i] = (uint8_t)i;
   d = R(4, 0, 8, 4); s = R(0, 4, 4, 8);
   CHECK(dd_blit(&b2.im, &d, &b1.im, &s, NULL) == DD_PIX_OK && memcmp(b2.bytes.data() + 8, b1.bytes.data() + 16, 8) == 0);
-  d = R(1, 0, 5, 4);
-  CHECK(dd_blit(&b2.im, &d, &b1.im, &s, NULL) == DD_PIX_UNSUPPORTED);
-  d = R(0, 0, 8, 8); s = R(0, 0, 4, 4);
-  CHECK(dd_blit(&b2.im, &d, &b1.im, &s, NULL) == DD_PIX_UNSUPPORTED);      // (no stretching of blocks)
+  // blocks: anything else re-encodes the blocks it touches (the pixels outside the rectangle kept)
+  {
+    // a solid blue block stretched from 4x4 to 8x8, and its corner 2x2 into the middle of another surface
+    Image sb(DD_FMT_DXT1, 4, 4), big(DD_FMT_DXT1, 8, 8), argb(DD_FMT_A8R8G8B8, 8, 8);
+    const uint8_t blue[8] = {0x1F, 0x00, 0x1F, 0x00, 0, 0, 0, 0};
+    memcpy(sb.bytes.data(), blue, 8);
+    d = R(0, 0, 8, 8); s = R(0, 0, 4, 4);
+    CHECK(dd_blit(&big.im, &d, &sb.im, &s, NULL) == DD_PIX_OK);
+    CHECK(dd_blit(&argb.im, &d, &big.im, &d, NULL) == DD_PIX_OK && dd_get_raw(&argb.im, 7, 7) == 0xFF0000FFu && dd_get_raw(&argb.im, 0, 0) == 0xFF0000FFu);
+    Image red(DD_FMT_R5G6B5, 4, 4);
+    d = R(0, 0, 4, 4);
+    CHECK(dd_fill(&red.im, &d, 0xF800) == DD_PIX_OK);
+    d = R(2, 2, 6, 6); s = R(0, 0, 4, 4);
+    CHECK(dd_blit(&big.im, &d, &red.im, &s, NULL) == DD_PIX_OK);      // (four blocks each partly written)
+    d = R(0, 0, 8, 8);
+    CHECK(dd_blit(&argb.im, &d, &big.im, &d, NULL) == DD_PIX_OK);
+    CHECK(dd_get_raw(&argb.im, 2, 2) == 0xFFFF0000u && dd_get_raw(&argb.im, 5, 5) == 0xFFFF0000u && dd_get_raw(&argb.im, 1, 1) == 0xFF0000FFu &&
+          dd_get_raw(&argb.im, 6, 6) == 0xFF0000FFu && dd_get_raw(&argb.im, 6, 2) == 0xFF0000FFu);
+    // a DXT1 block into DXT3 (a format change) and back
+    Image d3(DD_FMT_DXT3, 8, 8);
+    CHECK(dd_blit(&d3.im, &d, &big.im, &d, NULL) == DD_PIX_OK && d3.bytes[0] == 0xFF && d3.bytes[7] == 0xFF);
+    Image back(DD_FMT_A8R8G8B8, 8, 8);
+    CHECK(dd_blit(&back.im, &d, &d3.im, &d, NULL) == DD_PIX_OK && memcmp(back.bytes.data(), argb.bytes.data(), back.bytes.size()) == 0);
+    // what Wine's test_surface_format_conversion_alpha records for Windows: green and blue as DXT1 colour 0 0x07e0, colour 1 0x001f, codes 0x14445154
+    static const uint32_t rgba[16] = {0xff00ff00, 0xff0000ff, 0xff0000ff, 0xff0000ff, 0xff0000ff, 0xff00ff00, 0xff0000ff, 0xff0000ff,
+                                      0xff00ff00, 0xff0000ff, 0xff00ff00, 0xff0000ff, 0xff00ff00, 0xff0000ff, 0xff0000ff, 0xff00ff00};
+    Image src(DD_FMT_X8R8G8B8, 4, 4), x1(DD_FMT_DXT1, 4, 4), x2(DD_FMT_DXT2, 4, 4);
+    for (uint32_t i = 0; i < 16; ++i) dd_put_raw(&src.im, i & 3, i / 4, rgba[i] & 0xFFFFFF);
+    d = R(0, 0, 4, 4);
+    CHECK(dd_blit(&x1.im, &d, &src.im, &d, NULL) == DD_PIX_OK);
+    const uint8_t want1[8] = {0xe0, 0x07, 0x1f, 0x00, 0x54, 0x51, 0x44, 0x14};
+    CHECK(memcmp(x1.bytes.data(), want1, 8) == 0);
+    CHECK(dd_blit(&x2.im, &d, &x1.im, &d, NULL) == DD_PIX_OK);
+    const uint8_t want2[16] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xe0, 0x07, 0x1f, 0x00, 0x54, 0x51, 0x44, 0x14};
+    CHECK(memcmp(x2.bytes.data(), want2, 16) == 0);
+    // DXT into X8R8G8B8: the alpha byte written (0xff), and X1R5G5B5 into A1R5G5B5 copied as it is
+    Image x8(DD_FMT_X8R8G8B8, 4, 4);
+    CHECK(dd_blit(&x8.im, &d, &x1.im, &d, NULL) == DD_PIX_OK && dd_get_raw(&x8.im, 0, 0) == 0xff00ff00u && dd_get_raw(&x8.im, 1, 0) == 0xff0000ffu);
+    Image x555(DD_FMT_X1R5G5B5, 4, 4), a555(DD_FMT_A1R5G5B5, 4, 4);
+    dd_put_raw(&x555.im, 0, 0, 0x03e0);
+    CHECK(dd_blit(&a555.im, &d, &x555.im, &d, NULL) == DD_PIX_OK && dd_get_raw(&a555.im, 0, 0) == 0x03e0);
+    // DXT1 transparency survives (three-colour blocks), DXT5 alpha ramps are close
+    Image a8(DD_FMT_A8R8G8B8, 4, 4), x5(DD_FMT_DXT5, 4, 4), out8(DD_FMT_A8R8G8B8, 4, 4);
+    for (uint32_t i = 0; i < 16; ++i) dd_put_raw(&a8.im, i & 3, i / 4, ((i * 17u) << 24) | 0x00406080u);
+    CHECK(dd_blit(&x1.im, &d, &a8.im, &d, NULL) == DD_PIX_OK && dd_blit(&out8.im, &d, &x1.im, &d, NULL) == DD_PIX_OK);
+    CHECK((dd_get_raw(&out8.im, 0, 0) >> 24) == 0 && (dd_get_raw(&out8.im, 3, 3) >> 24) == 0xFF);
+    CHECK(dd_blit(&x5.im, &d, &a8.im, &d, NULL) == DD_PIX_OK && dd_blit(&out8.im, &d, &x5.im, &d, NULL) == DD_PIX_OK);
+    int worst = 0;
+    for (uint32_t i = 0; i < 16; ++i) {
+      const int a = (int)(dd_get_raw(&out8.im, i & 3, i / 4) >> 24), want = (int)(i * 17u);
+      if (abs(a - want) > worst) worst = abs(a - want);
+    }
+    CHECK(worst <= 18);
+    CHECK((dd_get_raw(&out8.im, 2, 2) & 0xFFFFFF) == 0x00426184u || (dd_get_raw(&out8.im, 2, 2) & 0xFFFFFF) == 0x00406080u ||
+          dd_rgb_distance(dd_get_raw(&out8.im, 2, 2), 0x406080u) < 64);
+  }
   // a block source decoded into a colour destination
   Image col(DD_FMT_X8R8G8B8, 4, 4);
   const uint8_t block[8] = {0x00, 0xF8, 0x1F, 0x00, 0x00, 0, 0, 0};
   memcpy(b1.bytes.data(), block, 8);
   d = R(0, 0, 4, 4); s = R(0, 0, 4, 4);
-  CHECK(dd_blit(&col.im, &d, &b1.im, &s, NULL) == DD_PIX_OK && dd_get_raw(&col.im, 3, 3) == 0xFF0000);
+  CHECK(dd_blit(&col.im, &d, &b1.im, &s, NULL) == DD_PIX_OK && dd_get_raw(&col.im, 3, 3) == 0xFFFF0000u);      // (the alpha byte written, as Windows)
   // depth into depth, and the refusal of depth into colour
   Image z16(DD_FMT_D16, 1, 1), z24(DD_FMT_D24S8, 1, 1);
   dd_put_raw(&z16.im, 0, 0, 0xFFFF);

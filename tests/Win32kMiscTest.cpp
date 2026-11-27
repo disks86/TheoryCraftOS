@@ -936,6 +936,13 @@ void test_monitors() {
   CHECK(p.call32(N::NtUserChangeDisplaySettings, 0, 0, 0, 0, 0) == 0 && gdi::screen_width() == 1280);      // (the registry mode is the one just stored)
   put_devmode(p.memory, kD, 0x80000 | 0x100000, 1024, 768, 0);
   CHECK(p.call32(N::NtUserChangeDisplaySettings, 0, kD, 0, 1, 0) == 0 && gdi::screen_width() == 1024);
+  // CDS_UPDATEREGISTRY | CDS_NORESET: stored, not put on; ChangeDisplaySettings(NULL, 0) puts it on
+  put_devmode(p.memory, kD, 0x80000 | 0x100000, 800, 600, 0);
+  CHECK(p.call32(N::NtUserChangeDisplaySettings, 0, kD, 0, 0x10000001u, 0) == 0 && gdi::screen_width() == 1024);
+  CHECK(p.call(N::NtUserEnumDisplaySettings, 0, 0xFFFFFFFEu, kD, 0) == 1 && p.memory.get32(kD + 172) == 800);
+  CHECK(p.call32(N::NtUserChangeDisplaySettings, 0, 0, 0, 0, 0) == 0 && gdi::screen_width() == 800 && gdi::screen_height() == 600);
+  put_devmode(p.memory, kD, 0x80000 | 0x100000, 1024, 768, 0);
+  CHECK(p.call32(N::NtUserChangeDisplaySettings, 0, kD, 0, 1, 0) == 0 && gdi::screen_width() == 1024);
 
   // display devices
   const uint64_t dd = kG;

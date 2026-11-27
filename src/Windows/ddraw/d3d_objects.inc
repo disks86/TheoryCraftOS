@@ -95,8 +95,9 @@ static ULONG mat_release(D3dMaterial *m) {
   const LONG r = InterlockedDecrement(&m->ref);
   if (!r) {
     dd_lock();
-    if (m->handle) handle_free(&g_handles, m->handle, H_MATERIAL);
+    for (UINT i = 0; i < m->handle_count; ++i) handle_free(&g_handles, m->handles[i].handle, H_MATERIAL);
     dd_unlock();
+    mem_free(m->handles);
     mem_free(m);
   }
   return (ULONG)r;
@@ -118,8 +119,25 @@ static HRESULT mat_get(D3dMaterial *m, D3DMATERIAL *data) {
 static HRESULT mat_handle(D3dMaterial *m, const void *device, D3DMATERIALHANDLE *out) {
   if (!out || !device) return DDERR_INVALIDPARAMS;
   dd_lock();
-  if (!m->handle) m->handle = handle_alloc(&g_handles, H_MATERIAL, m, NULL);
-  const DWORD h = m->handle;
+  DWORD h = 0;
+  for (UINT i = 0; i < m->handle_count && !h; ++i)
+    if (m->handles[i].device == device) h = m->handles[i].handle;
+  if (!h && m->handle_count < 0x10000u) {
+    struct D3dMaterialHandle *grown = mem_alloc((SIZE_T)(m->handle_count + 1) * sizeof *grown);
+    if (grown) {
+      for (UINT i = 0; i < m->handle_count; ++i) grown[i] = m->handles[i];
+      h = handle_alloc(&g_handles, H_MATERIAL, m, NULL);
+      if (h) {
+        grown[m->handle_count].device = device;
+        grown[m->handle_count].handle = h;
+        mem_free(m->handles);
+        m->handles = grown;
+        ++m->handle_count;
+      } else {
+        mem_free(grown);
+      }
+    }
+  }
   dd_unlock();
   if (!h) return DDERR_OUTOFMEMORY;
   *out = h;
@@ -249,7 +267,7 @@ static HRESULT STDMETHODCALLTYPE vp_TransformVertices(IDirect3DViewport3 *i, DWO
   if (!vp->device) return D3DERR_VIEWPORTHASNODEVICE;
   if (!data || data->dwSize != sizeof *data) return DDERR_INVALIDPARAMS;
   if (!(flags & (D3DTRANSFORM_CLIPPED | D3DTRANSFORM_UNCLIPPED))) return DDERR_INVALIDPARAMS;
-  if (!data->lpIn || !data->lpOut) return DDERR_INVALIDPARAMS;
+  if (count && (!data->lpIn || !data->lpOut)) return DDERR_INVALIDPARAMS;      /* (no vertices: no pointers needed) */
   dd_lock();
   D3dDevice *dev = vp->device;
   DlTransform t;
@@ -584,7 +602,8 @@ static HRESULT d3_run(D3dDevice *dev, D3dExecuteBuffer *eb, const D3DRECT *pick)
   DlExecutor x;
   HRESULT hr = dl_execute_begin(&x, dl_const_bytes(eb->memory, eb->size), &eb->data, (DlStatus *)&eb->data.dsStatus);
   if (hr != DL_OK) return hr;
-  if (!tl_room(dev, eb->data.dwVertexCount ? eb->data.dwVertexCount : 1)) return DDERR_OUTOFMEMORY;
+  const uint32_t room = dl_execute_vertex_room(eb->size, (const DlExecuteData *)&eb->data);
+  if (!tl_room(dev, room ? room : 1)) return DDERR_OUTOFMEMORY;
   if (pick) { dev->pick_count = 0; }
   else if (FAILED(hr = d3_flush(dev))) return hr;
   const DlConstBytes buffer = dl_const_bytes(eb->memory, eb->size);
@@ -791,10 +810,8 @@ static ULONG vb_release(D3dVertexBuffer *vb) {
 /* Lock: the memory of the vertices (DDLOCK_DISCARDCONTENTS and NOOVERWRITE are Direct3D 7's; the memory stays where it is, so both keep it). */
 static HRESULT vb_lock(D3dVertexBuffer *vb, DWORD flags, void **data, DWORD *size) {
   if (!data) return DDERR_INVALIDPARAMS;
-  if (flags & ~(DWORD)(DDLOCK_WAIT | DDLOCK_READONLY | DDLOCK_WRITEONLY | DDLOCK_NOSYSLOCK | DDLOCK_NOOVERWRITE | DDLOCK_DISCARDCONTENTS | DDLOCK_DONOTWAIT)) {
-    *data = NULL;
-    return DDERR_INVALIDPARAMS;
-  }
+  /* (any flags: Windows takes unknown ones, DDLOCK_EVENT and 0xdeadbeef too - Wine's d3d test; the memory is the program's at once anyway) */
+  (void)flags;
   dd_lock();
   ++vb->lock_count;
   *data = vb->memory;
@@ -843,14 +860,21 @@ static HRESULT vb_process(D3dVertexBuffer *dst, DWORD op, DWORD dst_index, DWORD
   d3_transform(dev, &t);
   /* (Direct3D 7's ProcessVertices lights no normal under a singular world matrix, where its draws use the matrix itself: Wine's test_lighting
    * of ddraw7 holds both of Windows' answers) */
-  if (dev->version >= 7 && ffl_singular(t.world.m)) dl_zero(t.normal_matrix, sizeof t.normal_matrix);
+  if (dev->version >= 7) {
+    if (ffl_singular(t.world.m)) dl_zero(t.normal_matrix, sizeof t.normal_matrix);
+    else ffl_normal_matrix(t.world.m, t.normal_matrix);      /* (a non-affine world: its whole 4 x 4 inverse, as the draws - test_lighting) */
+  }
   DlLighting l;
   d3_lighting(dev, &l);
+  /* (a material power of 0: Direct3D 7's ProcessVertices keeps the last power above 0 a material of the device had - Wine's test_specular_lighting
+   * of ddraw7, cases of power 0; its draws use 0) */
+  if (dev->version >= 7 && !(l.material.power > 0.0f) && dev->pv_power > 0.0f) l.material.power = dev->pv_power;
   DlProcessResult result;
   dl_result_init(&result);
   DWORD stride = dl_fvf_stride(fvf);
   const BOOL light = (op & D3DVOP_LIGHT) != 0;
   const DWORD blend = dev->version >= 7 ? dev->st.rs[D3DRENDERSTATE_VERTEXBLEND] : 0;
+  float *blend_w = NULL;
   if (blend >= D3DVBLEND_1WEIGHT && blend <= D3DVBLEND_3WEIGHTS && (fvf & D3DFVF_POSITION_MASK) != D3DFVF_XYZRHW) {
     /* Vertex blending (D3DRENDERSTATE_VERTEXBLEND): the position and normal are the weighted sum of what the world matrices 0 .. n make of them (the last
      * weight is 1 minus the others), then view and projection. The weights follow the position; a vertex without them gives the numbers after its
@@ -860,8 +884,11 @@ static HRESULT vb_process(D3dVertexBuffer *dst, DWORD op, DWORD dst_index, DWORD
     const DWORD out_fvf = (fvf & ~(DWORD)D3DFVF_POSITION_MASK) | D3DFVF_XYZ;
     DlFvfLayout ol;
     dl_fvf_layout(out_fvf, &ol);
-    BYTE *blended = d3_scratch(dev->dd3, 1, (SIZE_T)count * ol.stride);
+    /* (the blended positions are homogeneous - a world matrix may have a fourth column -: each is put in as x/w, y/w, z/w and its w kept after the
+     * vertices, to scale the clip-space result back by: Windows' rhw, test_process_vertices) */
+    BYTE *blended = d3_scratch(dev->dd3, 1, (SIZE_T)count * ol.stride + (SIZE_T)count * sizeof(float));
     if (!blended) return DDERR_OUTOFMEMORY;
+    blend_w = (float *)(void *)(blended + (SIZE_T)count * ol.stride);
     const DlMatrix *world[4] = {&dev->st.xf[D3DTRANSFORMSTATE_WORLD], &dev->st.xf[D3DTRANSFORMSTATE_WORLD1], &dev->st.xf[D3DTRANSFORMSTATE_WORLD2],
                                 &dev->st.xf[D3DTRANSFORMSTATE_WORLD3]};
     const SIZE_T src_bytes = src_end > src ? (SIZE_T)(src_end - src) : 0;
@@ -876,14 +903,18 @@ static HRESULT vb_process(D3dVertexBuffer *dst, DWORD op, DWORD dst_index, DWORD
       for (DWORD j = 0; j < blend; ++j) last -= w[j];
       w[blend] = last;
       if (lay.normal >= 0) dl_read(in, at + (SIZE_T)lay.normal, n, 12);
-      float bp[3] = {0, 0, 0}, bn[3] = {0, 0, 0};
+      float bp[4] = {0, 0, 0, 0}, bn[3] = {0, 0, 0};
       for (DWORD j = 0; j <= blend; ++j) {
         float q[4];
         dl_transform_point(world[j], p, q);
-        for (int c = 0; c < 3; ++c) {
-          bp[c] += w[j] * q[c];
-          bn[c] += w[j] * (n[0] * world[j]->m[0][c] + n[1] * world[j]->m[1][c] + n[2] * world[j]->m[2][c]);
-        }
+        for (int c = 0; c < 3; ++c) bn[c] += w[j] * (n[0] * world[j]->m[0][c] + n[1] * world[j]->m[1][c] + n[2] * world[j]->m[2][c]);
+        for (int c = 0; c < 4; ++c) bp[c] += w[j] * q[c];
+      }
+      if (bp[3] > 0.0f || bp[3] < 0.0f) {
+        for (int c = 0; c < 3; ++c) bp[c] /= bp[3];
+        blend_w[k] = bp[3];
+      } else {
+        blend_w[k] = 1.0f;      /* (w 0: a point at infinity; taken as it is) */
       }
       BYTE *o = blended + (SIZE_T)k * ol.stride;
       memcpy(o, bp, 12);
@@ -902,7 +933,15 @@ static HRESULT vb_process(D3dVertexBuffer *dst, DWORD op, DWORD dst_index, DWORD
     stride = ol.stride;
     src = blended;
   }
-  if (dl_process_fvf(&t, &l, light, fvf, dl_const_bytes(src, (SIZE_T)count * stride), count, cv, count, &result) != DL_OK) return DDERR_INVALIDPARAMS;
+  /* (a source without a specular colour starts from 0, alpha too - Wine's test_lighting; vertex fog and the lighting of Direct3D 7 write the alpha
+   * over it: test_fog_process_vertices, test_specular_lighting) */
+  const int how = (light ? (dev->version >= 7 ? 1 | DL_LIGHT_NO_NORMALS : 1) : 0) | DL_SPECULAR_ZERO;
+  if (dl_process_fvf(&t, &l, how, fvf, dl_const_bytes(src, (SIZE_T)count * stride), count, cv, count, &result) != DL_OK) return DDERR_INVALIDPARAMS;
+  if (blend_w)
+    for (DWORD k = 0; k < count; ++k) {
+      for (int c = 0; c < 4; ++c) cv[k].position[c] *= blend_w[k];
+      cv[k].clip = dl_clip_code(cv[k].position, cv[k].user, t.user_planes);      /* (a negative w turns the codes round) */
+    }
   /* (Direct3D 3's ProcessVertices gives lit vertices a specular alpha of 0 - the fog factor it did not work out; Wine's test_specular_lighting of
    * ddraw4) */
   if (dev->version < 7 && light && l.enabled)

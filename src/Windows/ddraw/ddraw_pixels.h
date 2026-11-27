@@ -401,6 +401,151 @@ static inline uint32_t dd_bc_colour(const uint8_t *block, uint32_t px, uint32_t 
   return out;
 }
 
+/* ---- DXT encoding (what a blit into a DXT surface writes) ------------------------------------------------------------------------------------------ */
+
+static inline uint32_t dd_888_to_565(uint32_t c) {
+  const uint32_t r = ((c >> 16) & 0xFF) * 31u + 127u, g = ((c >> 8) & 0xFF) * 63u + 127u, b = (c & 0xFF) * 31u + 127u;
+  return ((r / 255u) << 11) | ((g / 255u) << 5) | (b / 255u);
+}
+static inline uint32_t dd_rgb_distance(uint32_t a, uint32_t b) {
+  const int32_t dr = (int32_t)((a >> 16) & 0xFF) - (int32_t)((b >> 16) & 0xFF);
+  const int32_t dg = (int32_t)((a >> 8) & 0xFF) - (int32_t)((b >> 8) & 0xFF);
+  const int32_t db = (int32_t)(a & 0xFF) - (int32_t)(b & 0xFF);
+  return (uint32_t)(dr * dr + dg * dg + db * db);
+}
+/* The colours of a colour half with endpoints c0, c1 (the decoder's arithmetic, dd_bc_colour). */
+static inline void dd_bc_palette(uint32_t c0, uint32_t c1, int three, uint32_t pal[4]) {
+  const uint32_t a = dd_565_to_888(c0), b = dd_565_to_888(c1);
+  pal[0] = a;
+  pal[1] = b;
+  pal[2] = pal[3] = 0;
+  for (int shift = 0; shift < 24; shift += 8) {
+    const uint32_t ca = (a >> shift) & 0xFF, cb = (b >> shift) & 0xFF;
+    if (three) { pal[2] |= ((ca + cb) / 2u) << shift; }
+    else { pal[2] |= ((2u * ca + cb + 1u) / 3u) << shift; pal[3] |= ((ca + 2u * cb + 1u) / 3u) << shift; }
+  }
+}
+/* Codes for the pixels of a block with these endpoints; the summed error. `transparent` pixels (DXT1 three-colour blocks) take code 3. */
+static inline uint64_t dd_bc_fit(const uint32_t px[16], const uint8_t transparent[16], uint32_t c0, uint32_t c1, int three, uint32_t *bits) {
+  uint32_t pal[4];
+  dd_bc_palette(c0, c1, three, pal);
+  uint64_t err = 0;
+  *bits = 0;
+  for (uint32_t i = 0; i < 16; ++i) {
+    uint32_t code = 0;
+    if (transparent[i]) code = 3;
+    else {
+      uint32_t best = ~0u;
+      for (uint32_t k = 0; k < (three ? 3u : 4u); ++k) {
+        const uint32_t d = dd_rgb_distance(px[i], pal[k]);
+        if (d < best) { best = d; code = k; }
+      }
+      err += best;
+    }
+    *bits |= code << (2u * i);
+  }
+  return err;
+}
+/* Encodes the colour half (8 bytes) of a block of 16 A8R8G8B8 pixels (row by row). With `dxt1`, pixels of alpha below 128 become DXT1's transparent
+ * black (a three-colour block); otherwise the block has four colours (c0 > c1) when its endpoints differ. The endpoints are the pair of the block's
+ * colours farthest apart or the corners of their bounding box, whichever fits better; a block of two colours (or one) is exact up to 5-6-5. */
+static inline void dd_bc_encode_colour(const uint32_t px[16], int dxt1, uint8_t out[8]) {
+  uint8_t transparent[16];
+  int any_transparent = 0, any_opaque = 0;
+  uint32_t lo = 0x00FFFFFFu, hi = 0;
+  uint32_t ea = 0, eb = 0, farthest = 0;
+  for (uint32_t i = 0; i < 16; ++i) {
+    transparent[i] = (uint8_t)(dxt1 && (px[i] >> 24) < 128u);
+    if (transparent[i]) { any_transparent = 1; continue; }
+    if (!any_opaque) { ea = eb = px[i]; }
+    any_opaque = 1;
+    for (int shift = 0; shift < 24; shift += 8) {
+      const uint32_t c = (px[i] >> shift) & 0xFF;
+      if (c < ((lo >> shift) & 0xFF)) lo = (lo & ~(0xFFu << shift)) | (c << shift);
+      if (c > ((hi >> shift) & 0xFF)) hi = (hi & ~(0xFFu << shift)) | (c << shift);
+    }
+    for (uint32_t j = 0; j < i; ++j) {
+      if (transparent[j]) continue;
+      const uint32_t d = dd_rgb_distance(px[i], px[j]);
+      if (d > farthest) { farthest = d; ea = px[i]; eb = px[j]; }
+    }
+  }
+  uint32_t c0 = 0, c1 = 0, bits = 0xFFFFFFFFu;
+  if (any_opaque) {
+    const uint32_t cand[2][2] = {{dd_888_to_565(ea), dd_888_to_565(eb)}, {dd_888_to_565(hi), dd_888_to_565(lo)}};
+    uint64_t best = ~(uint64_t)0;
+    for (int k = 0; k < 2; ++k) {
+      uint32_t a = cand[k][0], b = cand[k][1];
+      const int three = any_transparent;
+      /* (four colours: c0 > c1; three colours and transparency: c0 <= c1) */
+      if (three ? a > b : a < b) { const uint32_t t = a; a = b; b = t; }
+      uint32_t kb;
+      const uint64_t e = dd_bc_fit(px, transparent, a, b, three, &kb);
+      if (e < best) { best = e; c0 = a; c1 = b; bits = kb; }
+    }
+    /* (equal endpoints without transparency: every pixel code 0, c0 in either mode - a DXT1 block of c0 == c1 is a three-colour one) */
+    if (!any_transparent && c0 == c1) bits = 0;
+  }
+  out[0] = (uint8_t)c0; out[1] = (uint8_t)(c0 >> 8); out[2] = (uint8_t)c1; out[3] = (uint8_t)(c1 >> 8);
+  out[4] = (uint8_t)bits; out[5] = (uint8_t)(bits >> 8); out[6] = (uint8_t)(bits >> 16); out[7] = (uint8_t)(bits >> 24);
+}
+/* The alphas of a DXT4/5 alpha half (the decoder's arithmetic, dd_read_argb). */
+static inline void dd_bc_alpha_palette(uint32_t a0, uint32_t a1, uint32_t pal[8]) {
+  pal[0] = a0;
+  pal[1] = a1;
+  for (uint32_t code = 2; code < 8; ++code) {
+    if (a0 > a1) pal[code] = ((8u - code) * a0 + (code - 1u) * a1) / 7u;
+    else pal[code] = code == 6 ? 0 : code == 7 ? 255 : ((6u - code) * a0 + (code - 1u) * a1) / 5u;
+  }
+}
+/* Encodes DXT4/5's alpha half (8 bytes): eight alphas between the block's extremes, or six and 0 and 255 when that fits better. */
+static inline void dd_bc_encode_alpha(const uint32_t px[16], uint8_t out[8]) {
+  uint32_t lo = 255, hi = 0, lo_inner = 255, hi_inner = 0;
+  for (uint32_t i = 0; i < 16; ++i) {
+    const uint32_t a = px[i] >> 24;
+    if (a < lo) lo = a;
+    if (a > hi) hi = a;
+    if (a != 0 && a != 255) { if (a < lo_inner) lo_inner = a; if (a > hi_inner) hi_inner = a; }
+  }
+  if (lo_inner > hi_inner) lo_inner = hi_inner = lo;
+  const uint32_t cand[2][2] = {{hi, lo}, {lo_inner, hi_inner}};      /* (a0 > a1: eight alphas; a0 <= a1: six, 0 and 255) */
+  uint64_t best = ~(uint64_t)0, bbits = 0;
+  uint32_t ba0 = hi, ba1 = lo;
+  for (int k = 0; k < 2; ++k) {
+    const uint32_t a0 = cand[k][0], a1 = cand[k][1];
+    uint32_t pal[8];
+    dd_bc_alpha_palette(a0, a1, pal);
+    uint64_t err = 0, bits = 0;
+    for (uint32_t i = 0; i < 16; ++i) {
+      const uint32_t a = px[i] >> 24;
+      uint32_t code = 0, bd = ~0u;
+      for (uint32_t c = 0; c < 8; ++c) {
+        const uint32_t d = a > pal[c] ? a - pal[c] : pal[c] - a;
+        if (d < bd) { bd = d; code = c; }
+      }
+      err += (uint64_t)bd * bd;
+      bits |= (uint64_t)code << (3u * i);
+    }
+    if (err < best) { best = err; ba0 = a0; ba1 = a1; bbits = bits; }
+  }
+  out[0] = (uint8_t)ba0;
+  out[1] = (uint8_t)ba1;
+  for (int i = 0; i < 6; ++i) out[2 + i] = (uint8_t)(bbits >> (8 * i));
+}
+/* Encodes 16 A8R8G8B8 pixels (row by row) as one block of a DXT format (DXT2 and DXT4 store the colours as given, as the decoder reads them). */
+static inline void dd_bc_encode_block(uint32_t fmt, const uint32_t px[16], uint8_t *out) {
+  if (fmt == DD_FMT_DXT1) { dd_bc_encode_colour(px, 1, out); return; }
+  if (fmt == DD_FMT_DXT2 || fmt == DD_FMT_DXT3) {
+    for (uint32_t i = 0; i < 16; i += 2) {
+      const uint32_t a = ((px[i] >> 24) * 15u + 127u) / 255u, b = ((px[i + 1] >> 24) * 15u + 127u) / 255u;
+      out[i / 2] = (uint8_t)(a | (b << 4));
+    }
+  } else {
+    dd_bc_encode_alpha(px, out);
+  }
+  dd_bc_encode_colour(px, 0, out + 8);
+}
+
 /* Writes a colour to pixel (x, y) of a palette, RGB, alpha, luminance or packed YUV format (a YUV pixel takes the luminance of the colour and its pair
  * the chroma). */
 static inline void dd_write_argb(DdImage *im, uint32_t x, uint32_t y, uint32_t argb) {
@@ -486,6 +631,22 @@ typedef struct DdBlit {
   uint32_t dst_key_low, dst_key_high;
 } DdBlit;
 
+/* The format of the same layout with alpha in the bits an X format leaves unused (the format itself for the others). */
+static inline uint32_t dd_alpha_twin(uint32_t fmt) {
+  switch (fmt) {
+    case DD_FMT_X1R5G5B5: return DD_FMT_A1R5G5B5;
+    case DD_FMT_X4R4G4B4: return DD_FMT_A4R4G4B4;
+    case DD_FMT_X8R8G8B8: return DD_FMT_A8R8G8B8;
+    case DD_FMT_X8B8G8R8: return DD_FMT_A8B8G8R8;
+    default: return fmt;
+  }
+}
+/* 16-bit formats of one layout with and without alpha (a blit between them copies the raw values). */
+static inline int dd_layout_twins(uint32_t a, uint32_t b) {
+  return (a == DD_FMT_X1R5G5B5 && b == DD_FMT_A1R5G5B5) || (a == DD_FMT_A1R5G5B5 && b == DD_FMT_X1R5G5B5) ||
+         (a == DD_FMT_X4R4G4B4 && b == DD_FMT_A4R4G4B4) || (a == DD_FMT_A4R4G4B4 && b == DD_FMT_X4R4G4B4);
+}
+
 /* Do two rectangles of images share bytes? (The same memory overlapping.) */
 static inline int dd_blit_overlaps(const DdImage *a, const DdRect *ra, const DdImage *b, const DdRect *rb) {
   /* (the bytes of each image's rows the rectangles touch, every plane counted: a block image's rows are rows of blocks) */
@@ -523,7 +684,8 @@ static inline void dd_blit_source(const DdBlit *b, uint32_t u, uint32_t v, uint3
 
 /* Copies `sr` of `src` to `dr` of `dst`, stretching or shrinking to fit, with the blit's effects and colour keys. Between images of one format the raw
  * values are copied; between colour formats each pixel goes through A8R8G8B8 (a palette destination takes the nearest entry); between depth formats the
- * depth is scaled. Block formats copy only to the same format, whole blocks, without stretching or effects; planar formats only as a source of colour.
+ * depth is scaled. Block formats copy whole blocks to the same format; any other blit into one re-encodes the blocks it touches. Planar formats only as a
+ * source of colour (or whole copies of one format).
  * Overlapping rectangles of the same memory are handled for plain copies of one format and size (the direction is chosen); other blits of
  * overlapping memory answer DD_PIX_OVERLAP, and the caller copies the source away first. */
 static inline int dd_blit(DdImage *dst, const DdRect *dr, const DdImage *src, const DdRect *sr, const DdBlit *b) {
@@ -533,19 +695,43 @@ static inline int dd_blit(DdImage *dst, const DdRect *dr, const DdImage *src, co
   const uint32_t flags = b ? b->flags : 0;
   const uint32_t dw = (uint32_t)(dr->right - dr->left), dh = (uint32_t)(dr->bottom - dr->top);
   const uint32_t sw = (uint32_t)(sr->right - sr->left), sh = (uint32_t)(sr->bottom - sr->top);
-  const int same = dst->fmt == src->fmt;
+  /* (16-bit formats with and without alpha of one layout copy raw: Windows' blitter copies X1R5G5B5 into A1R5G5B5 as it is, test_surface_format_conversion_alpha) */
+  const int same = dst->fmt == src->fmt || dd_layout_twins(dst->fmt, src->fmt);
   const int stretch = dw != sw || dh != sh;
   const int effects = (flags & (DD_BLIT_MIRROR_LR | DD_BLIT_MIRROR_UD | DD_BLIT_ROTATE90 | DD_BLIT_ROTATE180 | DD_BLIT_ROTATE270)) != 0;
   const int turned = (flags & (DD_BLIT_ROTATE90 | DD_BLIT_ROTATE270)) != 0;
 
-  /* block formats: whole blocks of one format */
+  /* block formats: whole blocks of one format are copied; anything else into a block format decodes the blocks it touches, writes the pixels and
+   * encodes them again (Windows' blitter takes any rectangle, stretching and converting: Wine's test_compressed_surface_stretch) */
   if (df->kind == DD_KIND_BLOCKS || sf->kind == DD_KIND_BLOCKS) {
     if (df->kind == DD_KIND_BLOCKS) {
-      if (!same || stretch || effects || (flags & (DD_BLIT_SRC_KEY | DD_BLIT_DST_KEY))) return DD_PIX_UNSUPPORTED;
-      if ((dr->left & 3) || (dr->top & 3) || (sr->left & 3) || (sr->top & 3)) return DD_PIX_UNSUPPORTED;
-      if (((dr->right & 3) && (uint32_t)dr->right != dst->width) || ((dr->bottom & 3) && (uint32_t)dr->bottom != dst->height)) return DD_PIX_UNSUPPORTED;
-      if (((sr->right & 3) && (uint32_t)sr->right != src->width) || ((sr->bottom & 3) && (uint32_t)sr->bottom != src->height)) return DD_PIX_UNSUPPORTED;
+      const int whole = same && !stretch && !effects && !(flags & (DD_BLIT_SRC_KEY | DD_BLIT_DST_KEY)) &&
+                        !((dr->left & 3) || (dr->top & 3) || (sr->left & 3) || (sr->top & 3)) &&
+                        !(((dr->right & 3) && (uint32_t)dr->right != dst->width) || ((dr->bottom & 3) && (uint32_t)dr->bottom != dst->height)) &&
+                        !(((sr->right & 3) && (uint32_t)sr->right != src->width) || ((sr->bottom & 3) && (uint32_t)sr->bottom != src->height));
       if (dd_blit_overlaps(dst, dr, src, sr)) return DD_PIX_OVERLAP;
+      if (!whole) {
+        if (!dd_format_has_colour(src->fmt)) return DD_PIX_UNSUPPORTED;
+        const uint32_t skeymask = dd_colour_mask(src->fmt);
+        const int src_raw_key = sf->bytes || sf->kind == DD_KIND_PALETTE;
+        for (uint32_t by = (uint32_t)dr->top / 4u; by * 4u < (uint32_t)dr->bottom; ++by)
+          for (uint32_t bx = (uint32_t)dr->left / 4u; bx * 4u < (uint32_t)dr->right; ++bx) {
+            uint32_t px[16];
+            for (uint32_t i = 0; i < 16; ++i) {
+              const uint32_t x = bx * 4u + (i & 3u), y = by * 4u + i / 4u;
+              /* (a block's pixels past the image's edge: whatever the block has there) */
+              px[i] = dd_read_argb(dst, x < dst->width ? x : dst->width - 1u, y < dst->height ? y : dst->height - 1u);
+              if (x < (uint32_t)dr->left || x >= (uint32_t)dr->right || y < (uint32_t)dr->top || y >= (uint32_t)dr->bottom) continue;
+              uint32_t su, sv;
+              dd_blit_source(b, x - (uint32_t)dr->left, y - (uint32_t)dr->top, dw, dh, sw, sh, &su, &sv);
+              const uint32_t sx = (uint32_t)sr->left + su, sy = (uint32_t)sr->top + sv;
+              if ((flags & DD_BLIT_SRC_KEY) && src_raw_key && dd_key_in(dd_get_raw(src, sx, sy), skeymask, b->src_key_low, b->src_key_high)) continue;
+              px[i] = dd_read_argb(src, sx, sy);
+            }
+            dd_bc_encode_block(dst->fmt, px, dst->data + (size_t)by * dst->pitch + (size_t)bx * df->block_bytes);
+          }
+        return DD_PIX_OK;
+      }
       const uint32_t bw = (dw + 3u) / 4u, bh = (dh + 3u) / 4u;
       for (uint32_t y = 0; y < bh; ++y) {
         uint8_t *d = dst->data + (size_t)((uint32_t)dr->top / 4u + y) * dst->pitch + (size_t)((uint32_t)dr->left / 4u) * df->block_bytes;
@@ -635,6 +821,10 @@ static inline int dd_blit(DdImage *dst, const DdRect *dr, const DdImage *src, co
   if (turned && df->kind == DD_KIND_YUV_PACKED) return DD_PIX_UNSUPPORTED;
   const uint32_t skeymask = dd_colour_mask(src->fmt), dkeymask = dd_colour_mask(dst->fmt);
   const int src_raw_key = sf->bytes || sf->kind == DD_KIND_PALETTE;
+  /* (a decoded DXT block keeps its alpha in the unused bits of an X8R8G8B8-like destination: Windows' decoder writes A8R8G8B8, Wine's
+   * test_surface_format_conversion_alpha records 0xff there) */
+  DdImage out = *dst;
+  if (sf->kind == DD_KIND_BLOCKS) out.fmt = dd_alpha_twin(dst->fmt);
   for (uint32_t y = 0; y < dh; ++y)
     for (uint32_t x = 0; x < dw; ++x) {
       uint32_t su, sv;
@@ -643,7 +833,10 @@ static inline int dd_blit(DdImage *dst, const DdRect *dr, const DdImage *src, co
       if ((flags & DD_BLIT_SRC_KEY) && src_raw_key && dd_key_in(dd_get_raw(src, sx, sy), skeymask, b->src_key_low, b->src_key_high)) continue;
       const uint32_t px = (uint32_t)dr->left + x, py = (uint32_t)dr->top + y;
       if ((flags & DD_BLIT_DST_KEY) && (df->bytes || df->kind == DD_KIND_PALETTE) && !dd_key_in(dd_get_raw(dst, px, py), dkeymask, b->dst_key_low, b->dst_key_high)) continue;
-      dd_write_argb(dst, px, py, dd_read_argb(src, sx, sy));
+      /* (a P8 source into a colour destination: Windows' blitter copies the index into each channel, as if it were L8 - it does not look the
+       * palette up; Wine's test_p8_blit records 0x10 -> 0x101010 on every driver but WARP) */
+      const uint32_t c = src->fmt == DD_FMT_P8 ? 0xFF000000u | (dd_get_raw(src, sx, sy) & 0xFFu) * 0x010101u : dd_read_argb(src, sx, sy);
+      dd_write_argb(&out, px, py, c);
     }
   return DD_PIX_OK;
 }

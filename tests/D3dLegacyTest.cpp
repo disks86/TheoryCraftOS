@@ -360,9 +360,10 @@ static void test_execute_refusals() {
   CHECK(dl_execute_data_check(&d, 64) == DL_DDERR_INVALIDPARAMS);
   d = execute_data(0, 0, 0, (uint32_t)b.size());
   CHECK(dl_execute_begin(&x, dl_const_bytes(b.bytes.data(), b.size()), &d, nullptr) == DL_DDERR_INVALIDPARAMS);
-  // Indices beyond the vertices: the record is in range DL_RANGE, the stream goes on.
+  // Indices beyond the vertices: the record is in range DL_RANGE, the stream goes on. (The vertices are the buffer's last 4 * 32 bytes: what an
+  // instruction may refer to is the buffer's room after dwVertexOffset, not dwVertexCount, as Windows.)
   {
-    std::vector<uint8_t> bytes(4 * 32, 0);
+    std::vector<uint8_t> bytes;
     Buffer i;
     i.op(DL_OP_TRIANGLE, 8, 2); i.u16(0); i.u16(1); i.u16(4); i.u16(0); i.u16(0); i.u16(1); i.u16(3); i.u16(0);
     i.op(DL_OP_LINE, 4, 1); i.u16(9); i.u16(0);
@@ -373,7 +374,8 @@ static void test_execute_refusals() {
     i.u32(0); i.u16(0); i.u16(0); i.u32(0xFFFFFFFFu); i.u32(0);
     i.op(DL_OP_SPAN, 4, 1); i.u16(5); i.u16(0);
     bytes.insert(bytes.end(), i.bytes.begin(), i.bytes.end());
-    DlExecuteData dd = execute_data(0, 4, 128, (uint32_t)i.size());
+    bytes.resize(bytes.size() + 4 * 32, 0);
+    DlExecuteData dd = execute_data((uint32_t)i.size(), 0, 0, (uint32_t)i.size());      // (a dwVertexCount of 0 does not gate them)
     const Decoded r = run(bytes, dd, &status);
     CHECK(r.last == DL_NEXT_END && r.commands.size() == 5);
     const int expected[] = {DL_RANGE, DL_OK, DL_RANGE, DL_RANGE, DL_OK, DL_RANGE, DL_RANGE, DL_RANGE, DL_RANGE};
@@ -461,8 +463,10 @@ static void test_execute_hostile() {
     DlStatus status = d.dsStatus;
     DlExecutor x;
     if (dl_execute_begin(&x, dl_const_bytes(bytes.data(), bytes.size()), &d, &status) != DL_OK) return;
-    std::vector<uint8_t> dst(4 * 32, 0);
-    std::vector<DlClipVertex> clip(4);
+    // (the device's processed vertices: as many as the buffer has room for after dwVertexOffset - dwVertexCount does not gate them, as Windows)
+    const uint32_t room = dl_execute_vertex_room(bytes.size(), &d);
+    std::vector<uint8_t> dst((size_t)(room ? room : 1) * 32, 0);
+    std::vector<DlClipVertex> clip(room ? room : 1);
     DlCommand c;
     int steps = 0;
     while (dl_execute_next(&x, &c) == DL_NEXT_COMMAND && ++steps < 70000) {

@@ -27,7 +27,7 @@
  * todo): the software devices' hardware description is empty but for the sizes of its parts; their software description has these flags and
  * device caps; the HAL's software description has the flags of its colour model, caps, transform, lighting and clipping only, the caps of
  * transformed vertices in floats, no lights, no primitive caps, no depths and no texture or stipple sizes. */
-static void enum_desc_windows(int kind, DlDeviceDesc *hal, DlDeviceDesc *hel) {
+static void enum_desc_windows(int kind, UINT version, DlDeviceDesc *hal, DlDeviceDesc *hel) {
   if (kind != DL_DEVICE_HAL) {
     const uint32_t size = hal->dwSize;
     zero(hal, sizeof *hal);
@@ -40,6 +40,11 @@ static void enum_desc_windows(int kind, DlDeviceDesc *hal, DlDeviceDesc *hel) {
                    D3DDD_DEVICEZBUFFERBITDEPTH | D3DDD_MAXBUFFERSIZE | D3DDD_MAXVERTEXCOUNT;
     hel->dwDevCaps = D3DDEVCAPS_FLOATTLVERTEX | D3DDEVCAPS_SORTINCREASINGZ | D3DDEVCAPS_SORTEXACT | D3DDEVCAPS_EXECUTESYSTEMMEMORY | D3DDEVCAPS_TLVERTEXSYSTEMMEMORY |
                      D3DDEVCAPS_TEXTURESYSTEMMEMORY | D3DDEVCAPS_DRAWPRIMTLVERTEX;
+    /* (Direct3D 3's software devices also report their line caps and no longer the sorting caps: Wine's ddraw4 test_enum_devices) */
+    if (version >= 3) {
+      hel->dwFlags |= D3DDD_LINECAPS;
+      hel->dwDevCaps &= ~(DWORD)(D3DDEVCAPS_SORTINCREASINGZ | D3DDEVCAPS_SORTEXACT);
+    }
     return;
   }
   hel->dwFlags = D3DDD_COLORMODEL | D3DDD_DEVCAPS | D3DDD_TRANSFORMCAPS | D3DDD_LIGHTINGCAPS | D3DDD_BCLIPPING;
@@ -54,6 +59,30 @@ static void enum_desc_windows(int kind, DlDeviceDesc *hal, DlDeviceDesc *hel) {
     hel->dwMinTextureWidth = hel->dwMinTextureHeight = hel->dwMaxTextureWidth = hel->dwMaxTextureHeight = 0;
     hel->dwMinStippleWidth = hel->dwMinStippleHeight = hel->dwMaxStippleWidth = hel->dwMaxStippleHeight = 0;
   }
+  if (hel->dwSize >= DL_DEVICEDESC_V3_SIZE) {
+    /* (Direct3D 3's part of the description: nothing in the HAL's software description) */
+    hel->dwMaxTextureRepeat = hel->dwMaxTextureAspectRatio = hel->dwMaxAnisotropy = 0;
+    hel->dvGuardBandLeft = hel->dvGuardBandTop = hel->dvGuardBandRight = hel->dvGuardBandBottom = 0.0f;
+    hel->dwStencilCaps = hel->dwFVFCaps = hel->dwTextureOpCaps = 0;
+    hel->wMaxTextureBlendStages = hel->wMaxSimultaneousTextures = 0;
+  }
+}
+
+/* The name and description EnumDevices hands out for a device: writable strings of the process, the same pointers every time, which keep what a
+ * program wrote into them (programs have written into them - Tomb Raider 3; Wine's d3d test D3D7EnumLifetimeTest records Windows keeping them). */
+static void d3_device_strings(int kind, char **name, char **description) {
+  static char names[DL_DEVICE_NULL + 1][64], descriptions[DL_DEVICE_NULL + 1][128];
+  static BOOL made[DL_DEVICE_NULL + 1];
+  const UINT k = kind >= 0 && kind <= DL_DEVICE_NULL ? (UINT)kind : 0;
+  dd_lock();
+  if (!made[k]) {
+    lstrcpynA(names[k], dl_device_name(kind), sizeof names[k]);
+    lstrcpynA(descriptions[k], dl_device_description(kind), sizeof descriptions[k]);
+    made[k] = TRUE;
+  }
+  dd_unlock();
+  *name = names[k];
+  *description = descriptions[k];
 }
 
 /* EnumDevices of Direct3D 1, 2 and 3: each device's GUID, description, name and its hardware and software descriptions (in the version's size). */
@@ -68,11 +97,9 @@ static HRESULT d3_enum_devices(DDraw *dd, UINT version, LPD3DENUMDEVICESCALLBACK
     if (kind == DL_DEVICE_NONE) break;
     DlDeviceDesc hal, hel;
     dl_device_descs(caps, kind, version, &hal, &hel);
-    enum_desc_windows(kind, &hal, &hel);
-    /* (writable copies: programs have written into the strings - Tomb Raider 3, Wine's note) */
-    char name[64], description[128];
-    lstrcpynA(name, dl_device_name(kind), sizeof name);
-    lstrcpynA(description, dl_device_description(kind), sizeof description);
+    enum_desc_windows(kind, version, &hal, &hel);
+    char *name, *description;
+    d3_device_strings(kind, &name, &description);
     GUID guid;
     memcpy(&guid, dl_device_guid(kind), sizeof guid);
     if (cb(&guid, description, name, (D3DDEVICEDESC *)&hal, (D3DDEVICEDESC *)&hel, ctx) != D3DENUMRET_OK) break;
@@ -126,12 +153,13 @@ static HRESULT d3_create_viewport(DDraw *dd, void **out, IUnknown *outer) {
   *out = vp;
   return D3D_OK;
 }
-/* EnumZBufferFormats: the depth formats Wine lists (16 before 24 and 32 bits: BattleZone II), and the 24-bit X8D24 once more with a bit depth of 24. */
+/* EnumZBufferFormats: 16 before 24 and 32 bits (BattleZone II), and the 24-bit X8D24 once more with a bit depth of 24 - formats Windows lists (Wine's
+ * d3d test accepts no others: no D15S1, no D24X4S4, which CreateSurface still takes). */
 static HRESULT d3_enum_zbuffer_formats(DDraw *dd, REFCLSID device, LPD3DENUMPIXELFORMATSCALLBACK cb, void *ctx) {
   (void)dd;
   if (!cb || !device) return DDERR_INVALIDPARAMS;
   if (dl_device_kind((const DlGuid *)device) == DL_DEVICE_NONE) return DDERR_INVALIDPARAMS;
-  static const UINT formats[] = {DD_FMT_D15S1, DD_FMT_D16, DD_FMT_D24X8, DD_FMT_D24X4S4, DD_FMT_D24S8, DD_FMT_D32};
+  static const UINT formats[] = {DD_FMT_D16, DD_FMT_D24X8, DD_FMT_D24S8, DD_FMT_D32};
   for (UINT k = 0; k < sizeof formats / sizeof formats[0]; ++k) {
     DDPIXELFORMAT pf;
     ddpf_from_format(formats[k], &pf);
@@ -198,9 +226,8 @@ static HRESULT STDMETHODCALLTYPE d3d7_EnumDevices(IDirect3D7 *i, LPD3DENUMDEVICE
     if (kind == DL_DEVICE_NONE) break;
     D3DDEVICEDESC7 desc;
     dl_device_desc7(caps, kind, (DlDeviceDesc7 *)&desc);
-    char name[64], description[128];
-    lstrcpynA(name, dl_device_name(kind), sizeof name);
-    lstrcpynA(description, dl_device_description(kind), sizeof description);
+    char *name, *description;
+    d3_device_strings(kind, &name, &description);
     if (cb(description, name, &desc, ctx) != D3DENUMRET_OK) break;
   }
   return D3D_OK;

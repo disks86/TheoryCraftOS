@@ -174,6 +174,7 @@ static void d3_set_material(D3dDevice *dev, const D3DMATERIAL7 *mat) {
   D3dState *s = set_target(dev, &m);
   s->material = *mat;
   m->material = TRUE;
+  if (s == &dev->st && mat->power > 0.0f) dev->pv_power = mat->power;
 }
 #define D3D_MAX_LIGHT_INDEX 0x10000u
 /* SetLight / LightEnable (the light gets Direct3D's default light first if it had none: LightEnable of a light never set). */
@@ -307,8 +308,8 @@ static Surface *attached_depth(Surface *target) {
   if (!target) return NULL;
   for (UINT i = 0; i < MAX_COMPLEX && target->complex[i]; ++i)
     if (target->complex[i]->desc.ddsCaps.dwCaps & DDSCAPS_ZBUFFER) return target->complex[i];
-  for (Surface *c = target->next_attached; c; c = c->next_attached)
-    if (c->desc.ddsCaps.dwCaps & DDSCAPS_ZBUFFER) return c;
+  for (AttachLink *l = target->attached; l; l = l->next)
+    if (l->child->desc.ddsCaps.dwCaps & DDSCAPS_ZBUFFER) return l->child;
   return NULL;
 }
 static UINT depth_bits(const Surface *z) {
@@ -422,6 +423,7 @@ static void bind_textures(D3dDevice *dev) {
   const int before = stage0_kind(dev);
   for (UINT st = 0; st < D3D_STAGES; ++st) {
     Surface *s = dev->st.texture[st];
+    if (s && !(s->desc.ddsCaps.dwCaps & DDSCAPS_TEXTURE) && (dev->kind == DL_DEVICE_HAL || dev->kind == DL_DEVICE_TNLHAL)) s = NULL;      /* (dv_set_texture) */
     D3dRes *r = s ? texture_res(d, texture_root(s), keying) : NULL;
     IDirect3DBaseTexture9 *bt = r ? (r->cube ? (IDirect3DBaseTexture9 *)r->cube : (IDirect3DBaseTexture9 *)r->texture) : NULL;
     if (r && r->keyed) kill |= 1u << st;
@@ -533,6 +535,13 @@ static HRESULT d3_flush(D3dDevice *dev) {
     if (vp.Width > tw - vp.X) vp.Width = tw - vp.X;
     if (vp.Height > th - vp.Y) vp.Height = th - vp.Y;
     if (dev->version < 7) { vp.MinZ = 0.0f; vp.MaxZ = 1.0f; }
+    /* (Direct3D 7 takes a depth range beyond [0, 1] - Wine's visual depth_clamp_test sets 0 .. 7.5 - and clamps the depth that comes out to
+     * [0, 1]. Direct3D 9's renderer refuses such a viewport and with it everything drawn after, so the range is cut to [0, 1]: depths beyond it
+     * come out clamped as Windows', depths inside it differ from Windows' by the scale - an open gap, docs/DirectDraw.md) */
+    if (!(vp.MinZ >= 0.0f)) vp.MinZ = 0.0f;
+    if (vp.MinZ > 1.0f) vp.MinZ = 1.0f;
+    if (!(vp.MaxZ >= 0.0f)) vp.MaxZ = 0.0f;
+    if (vp.MaxZ > 1.0f) vp.MaxZ = 1.0f;
     D3D_CALL(d9, SetViewport, &vp);
     dev->dirty.viewport = FALSE;
   }

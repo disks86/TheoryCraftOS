@@ -357,6 +357,14 @@ DL_API DlResult dl_execute_data_check(const DlExecuteData *data, uint32_t buffer
   return DL_OK;
 }
 
+/* The vertices an execute buffer has room for after dwVertexOffset: what PROCESSVERTICES and the primitives may refer to. dwVertexCount does not gate
+ * them - the instruction's own count does (Windows: Wine's test_execute_buffer_updates draws with a dwVertexCount of 0 and 1). */
+DL_API uint32_t dl_execute_vertex_room(uint64_t buffer_size, const DlExecuteData *data) {
+  if (data->dwVertexOffset >= buffer_size) return 0;
+  const uint64_t n = (buffer_size - data->dwVertexOffset) / DL_VERTEX_SIZE;
+  return n > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)n;
+}
+
 /* One instruction for the device to carry out: `count` records of `size` bytes from `at` in the buffer. */
 typedef struct DlCommand { uint32_t opcode, count, size, at, header; } DlCommand;
 
@@ -366,7 +374,7 @@ typedef struct DlExecutor {
   DlConstBytes buffer;
   uint32_t end;                  /* one past the last instruction byte */
   uint32_t pos;
-  uint32_t vertex_count;         /* dwVertexCount: what primitives and PROCESSVERTICES may refer to */
+  uint32_t vertex_count;         /* dl_execute_vertex_room: what primitives and PROCESSVERTICES may refer to */
   DlStatus *status;
   int done;
   DlResult error;                /* why it stopped, if it was not the end */
@@ -384,7 +392,7 @@ DL_API DlResult dl_execute_begin(DlExecutor *x, DlConstBytes buffer, const DlExe
   x->buffer = buffer;
   x->pos = data->dwInstructionOffset;
   x->end = data->dwInstructionOffset + data->dwInstructionLength;
-  x->vertex_count = data->dwVertexCount;
+  x->vertex_count = dl_execute_vertex_room(buffer.size, data);
   x->status = status;
   x->done = 0;
   return DL_OK;
@@ -555,7 +563,7 @@ DL_API int dl_command_state(const DlExecutor *x, const DlCommand *cmd, uint32_t 
   out->arg = dl_u32(x->buffer, r + 4);
   return DL_OK;
 }
-/* D3DOP_PROCESSVERTICES: dwCount vertices from wStart into the processed vertices from wDest, both within dwVertexCount. */
+/* D3DOP_PROCESSVERTICES: dwCount vertices from wStart into the processed vertices from wDest, both within the buffer's vertices (dl_execute_vertex_room). */
 DL_API int dl_command_process_vertices(const DlExecutor *x, const DlCommand *cmd, uint32_t i, DlProcessVertices *out) {
   uint32_t r;
   if (!dl_record(x, cmd, DL_OP_PROCESSVERTICES, i, &r)) return DL_BAD;
@@ -577,7 +585,7 @@ DL_API int dl_command_texture_load(const DlExecutor *x, const DlCommand *cmd, ui
 }
 /* A vertex of the execute buffer's vertex data (32 bytes: a D3DVERTEX, D3DLVERTEX or D3DTLVERTEX as the instruction says). */
 DL_API int dl_execute_vertex(DlConstBytes buffer, const DlExecuteData *data, uint32_t index, void *out32) {
-  if (index >= data->dwVertexCount) return 0;
+  if (index >= dl_execute_vertex_room(buffer.size, data)) return 0;
   return dl_read(buffer, (size_t)data->dwVertexOffset + (size_t)index * DL_VERTEX_SIZE, out32, DL_VERTEX_SIZE);
 }
 
@@ -610,7 +618,7 @@ DL_API void dl_transform_prepare(DlTransform *t) {
   dl_matrix_multiply(&t->total, &t->world_view, &t->projection);
   dl_matrix_multiply(&t->total, &t->total, &t->clip);
   dl_matrix_invert(&t->view_inverse, &t->view);
-  ffl_normal_matrix(t->world.m, t->normal_matrix);
+  ffl_normal_matrix3(t->world.m, t->normal_matrix);      /* (Direct3D 1-3's; Direct3D 7's ProcessVertices takes ffl_normal_matrix) */
   for (int i = 0; i < 3; ++i) {
     t->eye[i] = t->view_inverse.m[3][i];
     t->eye_axis[i] = t->view_inverse.m[2][i];
@@ -693,14 +701,23 @@ DL_API void dl_viewport7_from_v2(const DlViewport2 *v, DlViewport7 *out, DlMatri
   clip->m[3][2] = z ? -v->dvMinZ / dz : 0.0f;
 }
 /* GetViewport of a viewport set with SetViewport2, and GetViewport2 of one set with SetViewport (what Wine reports). */
+/* a / b, where a division by 0 gives infinity of a's sign (0 / 0: 0) without a floating-point exception. */
+static inline float dl_div_inf(float a, float b) {
+  if (b > 0.0f || b < 0.0f) return a / b;
+  if (!(a > 0.0f || a < 0.0f)) return 0.0f;
+  union { uint32_t u; float f; } inf;
+  inf.u = a > 0.0f ? 0x7F800000u : 0xFF800000u;
+  return inf.f;
+}
 DL_API void dl_viewport1_from_v2(const DlViewport2 *v, DlViewport1 *out) {
   out->dwSize = DL_VIEWPORT1_SIZE;
   out->dwX = v->dwX;
   out->dwY = v->dwY;
   out->dwWidth = v->dwWidth;
   out->dwHeight = v->dwHeight;
-  out->dvScaleX = (v->dvClipWidth > 0.0f || v->dvClipWidth < 0.0f) ? (float)v->dwWidth / v->dvClipWidth : 0.0f;
-  out->dvScaleY = (v->dvClipHeight > 0.0f || v->dvClipHeight < 0.0f) ? (float)v->dwHeight / v->dvClipHeight : 0.0f;
+  /* (a clip width of 0 gives a scale of infinity, as Windows: Wine's d3d ViewportTest) */
+  out->dvScaleX = dl_div_inf((float)v->dwWidth, v->dvClipWidth);
+  out->dvScaleY = dl_div_inf((float)v->dwHeight, v->dvClipHeight);
   out->dvMaxX = v->dvClipWidth + v->dvClipX;
   out->dvMaxY = v->dvClipY;
   out->dvMinZ = 0.0f;
@@ -1054,7 +1071,8 @@ DL_API int dl_execute_process(const DlProcessVertices *rec, DlConstBytes buffer,
                               size_t clip_count, const DlTransform *t, const DlLighting *l, DlStatus *status) {
   const uint32_t op = rec->dwFlags & DL_PROCESSVERTICES_OPMASK;
   if (op > DL_PROCESSVERTICES_COPY) return DL_BAD;
-  if (rec->dwCount > data->dwVertexCount || rec->wStart > data->dwVertexCount - rec->dwCount) return DL_RANGE;
+  const uint32_t room = dl_execute_vertex_room(buffer.size, data);
+  if (rec->dwCount > room || rec->wStart > room - rec->dwCount) return DL_RANGE;
   const size_t dst_vertices = dst.size / DL_VERTEX_SIZE;
   if (rec->dwCount > dst_vertices || rec->wDest > dst_vertices - rec->dwCount) return DL_RANGE;
   if (clip_out && (rec->dwCount > clip_count || rec->wDest > clip_count - rec->dwCount)) return DL_RANGE;
@@ -1200,7 +1218,7 @@ DL_API DlResult dl_transform_vertices(const DlTransform *t, uint32_t count, DlCo
   if (in_stride < 12 || out_stride < 16 || (clipped && (!hout || hout_count < count))) return DL_DDERR_INVALIDPARAMS;
   if ((uint64_t)count * in_stride > in.size + (uint64_t)in_stride - 12u || (uint64_t)count * out_stride > out.size + (uint64_t)out_stride - 16u)
     return DL_DDERR_INVALIDPARAMS;      /* (the last vertex needs only what is read or written of it) */
-  uint32_t all = clipped ? DL_CLIP_ALL : 0;
+  uint32_t all = clipped ? ~0u : 0;      /* (the codes every vertex has: all bits for no vertices, as Windows - Wine's test_transform_vertices) */
   for (uint32_t i = 0; i < count; ++i) {
     const size_t at = (size_t)i * in_stride, to = (size_t)i * out_stride;
     float p[3], c[4];
@@ -1383,7 +1401,10 @@ DL_API DlResult dl_gather_strided(uint32_t fvf, const DlStridedData *data, uint3
 
 /* Processes `count` vertices of an FVF code (`in`, count * stride bytes) - Direct3D 2/3 DrawPrimitive of untransformed vertices, and vertex buffers'
  * ProcessVertices - into clip-space vertices. They are lit if `light` (D3DVOP_LIGHT / not D3DDP_DONOTLIGHT), the lighting is enabled and they have
- * a normal. Transformed vertices (XYZRHW) come back as dl_clip_from_tl makes them. `result` takes the clip codes and extents. */
+ * a normal; with `light` 1 | DL_LIGHT_NO_NORMALS (Direct3D 7) those without one are lit too, as of a normal of zero (only the ambient and emissive parts:
+ * Windows' answer in Wine's test_lighting of ddraw7, where Direct3D 1-3 leave them unlit). Transformed vertices (XYZRHW) come back as dl_clip_from_tl makes them. `result` takes the clip codes and extents. */
+#define DL_LIGHT_NO_NORMALS 2      /* (with 1: vertices without a normal are lit too) */
+#define DL_SPECULAR_ZERO 4         /* an unlit, unfogged vertex without a specular colour gets alpha 0 (ProcessVertices), not 1 (the draws) */
 DL_API DlResult dl_process_fvf(const DlTransform *t, const DlLighting *l, int light, uint32_t fvf, DlConstBytes in, uint32_t count, DlClipVertex *out, size_t out_count,
                                DlProcessResult *result) {
   DlFvfLayout lay;
@@ -1412,8 +1433,14 @@ DL_API DlResult dl_process_fvf(const DlTransform *t, const DlLighting *l, int li
         for (int k = 0; k < 4; ++k) out[i].tex[s][k] = tex[s][k];
       continue;
     }
-    dl_process_vertex(t, l, light && lay.normal >= 0, p, lay.normal >= 0 ? n : NULL, lay.diffuse >= 0 ? &diffuse : NULL, lay.specular >= 0 ? &specular : NULL,
+    dl_process_vertex(t, l, (light & 1) && (lay.normal >= 0 || (light & DL_LIGHT_NO_NORMALS)), p, lay.normal >= 0 ? n : NULL, lay.diffuse >= 0 ? &diffuse : NULL, lay.specular >= 0 ? &specular : NULL,
                       (const float (*)[4])tex, lay.textures, &out[i]);
+    /* (DL_SPECULAR_ZERO: an unlit vertex without a specular colour has a specular alpha of 0, unless vertex fog wrote it) */
+    if ((light & DL_SPECULAR_ZERO) && lay.specular < 0) {
+      const int lit = (light & 1) && (lay.normal >= 0 || (light & DL_LIGHT_NO_NORMALS)) && l->enabled;
+      const int fogged = l->fog_mode != DL_FOG_NONE && (!l->legacy || lit);
+      if (!lit && !fogged) out[i].specular[3] = 0.0f;
+    }
     if (result) dl_result_add(result, t, &out[i]);
   }
   return DL_OK;

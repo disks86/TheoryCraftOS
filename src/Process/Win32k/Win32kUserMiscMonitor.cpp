@@ -29,7 +29,7 @@ constexpr uint32_t kDmPosition = 0x20, kDmDisplayOrientation = 0x80, kDmBitsPerP
                    kDmDisplayFrequency = 0x400000;
 constexpr uint32_t kEnumCurrent = 0xFFFFFFFFu, kEnumRegistry = 0xFFFFFFFEu;
 constexpr int32_t kDispChangeSuccessful = 0, kDispChangeFailed = -1, kDispChangeBadMode = -2, kDispChangeBadFlags = -4, kDispChangeBadParam = -5;
-constexpr uint32_t kCdsTest = 2, kCdsUpdateRegistry = 1, kCdsValid = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x100 | 0x200 | 0x10000000u | 0x20000000u | 0x40000000u;
+constexpr uint32_t kCdsTest = 2, kCdsUpdateRegistry = 1, kCdsNoReset = 0x10000000u, kCdsValid = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x100 | 0x200 | 0x10000000u | 0x20000000u | 0x40000000u;
 constexpr uint32_t kStatusInvalidParameter = 0xC000000Du, kStatusUnsuccessful = 0xC0000001u;
 constexpr uint32_t kQdcAllPaths = 1, kQdcOnlyActive = 2, kQdcDatabase = 4;
 constexpr uint32_t kAdapterLuidLow = 1;
@@ -172,6 +172,12 @@ uint64_t svc_change_display_settings(Call& c) {
     if (width < 16 || height < 16 || width > 16384 || height > 16384) return uint32_t(kDispChangeBadMode);
   }
   if (flags & kCdsTest) return uint32_t(kDispChangeSuccessful);
+  // CDS_UPDATEREGISTRY | CDS_NORESET: the mode is written to the registry and does not take effect now (a later ChangeDisplaySettings(NULL, 0) puts
+  // it on): Windows' meaning, which Wine's ddraw test_coop_level_mode_set relies on
+  if ((flags & kCdsNoReset) && (flags & kCdsUpdateRegistry)) {
+    if (c.arg(1) != 0) { g_monitor.registry_width = width; g_monitor.registry_height = height; g_monitor.registry_bpp = bpp; }
+    return uint32_t(kDispChangeSuccessful);
+  }
   if (width != gdi::screen_width() || height != gdi::screen_height()) {
     if (!gdi::set_screen_size(width, height)) return uint32_t(kDispChangeFailed);
     g_monitor.work_set = false;

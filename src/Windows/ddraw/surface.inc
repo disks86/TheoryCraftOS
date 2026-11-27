@@ -207,7 +207,6 @@ static Surface *surface_alloc(DDraw *dd, SurfaceGroup *g, UINT version) {
   s->dd = dd;
   s->group = g;
   s->implicit = TRUE;
-  s->first_attached = s;
   s->uniqueness = g_uniqueness++;
   if (!g_uniqueness) g_uniqueness = 1;
   if (version == 7) s->texture_outer = (IUnknown *)IFACE7(s);
@@ -255,8 +254,8 @@ static void surface_dc_destroy(Surface *s);
 
 static void surface_free(Surface *s) {
   /* (what was attached to it with AddAttachedSurface lets go of it) */
-  while (s->next_attached)
-    if (FAILED(surface_detach(s, s->next_attached, s->next_attached->attached_iface))) break;
+  while (s->attached)
+    if (FAILED(surface_detach(s, s->attached->child, s->attached->iface))) break;
   surface_unlink(s);
   if (s->dd->primary == s) s->dd->primary = NULL;
   if (s->palette) { IDirectDrawPalette_Release((IDirectDrawPalette *)s->palette); s->palette = NULL; }
@@ -366,6 +365,9 @@ static HRESULT surface_create(DDraw *dd, const DDSURFACEDESC2 *in, UINT version,
   if (*caps & DDSCAPS_FLIP) *caps |= DDSCAPS_FRONTBUFFER;
   if (*caps & DDSCAPS_PRIMARYSURFACE) *caps |= DDSCAPS_VISIBLE;
   const UINT fmt = format_from_ddpf(&d.ddpfPixelFormat);
+  /* (the program's memory is one surface: a complex mipmap or a cube map of it is DDERR_INVALIDCAPS, even of one level - Wine's test_user_memory;
+   * DDSCAPS_MIPMAP alone makes one level in it) */
+  if ((d.dwFlags & DDSD_LPSURFACE) && (*caps & DDSCAPS_COMPLEX) && ((*caps & DDSCAPS_MIPMAP) || (*caps2 & DDSCAPS2_CUBEMAP))) return DDERR_INVALIDCAPS;
   /* mipmap levels */
   UINT levels = 1;
   if (*caps & DDSCAPS_MIPMAP) {
@@ -396,8 +398,10 @@ static HRESULT surface_create(DDraw *dd, const DDSURFACEDESC2 *in, UINT version,
   }
   if (!(*caps & (DDSCAPS_VIDEOMEMORY | DDSCAPS_SYSTEMMEMORY))) {
     if (!(*caps2 & (DDSCAPS2_TEXTUREMANAGE | DDSCAPS2_D3DTEXTUREMANAGE))) {
-      const BOOL hardware = fmt != DD_FMT_UNKNOWN && !dd_format_is_palette(fmt) && fmt != DD_FMT_R3G3B2 && fmt != DD_FMT_A8R3G3B2 &&
-                            !((*caps & DDSCAPS_TEXTURE) && dd_format_is_yuv(fmt));
+      /* (a P8 texture is one the Direct3D part takes - EnumTextureFormats lists P8 - so it is in video memory as Windows puts the formats its
+       * devices enumerate: Wine's test_unsupported_formats; other palette surfaces stay in system memory) */
+      const BOOL hardware = fmt != DD_FMT_UNKNOWN && (!dd_format_is_palette(fmt) || (fmt == DD_FMT_P8 && (*caps & DDSCAPS_TEXTURE) && g_d3d.d3d7_vtbl)) &&
+                            fmt != DD_FMT_R3G3B2 && fmt != DD_FMT_A8R3G3B2 && !((*caps & DDSCAPS_TEXTURE) && dd_format_is_yuv(fmt));
       if (hardware || (*caps & DDSCAPS_PRIMARYSURFACE)) *caps |= DDSCAPS_VIDEOMEMORY;
       else { *caps |= DDSCAPS_SYSTEMMEMORY; sysmem_fallback = TRUE; }
     } else if (!(*caps & DDSCAPS_TEXTURE)) {
@@ -511,6 +515,7 @@ static HRESULT surface_create(DDraw *dd, const DDSURFACEDESC2 *in, UINT version,
   }
   if (*caps & DDSCAPS_PRIMARYSURFACE) {
     dd->primary = root;
+    dd->gdi_mem = root->store.mem;
     for (UINT i = 0; i < g->count; ++i) g->members[i]->made_bpp = mode.bpp;
     if (!(dd->coop & DDSCL_EXCLUSIVE)) primary_read_screen(root);
   }
@@ -600,6 +605,12 @@ static void surface_backbuffer_count(Surface *s, int inc) {
     x = x->complex[0];
   } while (x && x != s);
 }
+/* The AddAttachedSurface link from `s` to `a` (NULL: `a` is not attached to `s` that way). */
+static AttachLink *attach_link_find(const Surface *s, const Surface *a) {
+  for (AttachLink *l = s->attached; l; l = l->next)
+    if (l->child == a) return l;
+  return NULL;
+}
 static HRESULT surface_attach(Surface *s, Surface *a) {
   if (a == s) return DDERR_CANNOTATTACHSURFACE;
   if (surface_attachable_for_flip(a)) {
@@ -625,10 +636,21 @@ static HRESULT surface_attach(Surface *s, Surface *a) {
     surface_backbuffer_count(s, 1);
     return DD_OK;
   }
-  if (a->next_attached || a->first_attached != a) return DDERR_SURFACEALREADYATTACHED;
-  a->next_attached = s->next_attached;
-  a->first_attached = s->first_attached;
-  s->next_attached = a;
+  /* (a z buffer of another size than the surface's: DDERR_CANNOTATTACHSURFACE, as Windows - Wine's test_surface_attachment, smaller and larger) */
+  if ((a->desc.ddsCaps.dwCaps & DDSCAPS_ZBUFFER) && !(s->desc.ddsCaps.dwCaps & DDSCAPS_ZBUFFER) &&
+      (a->desc.dwWidth != s->desc.dwWidth || a->desc.dwHeight != s->desc.dwHeight))
+    return DDERR_CANNOTATTACHSURFACE;
+  /* (already attached here, or a surface that has attachments of its own - the reverse of an attachment among them: Wine's test_surface_attachment) */
+  if (attach_link_find(s, a) || a->attached) return DDERR_SURFACEALREADYATTACHED;
+  /* (a surface attached to another may be attached to this one too, as Windows: Wine's test_surface_attachment, a device's z buffer attached to a
+   * second target in test_edge_antialiasing_blending) */
+  AttachLink *link = mem_alloc(sizeof *link);
+  if (!link) return DDERR_OUTOFMEMORY;
+  link->child = a;
+  link->iface = NULL;
+  link->next = s->attached;
+  s->attached = link;
+  ++a->parents;
   return DD_OK;
 }
 /* AddAttachedSurface of each version: the attachment holds a reference of the interface it was given. */
@@ -636,6 +658,10 @@ static HRESULT surface_add_attached(Surface *s, Surface *a, IUnknown *iface, UIN
   if (!a) return DDERR_INVALIDPARAMS;
   dd_lock();
   HRESULT hr;
+  /* (an attachment that is there already, asked again through another interface version: DDERR_CANNOTATTACHSURFACE - ddraw7's
+   * test_surface_attachment; through the same one DDERR_SURFACEALREADYATTACHED, below) */
+  const AttachLink *there = attach_link_find(s, a);
+  if (there && there->iface != iface) { dd_unlock(); return DDERR_CANNOTATTACHSURFACE; }
   if (call_version == 7) {
     hr = (a->desc.ddsCaps.dwCaps & DDSCAPS_ZBUFFER) ? surface_attach(s, a) : DDERR_CANNOTATTACHSURFACE;
   } else {
@@ -650,7 +676,9 @@ static HRESULT surface_add_attached(Surface *s, Surface *a, IUnknown *iface, UIN
     }
   }
   if (SUCCEEDED(hr)) {
-    a->attached_iface = iface;
+    AttachLink *link = attach_link_find(s, a);
+    if (link) link->iface = iface;
+    if (!link || !a->attached_iface) a->attached_iface = iface;
     IUnknown_AddRef(iface);
   }
   dd_unlock();
@@ -682,16 +710,22 @@ static HRESULT surface_detach(Surface *s, Surface *a, IUnknown *detach_iface) {
     if (detach_iface) IUnknown_Release(detach_iface);
     return DD_OK;
   }
-  if (surface_attachable_for_flip(a) && s->complex[0] != a && a->first_attached == a) return DDERR_SURFACENOTATTACHED;
-  if (a->first_attached != s || a == s) return DDERR_CANNOTDETACHSURFACE;
-  if (a->attached_iface != detach_iface) return DDERR_SURFACENOTATTACHED;
+  AttachLink *link = attach_link_find(s, a);
+  if (surface_attachable_for_flip(a) && s->complex[0] != a && !a->parents) return DDERR_SURFACENOTATTACHED;
+  if (!link || a == s) return DDERR_CANNOTDETACHSURFACE;
+  if (link->iface != detach_iface) return DDERR_SURFACENOTATTACHED;
   if (s->desc.ddsCaps.dwCaps & a->desc.ddsCaps.dwCaps & DDSCAPS_MIPMAP) a->desc.ddsCaps.dwCaps2 &= ~(DWORD)DDSCAPS2_MIPMAPSUBLEVEL;
-  Surface *prev = s;
-  while (prev->next_attached != a) if (!(prev = prev->next_attached)) return DDERR_SURFACENOTATTACHED;
-  prev->next_attached = a->next_attached;
-  a->next_attached = NULL;
-  a->first_attached = a;
-  a->attached_iface = NULL;
+  for (AttachLink **p = &s->attached; *p; p = &(*p)->next)
+    if (*p == link) { *p = link->next; break; }
+  --a->parents;
+  /* (the interface that keeps the surface alive: another parent's, if it has one) */
+  if (a->attached_iface == link->iface) {
+    a->attached_iface = NULL;
+    for (Surface *o = a->parents && a->dd ? a->dd->surfaces : NULL; o && !a->attached_iface; o = o->list_next)
+      for (AttachLink *l = o->attached; l; l = l->next)
+        if (l->child == a && l->iface) { a->attached_iface = l->iface; break; }
+  }
+  mem_free(link);
   if (detach_iface) IUnknown_Release(detach_iface);
   return DD_OK;
 }
@@ -718,8 +752,8 @@ static HRESULT surface_get_attached(Surface *s, const DDSCAPS2 *in, UINT version
     if (!c) break;
     if ((c->desc.ddsCaps.dwCaps & caps.dwCaps) == caps.dwCaps && (c->desc.ddsCaps.dwCaps2 & caps.dwCaps2) == caps.dwCaps2) found = c;
   }
-  for (Surface *c = s->next_attached; c && !found; c = c->next_attached)
-    if ((c->desc.ddsCaps.dwCaps & caps.dwCaps) == caps.dwCaps && (c->desc.ddsCaps.dwCaps2 & caps.dwCaps2) == caps.dwCaps2) found = c;
+  for (AttachLink *l = s->attached; l && !found; l = l->next)
+    if ((l->child->desc.ddsCaps.dwCaps & caps.dwCaps) == caps.dwCaps && (l->child->desc.ddsCaps.dwCaps2 & caps.dwCaps2) == caps.dwCaps2) found = l->child;
   dd_unlock();
   if (!found) return DDERR_NOTFOUND;
   *out = found;
@@ -734,7 +768,7 @@ static HRESULT surface_enum_attached(Surface *s, UINT version, void *context, vo
   UINT n = 0;
   dd_lock();
   for (UINT i = 0; i < MAX_COMPLEX && s->complex[i]; ++i) list[n++] = s->complex[i];
-  for (Surface *c = s->next_attached; c && n < sizeof list / sizeof list[0]; c = c->next_attached) list[n++] = c;
+  for (AttachLink *l = s->attached; l && n < sizeof list / sizeof list[0]; l = l->next) list[n++] = l->child;      /* (newest first) */
   dd_unlock();
   for (UINT i = 0; i < n; ++i) {
     Surface *c = list[i];
@@ -785,7 +819,10 @@ static HRESULT surface_lock(Surface *s, RECT *rect, DDSURFACEDESC2 *out, DWORD s
   if (rect) {
     if (rect->left < 0 || rect->top < 0 || rect->left > rect->right || rect->right > (LONG)s->desc.dwWidth || rect->top > rect->bottom ||
         rect->bottom > (LONG)s->desc.dwHeight) { dd_unlock(); return DDERR_INVALIDPARAMS; }
-    if (dd_format_is_blocks(s->fmt) &&
+    /* (a rectangle of part of a block: system memory and managed surfaces take it, video memory ones do not - Windows Vista on, as d3d8/9; Wine's
+     * dsurface test_partial_block_lock) */
+    const BOOL vidmem = !(s->desc.ddsCaps.dwCaps & DDSCAPS_SYSTEMMEMORY) && !(s->desc.ddsCaps.dwCaps2 & (DDSCAPS2_TEXTUREMANAGE | DDSCAPS2_D3DTEXTUREMANAGE));
+    if (dd_format_is_blocks(s->fmt) && vidmem &&
         ((rect->left & 3) || (rect->top & 3) || ((rect->right & 3) && rect->right != (LONG)s->desc.dwWidth) ||
          ((rect->bottom & 3) && rect->bottom != (LONG)s->desc.dwHeight))) { dd_unlock(); return DDERR_INVALIDPARAMS; }
   }
@@ -1110,6 +1147,12 @@ static HRESULT surface_restore(Surface *s) {
     if (!c || c == s) continue;
     if (c->group == s->group && c->implicit) c->lost = FALSE;
   }
+  /* (the root restores every surface made with it: each back buffer of a flipping chain, not only the first - Wine's test_lost_device) */
+  if (s->group && s->group->root == s)
+    for (UINT i = 0; i < s->group->count; ++i) {
+      Surface *c = s->group->members[i];
+      if (c && c != s && c->implicit) c->lost = FALSE;
+    }
   cpu_wrote(s, NULL);
   if (surface_is_visible_front(s)) present_primary(s, NULL);
   dd_unlock();

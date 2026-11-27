@@ -156,9 +156,11 @@ static LRESULT focus_window_message(HWND w, UINT message, WPARAM wparam, LPARAM 
   DDraw *dd = h && h->owner && !(h->owner->flags & DD_DEAD) ? h->owner : NULL;
   if (dd && message == WM_ACTIVATEAPP) {
     if (!wparam) {
+      /* (the desktop's mode first - the program hears WM_DISPLAYCHANGE while the device is still fine -, then the loss, then the window minimized,
+       * and only then the program's WM_ACTIVATEAPP: Windows' order, Wine's test_coop_level_mode_set) */
+      if (dd->flags & DD_RESTORE_MODE) display_restore();
       dd->device_state = DD_STATE_LOST;
       g_exclusive_window = NULL;
-      if (dd->flags & DD_RESTORE_MODE) display_restore();
       g_seen_valid = FALSE;
       if (!(dd->coop & DDSCL_NOWINDOWCHANGES) && IsWindowVisible(w)) ShowWindow(w, SW_MINIMIZE);
     } else {
@@ -275,8 +277,13 @@ static void exclusive_activate(DDraw *dd, HWND window) {
 static void exclusive_activate_now(DDraw *dd, HWND window) {
   const HWND fg = GetForegroundWindow();
   if (fg == window || (dd->focus_window && fg == dd->focus_window)) return;
+  /* (the window first comes to the top of its level, which it hears as WM_WINDOWPOSCHANGING before WM_ACTIVATE - Windows' activation does that
+   * z-order change itself; the window manager here moves it without the message: Wine's test_wndproc) */
+  window_set_pos(window, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
   SetForegroundWindow(window);
-  if (GetForegroundWindow() == window && IsWindowVisible(window)) exclusive_window_fill_screen(dd, window, TRUE, TRUE);
+  /* (shown over the screen, but not made topmost: only a window that was the foreground when the level was set is - Wine's test_window_style, where
+   * another window had the foreground; the 1.5 s check makes it topmost later while the program stays in front) */
+  if (GetForegroundWindow() == window && IsWindowVisible(window)) exclusive_window_fill_screen(dd, window, TRUE, FALSE);
 }
 
 /* ---- the cooperative level -------------------------------------------------------------------------------------------------------------------------
@@ -311,7 +318,8 @@ static void present_primary_all(Surface *primary);
 static HRESULT ddraw_set_cooperative_level(DDraw *dd, HWND window, DWORD flags, BOOL restore_mode_on_normal) {
   if (dd->flags & DD_SCL_RECURSIVE) return DD_OK;
   if (window && !IsWindow(window)) return DDERR_INVALIDPARAMS;
-  if (window && window == GetDesktopWindow() && (flags & DDSCL_EXCLUSIVE)) return DDERR_INVALIDPARAMS;
+  /* (exclusive mode on the desktop window is taken, as Windows - Wine's refcount test -; ddraw does not touch that window: no window changes) */
+  if (window && window == GetDesktopWindow() && (flags & DDSCL_EXCLUSIVE)) flags |= DDSCL_NOWINDOWCHANGES;
   if (!(flags & (DDSCL_SETFOCUSWINDOW | DDSCL_NORMAL | DDSCL_EXCLUSIVE))) return DDERR_INVALIDPARAMS;
   /* (DDSCL_NORMAL with DDSCL_EXCLUSIVE: exclusive mode, as Windows; without DDSCL_FULLSCREEN or a window it fails as exclusive mode does) */
   if ((flags & DDSCL_CREATEDEVICEWINDOW) && !(flags & DDSCL_EXCLUSIVE)) return DDERR_INVALIDPARAMS;
@@ -352,8 +360,16 @@ static HRESULT ddraw_set_cooperative_level(DDraw *dd, HWND window, DWORD flags, 
   }
   if (!(flags & DDSCL_EXCLUSIVE) && (dd->coop & DDSCL_EXCLUSIVE)) {
     /* leaving exclusive mode: the window off the top, the mode back */
-    if (!(flags & DDSCL_NOWINDOWCHANGES) && window && IsWindow(window)) window_set_pos(window, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    if (!(flags & DDSCL_NOWINDOWCHANGES) && window && IsWindow(window) && window != GetDesktopWindow()) window_set_pos(window, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     if (restore_mode_on_normal) ddraw_restore_display_mode(dd);
+    /* (IDirectDraw2 and later lose the surfaces that can be lost when exclusive mode goes to DDSCL_NORMAL, not to DDSCL_NORMAL | DDSCL_FULLSCREEN;
+     * IDirectDraw's SetCooperativeLevel keeps them - Wine's test_lost_device of each version. The object itself stays fine: TestCooperativeLevel
+     * answers DD_OK, a new surface is not lost.) */
+    if (restore_mode_on_normal && !(flags & DDSCL_FULLSCREEN)) {
+      ddraw_update_lost_surfaces(dd);
+      for (Surface *s = dd->surfaces; s; s = s->list_next)
+        if (surface_can_be_lost(s)) s->lost = TRUE;
+    }
     ClipCursor(NULL);
     focus_window_unhook(dd);
     /* (going exclusive again later loses the surfaces, as Windows) */

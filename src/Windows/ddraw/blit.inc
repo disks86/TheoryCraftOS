@@ -28,10 +28,12 @@
 /* Copies the source rectangle to memory of its own (for a blit of a surface to an overlapping part of itself). */
 static BOOL image_copy_rect(const DdImage *src, const DdRect *r, DdImage *copy, DdRect *copy_rect) {
   *copy = *src;
+  /* (block and planar sources are copied decoded, as A8R8G8B8: a rectangle of them need not be whole blocks or planes) */
+  if (dd_format_is_blocks(src->fmt) || dd_format(src->fmt)->kind == DD_KIND_YUV_PLANAR) copy->fmt = DD_FMT_A8R8G8B8;
   const uint32_t w = (uint32_t)(r->right - r->left), h = (uint32_t)(r->bottom - r->top);
-  const uint32_t pitch = dd_aligned_pitch(src->fmt, w, 4);
-  if (!pitch || dd_format_is_blocks(src->fmt) || dd_format(src->fmt)->kind == DD_KIND_YUV_PLANAR) return FALSE;
-  const uint64_t bytes = dd_image_bytes(src->fmt, w, h, pitch);
+  const uint32_t pitch = dd_aligned_pitch(copy->fmt, w, 4);
+  if (!pitch) return FALSE;
+  const uint64_t bytes = dd_image_bytes(copy->fmt, w, h, pitch);
   if (!bytes || bytes > 0x7FFFFFFFull) return FALSE;
   copy->data = mem_alloc((SIZE_T)bytes);
   if (!copy->data) return FALSE;
@@ -151,6 +153,8 @@ static HRESULT surface_blt(Surface *dst, RECT *dst_rect, Surface *src, RECT *src
       case SRCCOPY: break;
       case WHITENESS:
       case BLACKNESS:
+        /* (no ROP fills of FourCC surfaces - YUV, DXT -, where a colour fill of the raw value works: Wine's test_color_fill) */
+        if (dd_format_is_yuv(dst->fmt) || dd_format_is_blocks(dst->fmt)) { hr = DDERR_NORASTEROPHW; goto done; }
         rop_fx = *fx;
         rop_fx.dwFillColor = fx->dwROP == WHITENESS ? 0xFFFFFFFFu : 0;
         flags |= (dst->desc.ddsCaps.dwCaps & DDSCAPS_ZBUFFER) ? DDBLT_DEPTHFILL : DDBLT_COLORFILL;
@@ -175,9 +179,9 @@ static HRESULT surface_blt(Surface *dst, RECT *dst_rect, Surface *src, RECT *src
     if (sr.left < 0 || sr.top < 0 || sr.right > (LONG)src->desc.dwWidth || sr.bottom > (LONG)src->desc.dwHeight) { hr = DDERR_INVALIDRECT; goto done; }
     if (surface_busy(src)) { hr = DDERR_SURFACEBUSY; goto done; }
     if (dd_format_is_depth(src->fmt) != dd_format_is_depth(dst->fmt)) { hr = DDERR_INVALIDPARAMS; goto done; }
-    if (src->dd != dst->dd && src->dd && dst->dd) {
-      /* (Windows blits between surfaces of different DirectDraw objects of the same display; so does this) */
-    }
+    /* (Windows blits between surfaces of different DirectDraw objects only as copies of one format: a conversion between them is E_NOTIMPL -
+     * Wine's test_cross_device_blt) */
+    if (src->dd != dst->dd && src->dd && dst->dd && src->fmt != dst->fmt) { hr = DDERR_UNSUPPORTED; goto done; }
   } else {
     rect_set(&sr, 0, 0, 0, 0);
   }
@@ -187,7 +191,9 @@ static HRESULT surface_blt(Surface *dst, RECT *dst_rect, Surface *src, RECT *src
   if (flags & DDBLT_KEYSRC) { b.flags |= DD_BLIT_SRC_KEY; b.src_key_low = src->desc.ddckCKSrcBlt.dwColorSpaceLowValue; b.src_key_high = src->desc.ddckCKSrcBlt.dwColorSpaceHighValue; }
   else if (flags & DDBLT_KEYSRCOVERRIDE) { b.flags |= DD_BLIT_SRC_KEY; b.src_key_low = fx->ddckSrcColorkey.dwColorSpaceLowValue; b.src_key_high = fx->ddckSrcColorkey.dwColorSpaceHighValue; }
   if (flags & DDBLT_KEYDEST) {
-    const Surface *k = (dst_key_owner->desc.dwFlags & DDSD_CKDESTBLT) ? dst_key_owner : dst;
+    /* (versions 1-3 take the source's key value even after SetColorKey(DDCKEY_DESTBLT, NULL) took it off: "it uses the old key from the src
+     * surface", Wine's test_ck_operation) */
+    const Surface *k = (version < 4 && src) ? src : (dst_key_owner->desc.dwFlags & DDSD_CKDESTBLT) ? dst_key_owner : dst;
     b.flags |= DD_BLIT_DST_KEY;
     b.dst_key_low = k->desc.ddckCKDestBlt.dwColorSpaceLowValue;
     b.dst_key_high = k->desc.ddckCKDestBlt.dwColorSpaceHighValue;

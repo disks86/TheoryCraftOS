@@ -121,6 +121,8 @@ static HRESULT d3_device_create(DDraw *dd, REFCLSID guid, Surface *target, IUnkn
   const int kind = guid ? dl_device_kind((const DlGuid *)guid) : DL_DEVICE_NONE;
   if (!dl_device_creatable(version, kind)) return version == 1 ? E_NOINTERFACE : DDERR_INVALIDPARAMS;
   if ((kind == DL_DEVICE_HAL || kind == DL_DEVICE_TNLHAL) && !(caps & DDSCAPS_VIDEOMEMORY)) return D3DERR_SURFACENOTINVIDMEM;
+  /* (Direct3D 7's software device does not draw into a palette target in system memory: E_FAIL - Wine's test_rt_caps, which Wine leaves todo) */
+  if (version >= 7 && dd_format_is_palette(target->fmt) && !(caps & DDSCAPS_VIDEOMEMORY)) return E_FAIL;
   D3dDD *d = d3_dd(dd);
   if (!d) return DDERR_OUTOFMEMORY;      /* (no Direct3D 9: what Wine answers without 3D) */
   D3dDevice *dev = mem_alloc(sizeof *dev);
@@ -403,7 +405,9 @@ static HRESULT d3_viewport_delete(D3dDevice *dev, D3dViewport *vp) {
   vp->device = NULL;
   if (dev->current_viewport == vp) {
     dev->current_viewport = NULL;
-    IDirect3DViewport3_Release((IDirect3DViewport3 *)vp);      /* (the reference SetCurrentViewport took) */
+    /* (the reference SetCurrentViewport took: IDirect3DDevice3 lets it go; IDirect3DDevice2 keeps it for good - DeleteViewport, a later
+     * SetCurrentViewport and the device's destruction do not release it, Windows' leak that Wine's ddraw2 test_viewport_object records) */
+    if (dev->version != 2) IDirect3DViewport3_Release((IDirect3DViewport3 *)vp);
   }
   IDirect3DViewport3_Release((IDirect3DViewport3 *)vp);
   return D3D_OK;
@@ -526,7 +530,9 @@ static HRESULT dv_end(D3dDevice *dev, DWORD flags) {
 
 static HRESULT dv_set_texture(D3dDevice *dev, DWORD stage, Surface *s) {
   if (stage >= D3D_STAGES) return DDERR_INVALIDPARAMS;
-  if (s && !(s->desc.ddsCaps.dwCaps & DDSCAPS_TEXTURE)) s = NULL;      /* (Wine: a surface that is not a texture unbinds) */
+  /* (a surface without DDSCAPS_TEXTURE is kept - GetTexture gives it back - and the software devices sample it; the hardware ones draw as if no
+   * texture were set: Windows, Wine's test_texture_wrong_caps; bind_textures. Direct3D 7 unbinds it, as Wine.) */
+  if (s && !(s->desc.ddsCaps.dwCaps & DDSCAPS_TEXTURE) && dev->version >= 7) s = NULL;
   d3_set_texture(dev, stage, s);
   if (stage == 0 && dev->legacy_blend) MASK_SET(dev->dirty.rs, D3DRENDERSTATE_TEXTUREMAPBLEND);
   return D3D_OK;

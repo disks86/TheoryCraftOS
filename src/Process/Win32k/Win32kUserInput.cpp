@@ -161,17 +161,23 @@ static void foreground_changes(Queue* new_queue, Notes& notes) {
   State& s = S();
   Queue* old = s.foreground_thread ? find_queue(s.foreground_thread) : nullptr;
   if (old == new_queue) return;
-  // (the application that goes to the background hears it first, the one that comes to the foreground before its activation messages)
-  activate_app_notes(old ? old->thread : 0, false, new_queue ? new_queue->thread : 0, notes);
+  // The application that goes to the background hears it first: its active window's WM_NCACTIVATE and WM_ACTIVATE (WA_INACTIVE), then
+  // WM_ACTIVATEAPP (FALSE) to its top-level windows, then the focus window's WM_KILLFOCUS - Windows' order (Wine's ddraw test_coop_level_mode_set
+  // records it: DirectDraw's hook acts at WM_ACTIVATEAPP, after WM_ACTIVATE). The one that comes to the foreground gets WM_ACTIVATEAPP (TRUE)
+  // before its activation messages.
   if (old) {
     InputState& in = *old->input_state;
-    if (in.focus) { notes.add(in.focus->handle, wn::WM_KILLFOCUS, 0, 0); in.focus = nullptr; }
     if (in.active) {
       notify_top_level(in.active);
       notes.add(in.active->handle, wn::WM_NCACTIVATE, 0, 0);
       notes.add(in.active->handle, wn::WM_ACTIVATE, WA_INACTIVE, 0);
       in.active = nullptr;
     }
+  }
+  activate_app_notes(old ? old->thread : 0, false, new_queue ? new_queue->thread : 0, notes);
+  if (old) {
+    InputState& in = *old->input_state;
+    if (in.focus) { notes.add(in.focus->handle, wn::WM_KILLFOCUS, 0, 0); in.focus = nullptr; }
   }
   activate_app_notes(new_queue ? new_queue->thread : 0, true, old ? old->thread : 0, notes);
   s.foreground_thread = new_queue ? new_queue->thread : 0;

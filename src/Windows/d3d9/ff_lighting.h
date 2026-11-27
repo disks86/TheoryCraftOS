@@ -149,7 +149,41 @@ static int ffl_singular(const float m[4][4]) {
 /* The matrix for normals out of the one for positions: the inverse of its 3 x 3, transposed - which is its cofactors over its determinant.
  * A matrix that has no inverse is used as it is in the inverse's place (its 3 x 3 transposed): Windows does so - Wine's test_lighting of
  * ddraw 1-7 and d3d9 light a quad under a singular world matrix (and wined3d does the same). */
+static void ffl_normal_matrix3(const float m[4][4], float out[3][3]);
 static void ffl_normal_matrix(const float m[4][4], float out[3][3]) {
+  /* A matrix with a fourth column other than (0, 0, 0, 1) (not affine) takes the 3 x 3 of its whole 4 x 4 inverse, transposed, as Windows: Wine's
+   * test_lighting of ddraw 7 ("non-affine matrix") records black there, which only that inverse gives. (For an affine matrix it is the same as the
+   * inverse of the 3 x 3.) */
+  if (m[0][3] != 0.0f || m[1][3] != 0.0f || m[2][3] != 0.0f || m[3][3] != 1.0f) {
+    double a[4][8];
+    for (int i = 0; i < 4; ++i)
+      for (int j = 0; j < 8; ++j) a[i][j] = j < 4 ? (double)m[i][j] : (double)(j - 4 == i);
+    int ok = 1;
+    for (int c = 0; c < 4 && ok; ++c) {
+      int p = c;
+      for (int r = c + 1; r < 4; ++r)
+        if ((a[r][c] < 0 ? -a[r][c] : a[r][c]) > (a[p][c] < 0 ? -a[p][c] : a[p][c])) p = r;
+      if (!(a[p][c] > 1e-30 || a[p][c] < -1e-30)) { ok = 0; break; }
+      if (p != c)
+        for (int j = 0; j < 8; ++j) { const double t = a[c][j]; a[c][j] = a[p][j]; a[p][j] = t; }
+      const double d = a[c][c];
+      for (int j = 0; j < 8; ++j) a[c][j] /= d;
+      for (int r = 0; r < 4; ++r) {
+        if (r == c || a[r][c] == 0.0) continue;
+        const double f = a[r][c];
+        for (int j = 0; j < 8; ++j) a[r][j] -= f * a[c][j];
+      }
+    }
+    if (ok) {
+      for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) out[i][j] = (float)a[j][4 + i];
+      return;
+    }
+  }
+  ffl_normal_matrix3(m, out);
+}
+/* The same from the 3 x 3 alone, whatever the fourth column (Direct3D 1-3's lighting: ddraw 1/2/4 test_lighting light the non-affine quad). */
+static void ffl_normal_matrix3(const float m[4][4], float out[3][3]) {
   float cofactor[3][3];
   for (int i = 0; i < 3; ++i) {
     for (int j = 0; j < 3; ++j) {

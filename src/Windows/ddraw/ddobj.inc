@@ -31,10 +31,12 @@ static HRESULT dd_query(DDraw *dd, REFIID riid, void **out) {
   else if (guid_eq(riid, &IID_IDirectDraw4)) iface = DDI4(dd);
   else if (guid_eq(riid, &IID_IDirectDraw2)) iface = DDI2(dd);
   else if (guid_eq(riid, &IID_IDirectDraw)) iface = DDI1(dd);
-  else if (guid_eq(riid, &IID_IDirect3D7)) { if (dd->vt_d3d7) { dd->d3d_version = 7; iface = &dd->vt_d3d7; } }
-  else if (guid_eq(riid, &IID_IDirect3D3)) { if (dd->vt_d3d3) { dd->d3d_version = 3; iface = &dd->vt_d3d3; } }
-  else if (guid_eq(riid, &IID_IDirect3D2)) { if (dd->vt_d3d2) { dd->d3d_version = 2; iface = &dd->vt_d3d2; } }
-  else if (guid_eq(riid, &IID_IDirect3D)) { if (dd->vt_d3d1) { dd->d3d_version = 1; iface = &dd->vt_d3d1; } }
+  /* (an object DirectDrawCreateEx made gives only IDirect3D7, one of DirectDrawCreate every IDirect3D but 7, whatever interface is asked: Windows,
+   * Wine's refcount test) */
+  else if (guid_eq(riid, &IID_IDirect3D7)) { if (dd->vt_d3d7 && dd->d3d_family != 1) { dd->d3d_version = 7; iface = &dd->vt_d3d7; } }
+  else if (guid_eq(riid, &IID_IDirect3D3)) { if (dd->vt_d3d3 && dd->d3d_family != 7) { dd->d3d_version = 3; iface = &dd->vt_d3d3; } }
+  else if (guid_eq(riid, &IID_IDirect3D2)) { if (dd->vt_d3d2 && dd->d3d_family != 7) { dd->d3d_version = 2; iface = &dd->vt_d3d2; } }
+  else if (guid_eq(riid, &IID_IDirect3D)) { if (dd->vt_d3d1 && dd->d3d_family != 7) { dd->d3d_version = 1; iface = &dd->vt_d3d1; } }
   else if (g_d3d.ddraw_query) return g_d3d.ddraw_query(dd, riid, out);
   if (!iface) return E_NOINTERFACE;
   IUnknown_AddRef((IUnknown *)iface);
@@ -99,7 +101,8 @@ static HRESULT dd_create_surface2(DDraw *dd, DDSURFACEDESC2 *desc, void **out, I
   DD_READY(dd);
   if (!(dd->coop & (DDSCL_NORMAL | DDSCL_EXCLUSIVE))) return DDERR_NOCOOPERATIVELEVELSET;
   if (!desc || desc->dwSize != sizeof(DDSURFACEDESC2)) return DDERR_INVALIDPARAMS;
-  if (!out) return DDERR_INVALIDPARAMS;
+  /* (a pointer that cannot be written - Wine's test_surface_qi passes 0xdeadbeef: Windows and Wine answer DDERR_INVALIDPARAMS, E_INVALIDARG) */
+  if (!out || IsBadWritePtr(out, sizeof *out)) return DDERR_INVALIDPARAMS;
   *out = NULL;
   if (desc->ddsCaps.dwCaps & (DDSCAPS_FRONTBUFFER | DDSCAPS_BACKBUFFER)) return DDERR_INVALIDCAPS;
   if (outer) return CLASS_E_NOAGGREGATION;
@@ -112,7 +115,8 @@ static HRESULT dd_create_surface1(DDraw *dd, DDSURFACEDESC *desc, IDirectDrawSur
   DD_READY(dd);
   if (!(dd->coop & (DDSCL_NORMAL | DDSCL_EXCLUSIVE))) return DDERR_NOCOOPERATIVELEVELSET;
   if (!desc || desc->dwSize != sizeof(DDSURFACEDESC)) return DDERR_INVALIDPARAMS;
-  if (!out) return DDERR_INVALIDPARAMS;
+  /* (a pointer that cannot be written - Wine's test_surface_qi passes 0xdeadbeef: Windows and Wine answer DDERR_INVALIDPARAMS, E_INVALIDARG) */
+  if (!out || IsBadWritePtr(out, sizeof *out)) return DDERR_INVALIDPARAMS;
   *out = NULL;
   const DWORD c = desc->ddsCaps.dwCaps;
   if (version == 2) {
@@ -264,6 +268,9 @@ static HRESULT dd_enum_surfaces(DDraw *dd, DWORD flags, const DDSURFACEDESC2 *de
   n = 0;
   for (Surface *s = dd->surfaces; s; s = s->list_next) {
     if (!s->iface_count) continue;
+    /* (a sublevel or face whose root was destroyed no longer exists for Windows, whatever references the program still has to it: Wine's dsurface
+     * CubeMapTest leaks 41 of them and finds none; here they stay valid memory until their last release) */
+    if (s->group && !s->group->root) continue;
     if (!(flags & DDENUMSURFACES_ALL) && nomatch == ddsd_match(desc, &s->desc)) continue;
     list[n++] = s;
     if (version == 7) s7_AddRef(IFACE7(s)); else if (version == 4) s4_AddRef(IFACE4(s)); else s1_AddRef(IFACE1(s));
@@ -458,8 +465,16 @@ static HRESULT dd_get_gdi_surface(DDraw *dd, Surface **out) {
   *out = NULL;
   DD_READY(dd);
   if (!dd->primary) return DDERR_NOTFOUND;
-  /* (the surface of the flipping chain whose memory is the GDI's: the front buffer, the primary surface itself) */
-  *out = dd->primary;
+  /* (the surface of the primary's flipping chain that has the GDI's memory now - Flip passes the memory round, as Windows: after one flip it is
+   * the back buffer; the primary itself when none has it) */
+  Surface *found = dd->primary;
+  Surface *c = dd->primary;
+  for (UINT i = 0; c && i < 64; ++i) {
+    if (c->store.mem == dd->gdi_mem) { found = c; break; }
+    c = c->complex[0];
+    if (c == dd->primary) break;
+  }
+  *out = found;
   return DD_OK;
 }
 static HRESULT dd_flip_to_gdi_surface(DDraw *dd) {
@@ -467,8 +482,12 @@ static HRESULT dd_flip_to_gdi_surface(DDraw *dd) {
   Surface *gdi;
   HRESULT hr = dd_get_gdi_surface(dd, &gdi);
   if (FAILED(hr)) return hr;
-  /* (the primary surface keeps the GDI's memory in its front buffer here: flipping chains pass memory, not the front's identity) */
-  present_primary(gdi, NULL);
+  Surface *front = dd->primary;
+  /* (a primary that is not a flipping chain cannot flip: DDERR_NOTFLIPPABLE, as Windows - Wine's test_gdi_surface) */
+  if (!(front->desc.ddsCaps.dwCaps & DDSCAPS_FLIP) || !front->complex[0]) return DDERR_NOTFLIPPABLE;
+  /* (the GDI's memory back in front: the front and the surface that has it exchange theirs) */
+  if (gdi != front) return surface_flip(front, gdi, DDFLIP_NOVSYNC, 7);
+  present_primary(front, NULL);
   return DD_OK;
 }
 

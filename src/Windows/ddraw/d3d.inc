@@ -249,6 +249,7 @@ struct D3dDevice {
   D3dHandles blocks;             /* state blocks (Direct3D 7) */
   /* states */
   D3dState st;
+  float pv_power;                /* the last material power above 0 (Direct3D 7's ProcessVertices lights with it when the material's is 0) */
   D3dMask dirty;
   BOOL all_dirty;                /* everything goes to Direct3D 9 again (it was another device's) */
   DWORD light_state[9];          /* D3DLIGHTSTATE_* of Direct3D 2 and 3 (1 .. 8) */
@@ -318,7 +319,10 @@ struct D3dMaterial {
   LONG ref;
   DDraw *dd;
   DlMaterial material;
-  DWORD handle;
+  /* GetHandle's handles: one for each device asked with (Windows gives another device another handle - Wine's test_multiple_devices -, and each
+   * names the material for any device) */
+  struct D3dMaterialHandle { const void *device; DWORD handle; } *handles;
+  UINT handle_count;
 };
 
 /* IDirect3DExecuteBuffer. */
