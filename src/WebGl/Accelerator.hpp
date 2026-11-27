@@ -68,6 +68,9 @@ struct AccelLimits {
   bool layered_textures = false;  // create_layered: 3D, cube and 2D array textures
   bool depth_bias = false;        // AccelState::depth_bias_*
   bool stencil = false;           // AccelFormat::DepthStencil images and AccelState::stencil_*
+  // write_image / read_image of Depth and DepthStencil images, and write_depth / read_depth of a target: the device's depth (and stencil) can be written and read,
+  // so a draw the CPU makes in between does not leave the device's depth out of date
+  bool depth_transfer = false;
 };
 
 // The kinds of device image (create_image). Rgba8 (Srgb: sRGB encoded) has 8-bit channels; Rgba16F and Rgba32F floats; Depth a float depth image. Pixels go in and out
@@ -208,6 +211,15 @@ class IAccelerator {
     (void)rgba;
     return false;
   }
+  // AccelLimits::depth_transfer: the depth image of a target as 4-byte floats (little-endian, in 0 .. 1), the rows in read_color's order. False if the device cannot (the default).
+  virtual bool write_depth(uint32_t target, ConstByteView depth) {
+    (void)target, (void)depth;
+    return false;
+  }
+  virtual bool read_depth(uint32_t target, ByteView depth) {
+    (void)target, (void)depth;
+    return false;
+  }
 
   // --- Device images (AccelLimits::image_colors). An image is a texture handle (AccelState::textures may name it) that draws can also render into.
   // A w x h image of `format` with `levels` mipmap levels (more than 1: AccelLimits::mip_images, Rgba8 / Rgba8Srgb, sampled only - not rendered into). 0: the device cannot.
@@ -215,12 +227,13 @@ class IAccelerator {
     (void)w, (void)h, (void)format, (void)levels;
     return 0;
   }
-  // Replaces level `level` (its size: w >> level, h >> level, at least 1) with `pixels` (as AccelFormat says). False for a Depth image.
+  // Replaces level `level` (its size: w >> level, h >> level, at least 1) with `pixels` (as AccelFormat says). A Depth image (AccelLimits::depth_transfer only, level 0) takes
+  // 4 bytes a texel - the depth as a little-endian float -, a DepthStencil image 8 - the depth, then the stencil in a little-endian word (0 .. 255).
   virtual bool write_image(uint32_t image, uint32_t level, ConstByteView pixels) {
     (void)image, (void)level, (void)pixels;
     return false;
   }
-  // Copies level 0 of a colour image to `pixels` (as AccelFormat says). False for a Depth image: its depth stays on the device.
+  // Copies level 0 of an image to `pixels` (as AccelFormat says; a Depth or DepthStencil image as write_image takes it, with AccelLimits::depth_transfer only).
   virtual bool read_image(uint32_t image, ByteView pixels) {
     (void)image, (void)pixels;
     return false;

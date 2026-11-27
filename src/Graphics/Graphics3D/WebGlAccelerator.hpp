@@ -54,6 +54,8 @@ class WebGlAccelerator final : public webgl::IAccelerator {
   bool draw(uint32_t target, uint32_t program, const webgl::AccelState& state, ConstByteView vertices, uint32_t vertex_count, ConstByteView constants) override;
   bool read_color(uint32_t target, ByteView rgba) override;
   bool write_color(uint32_t target, ConstByteView rgba) override;
+  bool write_depth(uint32_t target, ConstByteView depth) override;
+  bool read_depth(uint32_t target, ByteView depth) override;
   uint32_t create_image(uint32_t w, uint32_t h, webgl::AccelFormat format, uint32_t levels) override;
   bool write_image(uint32_t image, uint32_t level, ConstByteView pixels) override;
   uint32_t create_layered(uint32_t w, uint32_t h, uint32_t layers, webgl::AccelKind kind) override;
@@ -104,6 +106,7 @@ class WebGlAccelerator final : public webgl::IAccelerator {
   // its own: the device's passes have one, see blank_color). False if not.
   bool images_pass(const webgl::AccelAttachments& a, RenderPassBegin* pass, uint32_t* width, uint32_t* height);
   IImage* blank_color(uint32_t w, uint32_t h);
+  bool depth_planes(IImage& image, bool stencil, ConstByteView in, ByteView* out);   // (see the .cpp)
   struct Blank {
     IImage* image = nullptr;
     uint32_t width = 0, height = 0;

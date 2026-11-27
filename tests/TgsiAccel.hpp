@@ -64,11 +64,49 @@ struct TgsiAccel : IAccelerator {
     l.depth_bias = true;
     l.layered_textures = true;
     l.stencil = true;
+    l.depth_transfer = depth_transfer;
     return l;
   }
   uint32_t images = 4;   // (0: a device without device images)
   int image_reads = 0, image_writes = 0, image_draws = 0, image_clears = 0;
   bool upload = true;   // (false: a device without write_color)
+  bool depth_transfer = false;   // (true: write_image/read_image of depth images and write_depth/read_depth of targets)
+  int depth_reads = 0, depth_writes = 0;
+  bool write_depth(uint32_t target, ConstByteView d) override {
+    if (!depth_transfer) return false;
+    Tgt& t = tgts.at(target - 1);
+    if (d.size() != t.depth.size() * 4) return false;
+    ++depth_writes;
+    memcpy(t.depth.data(), d.data(), d.size());
+    return true;
+  }
+  bool read_depth(uint32_t target, ByteView d) override {
+    if (!depth_transfer) return false;
+    Tgt& t = tgts.at(target - 1);
+    if (d.size() != t.depth.size() * 4) return false;
+    ++depth_reads;
+    memcpy(d.data(), t.depth.data(), d.size());
+    return true;
+  }
+  // A depth image's planes as write_image/read_image take them: a float a texel, and with a stencil plane a word after it.
+  bool depth_image_transfer(Tex& t, const uint8_t* in, uint8_t* out, size_t size) {
+    const bool write = in != nullptr;
+    const uint64_t n = uint64_t{t.w} * t.h;
+    const bool st = !t.stencil.empty();
+    if (!depth_transfer || size != n * (st ? 8 : 4)) return false;
+    for (uint64_t i = 0; i < n; ++i) {
+      const uint64_t at = i * (st ? 8 : 4);
+      if (write) {
+        memcpy(&t.f[i], in + at, 4);
+        if (st) { uint32_t v; memcpy(&v, in + at + 4, 4); t.stencil[i] = static_cast<uint8_t>(v); }
+      } else {
+        memcpy(out + at, &t.f[i], 4);
+        if (st) { const uint32_t v = t.stencil[i]; memcpy(out + at + 4, &v, 4); }
+      }
+    }
+    if (write) ++depth_writes; else ++depth_reads;
+    return true;
+  }
   bool write_color(uint32_t target, ConstByteView rgba) override {
     if (!upload) return false;
     Tgt& t = tgts.at(target - 1);
@@ -146,6 +184,7 @@ struct TgsiAccel : IAccelerator {
   }
   bool write_image(uint32_t image, uint32_t level, ConstByteView px) override {
     Tex& t = texs.at(image - 1);
+    if (t.image && t.depth && level == 0) return depth_image_transfer(t, px.data(), nullptr, px.size());
     if (!t.image || t.depth || level >= t.levels) return false;
     ++image_writes;
     const uint32_t w = t.w >> level ? t.w >> level : 1, h = t.h >> level ? t.h >> level : 1;
@@ -157,6 +196,7 @@ struct TgsiAccel : IAccelerator {
   }
   bool read_image(uint32_t image, ByteView px) override {
     Tex& t = texs.at(image - 1);
+    if (t.image && t.depth) return depth_image_transfer(t, nullptr, px.data(), px.size());
     if (!t.image || t.depth) return false;
     ++image_reads;
     if (px.size() != uint64_t{t.w} * t.h * (t.floats ? 16 : 4)) return false;

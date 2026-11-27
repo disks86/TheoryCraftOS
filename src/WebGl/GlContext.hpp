@@ -977,6 +977,8 @@ class GlContext final : public shader::ITextureHost {
   // hw_depth_stale_: the device has the colour (written up from def_color_ by hw_upload()) but not the depth, which only a clear of the depth on the device brings back;
   // until then a draw with the depth test is the CPU's.
   bool hw_depth_stale_ = false;
+  // hw_depth_ahead_: the device drew depth into its target since def_depth_ was last in step with it (AccelLimits::depth_transfer: hw_cpu_write reads it back)
+  bool hw_depth_ahead_ = false;
   bool hw_upload(IAccelerator* acc);
   uint32_t hw_w_ = 0, hw_h_ = 0;    // the size of hw_target_
   HardwareStats hw_stats_;
@@ -989,7 +991,9 @@ class GlContext final : public shader::ITextureHost {
   void hw_drop();
   void hw_retarget(uint32_t w, uint32_t h);
   void hw_sync();
-  void hw_cpu_write() { hw_sync(); hw_valid_ = false; hw_depth_stale_ = false; }
+  void hw_cpu_write();
+  bool hw_write_depth(IAccelerator* acc);
+  bool hw_read_depth();
   // A whole-buffer clear done on the device alone (see clear()); the CPU's depth and stencil clears it leaves for later.
   bool hw_fast_clear(uint32_t mask);
   void hw_apply_pending_clears();

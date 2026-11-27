@@ -22,8 +22,9 @@
 //  - everything that reads def_color_ calls hw_sync() first, which copies the device picture over it;
 //  - everything on the CPU that writes def_color_ calls hw_cpu_write(): sync, and from then on the device picture is out of date (a device image cannot be written
 //    from the CPU), so the draws that follow run on the CPU until the next whole-buffer clear.
-// The device depth buffer cannot be read back either, so def_depth_ is only what the CPU draws and clears put there; after a mix of both in one frame the depth
-// test of the CPU draws knows nothing of the hardware draws that came before them.
+// The depth: with AccelLimits::depth_transfer the device's depth is written up with the colour (hw_upload) and read back before the CPU draws (hw_cpu_write, while
+// hw_depth_ahead_ says the device's is newer), so draws can move between the two without the depth test of either missing what the other drew. Without it def_depth_
+// is only what the CPU draws and clears put there, and a draw with the depth test after hw_upload stays on the CPU until the depth is cleared on the device.
 
 #include "WebGl/GlContext.hpp"
 #include "WebGl/GlAssemble.hpp"
@@ -154,7 +155,8 @@ bool GlContext::hw_current(Image& im, AccelImage& copy) {
   }
   const uint64_t version = im.version();
   if (copy.synced == version) return true;
-  if (copy.format == AccelFormat::Depth || copy.format == AccelFormat::DepthStencil) return false;
+  // (a depth copy is written up only where the device takes depth: AccelLimits::depth_transfer)
+  if ((copy.format == AccelFormat::Depth || copy.format == AccelFormat::DepthStencil) && !copy.owner->limits().depth_transfer) return false;
   const uint64_t bytes = uint64_t{im.w} * im.h * texel_bytes(im.info->store);
   if (im.px.size() != bytes || !copy.owner->write_image(copy.handle, 0, im.px.view())) return false;
   copy.synced = version;
@@ -168,14 +170,14 @@ void GlContext::hw_sync_image(Image& im) {
   if (!im.hw || !im.hw->ahead) return;
   AccelImage& copy = *im.hw;
   const bool depth_copy = copy.format == AccelFormat::Depth || copy.format == AccelFormat::DepthStencil;
-  if (depth_copy && !copy.cleared) {
+  if (depth_copy && !copy.cleared && !copy.owner->limits().depth_transfer) {
     // (the device drew depth the CPU cannot have: the CPU goes on with what it has, the device keeps its own until the CPU writes the image - hw_current)
     if (!copy.cpu_seen) hw_stats_.note("depth the device drew that the CPU then needed");
     copy.cpu_seen = im.version();
     return;
   }
   copy.set_ahead(false);
-  if (depth_copy) {      // (only clears since: the CPU does them - the depth, the stencil plane)
+  if (depth_copy && copy.cleared) {      // (only clears since: the CPU does them - the depth, the stencil plane)
     const uint32_t depth = f2u(copy.cleared_value);
     const bool stencil = copy.stencil_cleared >= 0 && im.info->store == Store::DepthStencil;
     if (copy.depth_cleared || stencil)
@@ -629,6 +631,7 @@ void GlContext::hw_drop() {
   hw_w_ = hw_h_ = 0;
   hw_valid_ = false;
   hw_ahead_ = false;
+  hw_depth_ahead_ = false;
 }
 
 // The default framebuffer is about to be other images (a window's buffers after a swap, or a resize). The picture on the device is the old images' (whoever needs it
@@ -640,6 +643,7 @@ void GlContext::hw_retarget(uint32_t w, uint32_t h) {
   }
   hw_valid_ = false;
   hw_ahead_ = false;
+  hw_depth_ahead_ = false;
 }
 
 void GlContext::hw_sync() {
@@ -663,8 +667,51 @@ bool GlContext::hw_upload(IAccelerator* acc) {
   if (!hw_target(acc) || dcolor_->px.size() != uint64_t{hw_w_} * hw_h_ * 4 || !acc->write_color(hw_target_, dcolor_->px.view())) return false;
   hw_valid_ = true;
   hw_ahead_ = false;
-  hw_depth_stale_ = ddepth_->defined();
+  hw_depth_stale_ = ddepth_->defined() && !hw_write_depth(acc);
+  hw_depth_ahead_ = false;
   return true;
+}
+
+// The default framebuffer's depth between def_depth_ and the device's target (AccelLimits::depth_transfer): 4-byte floats there, def_depth_'s store here (a
+// DepthStencil store keeps its stencil, which the device's target has not).
+bool GlContext::hw_write_depth(IAccelerator* acc) {
+  if (!acc->limits().depth_transfer || !ddepth_->defined() || ddepth_->w != hw_w_ || ddepth_->h != hw_h_) return false;
+  const Store store = ddepth_->info->store;
+  if (store != Store::Depth && store != Store::DepthStencil) return false;
+  const uint64_t texels = uint64_t{hw_w_} * hw_h_;
+  if (store == Store::Depth) return ddepth_->px.size() == texels * 4 && acc->write_depth(hw_target_, ddepth_->px.view());
+  ByteBuffer depth(a_);
+  if (ddepth_->px.size() != texels * 8 || !depth.put_zeros(texels * 4)) return false;
+  ByteView out = depth.writable_view();
+  const ConstByteView in = ddepth_->px.view();
+  for (uint64_t i = 0; i < texels; ++i) out.subview(i * 4, 4).copy_from(in.subview(i * 8, 4));
+  return acc->write_depth(hw_target_, depth.view());
+}
+
+bool GlContext::hw_read_depth() {
+  if (!hw_owner_ || !hw_target_ || !hw_owner_->limits().depth_transfer || !ddepth_->defined() || ddepth_->w != hw_w_ || ddepth_->h != hw_h_) return false;
+  const Store store = ddepth_->info->store;
+  if (store != Store::Depth && store != Store::DepthStencil) return false;
+  const uint64_t texels = uint64_t{hw_w_} * hw_h_;
+  if (ddepth_->px.size() != texels * (store == Store::Depth ? 4u : 8u)) return false;
+  ByteView px = ddepth_->px.writable_view();
+  ddepth_->touched();
+  if (store == Store::Depth) return hw_owner_->read_depth(hw_target_, px);
+  ByteBuffer depth(a_);
+  if (!depth.put_zeros(texels * 4)) return false;
+  ByteView d = depth.writable_view();
+  if (!hw_owner_->read_depth(hw_target_, d)) return false;
+  for (uint64_t i = 0; i < texels; ++i) px.subview(i * 8, 4).copy_from(depth.view().subview(i * 4, 4));
+  return true;
+}
+
+void GlContext::hw_cpu_write() {
+  hw_sync();
+  // (the device's depth is newer than the CPU's: it comes back, so the CPU's depth test sees what the device drew)
+  if (hw_valid_ && hw_depth_ahead_ && !hw_depth_stale_ && !hw_read_depth()) hw_stats_.note("depth the device drew that the CPU then needed");
+  hw_depth_ahead_ = false;
+  hw_valid_ = false;
+  hw_depth_stale_ = false;
 }
 
 bool GlContext::hw_target(IAccelerator* acc) {
@@ -703,7 +750,9 @@ bool GlContext::hw_fast_clear(uint32_t mask) {
   hw_ahead_ = true;
   all_dirty_ = true;
   if (clear_depth) hw_depth_stale_ = false;
+  if (clear_depth && !depth_asked) hw_depth_ahead_ = !hw_write_depth(acc);      // (a new picture's depth of 1, which the CPU's depth has not: the CPU's goes up instead)
   if (depth_asked) {
+    hw_depth_ahead_ = false;      // (the CPU owes the same clear: hw_apply_pending_clears)
     hw_pending_depth_ = true;
     hw_pending_depth_value_ = d;
   }
@@ -763,6 +812,9 @@ void GlContext::hw_after_clear(uint32_t mask, bool whole) {
   hw_valid_ = acc->clear(hw_target_, true, rgba, clear_depth, d);
   hw_ahead_ = false;   // def_color_ was just cleared to the same color
   if (clear_depth || !was_valid) hw_depth_stale_ = false;      // (a new picture: its depth is the clear's, as above)
+  // (a new picture whose depth was not cleared: the CPU's depth goes up where the device takes it, else the device's 1 is newer than the CPU's)
+  if (hw_valid_ && clear_depth && !depth_asked) hw_depth_ahead_ = !hw_write_depth(acc);
+  if (hw_valid_ && depth_asked) hw_depth_ahead_ = false;
 }
 
 bool GlContext::hw_program(ProgramObj& p, IAccelerator& acc) {
@@ -959,7 +1011,9 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
   if (!fbo) {
     if (!hw_target(acc)) return no("no device target");
     // A device picture that is out of date is written up from the CPU's before the draw (hw_upload), but not its depth: a draw with the depth test then stays here.
-    if (depth_test && (!hw_valid_ || hw_depth_stale_)) return no(hw_valid_ ? "the device depth is out of date" : "the device picture is out of date");
+    // (with AccelLimits::depth_transfer hw_upload writes the depth up too)
+    if (depth_test && hw_valid_ && hw_depth_stale_) return no("the device depth is out of date");
+    if (depth_test && !hw_valid_ && !limits.depth_transfer) return no("the device picture is out of date");
     if (!hw_valid_ && !acc->limits().color_upload) return no("the device picture is out of date");
   } else {
     // A framebuffer object: its images' device copies, made or brought up to date (a colour image's pixels are written up when they are newer; a depth image's
@@ -1332,11 +1386,13 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
     return true;
   }
   if (!hw_valid_ && !hw_upload(acc)) return no("the device picture is out of date");
+  if (depth_test && hw_depth_stale_) return no("the device depth is out of date");      // (the upload's depth was refused)
   if (!acc->draw(hw_target_, p.accel_program, st, vertices.view(), static_cast<uint32_t>(tris.count()), constants.view())) {
     hw_valid_ = false;   // the device may have drawn part of it: the caller reads the picture back and goes on on the CPU
     return no("the device failed the draw");
   }
   hw_ahead_ = true;
+  if (st.depth_write || stencil_writes) hw_depth_ahead_ = true;
   all_dirty_ = true;
   ++version_;
   return true;

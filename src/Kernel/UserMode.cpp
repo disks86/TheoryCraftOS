@@ -1587,6 +1587,48 @@ void report() {
     console::puts(" MiB of it its own");
     if (task->program.process()->exited()) { console::puts(", ended with "); console::put_hex(task->program.process()->exit_code()); }
     console::puts("\n");
+    {
+      // Its addresses: what the regions span, the largest gap left below the top (a 32-bit program runs out of addresses long before memory) and the allocations
+      // of 8 MiB or more (private or shared).
+      const process::AddressSpace& space = task->program.address_space();
+      uint64_t spanned = 0, gap = 0, previous_end = 0x10000;
+      process::AddressSpace::RegionInfo r;
+      for (uint64_t i = 0; i < space.region_count() && space.region_at(i, &r); ++i) {
+        spanned += r.size;
+        if (r.base > previous_end && r.base - previous_end > gap && r.base <= space.top()) gap = r.base - previous_end;
+        previous_end = r.base + r.size;
+      }
+      if (space.top() > previous_end && space.top() - previous_end > gap) gap = space.top() - previous_end;
+      console::puts("  addresses: ");
+      console::put_dec(int64_t(spanned >> 20));
+      console::puts(" MiB in ");
+      console::put_dec(int64_t(space.region_count()));
+      console::puts(" regions below ");
+      console::put_hex(space.top());
+      console::puts(", largest gap ");
+      console::put_dec(int64_t(gap >> 20));
+      console::puts(" MiB\n");
+      uint64_t alloc_id = ~uint64_t{0}, alloc_base = 0, alloc_size = 0;
+      bool alloc_shared = false;
+      auto flush = [&]() {
+        if (alloc_size >= (uint64_t{8} << 20)) {
+          console::puts("    ");
+          console::put_hex(alloc_base);
+          console::puts(alloc_shared ? " shared " : " private ");
+          console::put_dec(int64_t(alloc_size >> 20));
+          console::puts(" MiB\n");
+        }
+      };
+      for (uint64_t i = 0; i < space.region_count() && space.region_at(i, &r); ++i) {
+        if (r.allocation != alloc_id) {
+          flush();
+          alloc_id = r.allocation, alloc_base = r.base, alloc_size = 0, alloc_shared = false;
+        }
+        alloc_size += r.size;
+        alloc_shared = alloc_shared || space.is_shared(r.base);
+      }
+      flush();
+    }
     const process::ModuleSet* modules = task->program.modules();
     auto where = [&](uint64_t address) { return put_code_address(modules, address); };
     for (uint64_t i = 0; modules && i < modules->count(); ++i) {      // where its modules are (a library that had to move is not where the others have it)

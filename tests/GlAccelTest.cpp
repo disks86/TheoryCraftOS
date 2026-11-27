@@ -1672,6 +1672,66 @@ static void test_stage_programs() {
   CHECK(a.live == 0);
 }
 
+// AccelLimits::depth_transfer: draws move between the CPU and the device with the depth test, in the default framebuffer and in a framebuffer object, and neither
+// misses the depth the other drew (the CPU's is written up before the device draws, the device's comes back before the CPU draws).
+static void test_depth_transfer() {
+  TestAllocator a;
+  for (int fbo = 0; fbo <= 1; ++fbo) {
+    TgsiAccel ref;
+    ref.depth_transfer = true;
+    set_accelerator(&ref);
+    {
+      GlContext gl(a, true, 64, 64, noaa());
+      static const char* kSolidVs = "attribute vec3 pos; void main() { gl_Position = vec4(pos, 1.0); }";
+      static const char* kSolidFs = "precision mediump float; uniform vec4 color; void main() { gl_FragColor = color; }";
+      const uint32_t solid = make_program(gl, kSolidVs, kSolidFs);
+      if (fbo) {
+        const uint32_t tex = rgba_texture(gl, 64, 64);
+        const uint32_t rb = gl.create_renderbuffer();
+        gl.bind_renderbuffer(rb);
+        gl.renderbuffer_storage(0x81A5, 64, 64, 0);   // DEPTH_COMPONENT16
+        const uint32_t fb = gl.create_framebuffer();
+        gl.bind_framebuffer(0x8D40, fb);
+        gl.framebuffer_texture(0x8D40, 0x8CE0, 0x0DE1, tex, 0, 0);
+        gl.framebuffer_renderbuffer(0x8D40, 0x8D00, rb);
+        CHECK(gl.check_framebuffer_status(0x8D40) == 0x8CD5);
+      }
+      gl.use_program(solid);
+      gl.clear_color(0, 0, 0, 1);
+      gl.clear(0x4000 | 0x100);
+      gl.enable(0x0B71, true);   // DEPTH_TEST
+      // the CPU (the stencil test, which the default framebuffer's device target has not and a framebuffer object without a stencil image passes on the CPU): red, depth 0.5, the left half
+      quad_buffer(gl, solid, 0.0f);
+      set_vec4(gl, solid, "color", 1, 0, 0, 1);
+      gl.enable(0x0B90, true);
+      gl.viewport(0, 0, 32, 64);
+      const uint64_t cpu0 = gl.hardware_stats().cpu_draws, gpu0 = gl.hardware_stats().gpu_draws;
+      gl.draw_arrays(4, 0, 6, 1);
+      gl.enable(0x0B90, false);
+      CHECK(gl.hardware_stats().cpu_draws == cpu0 + 1);
+      // the device: green at depth 0.75 over everything - behind the CPU's red
+      gl.viewport(0, 0, 64, 64);
+      quad_buffer(gl, solid, 0.5f);
+      set_vec4(gl, solid, "color", 0, 1, 0, 1);
+      gl.draw_arrays(4, 0, 6, 1);
+      CHECK(gl.hardware_stats().gpu_draws == gpu0 + 1);
+      CHECK(ref.depth_writes >= 1);
+      // the CPU again: blue at depth 0.875, behind both
+      quad_buffer(gl, solid, 0.75f);
+      set_vec4(gl, solid, "color", 0, 0, 1, 1);
+      gl.enable(0x0B90, true);
+      gl.draw_arrays(4, 0, 6, 1);
+      gl.enable(0x0B90, false);
+      CHECK(gl.hardware_stats().cpu_draws == cpu0 + 2);
+      CHECK(ref.depth_reads >= 1);
+      CHECK(pixel(gl, 10, 10) == 0xFFFF0000u);   // red: in front of the green and the blue
+      CHECK(pixel(gl, 50, 10) == 0xFF00FF00u);   // green: the device's depth kept the blue out
+    }
+    set_accelerator(nullptr);
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
   test_translate_overloads();
   test_bound_fragment_outputs();
@@ -1687,6 +1747,7 @@ int main() {
   test_device_only_clear();
   test_translated_shaders_match_the_cpu();
   test_color_upload();
+  test_depth_transfer();
   test_framebuffer_objects();
   test_framebuffer_objects_mrt();
   test_mipmapped_texture();

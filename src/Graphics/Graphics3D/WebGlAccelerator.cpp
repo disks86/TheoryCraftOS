@@ -72,6 +72,7 @@ webgl::AccelLimits WebGlAccelerator::limits() const {
   l.clip_distances = (info.features & kFeatureClipDistances) != 0;
   l.float_textures = (info.features & kFeatureFloatFormats) != 0;
   l.control_varyings = info.limits.control_varyings;
+  l.depth_transfer = (info.features2 & kFeature2DepthCopies) != 0;   // (IImage::write_depth_subresource / read_depth_subresource)
   l.color_upload = true;      // (write_color: an image write the device may still refuse, and the context then stays on the CPU)
   // (device images: a pass has at least one colour image; several need kFeatureMultipleTargets)
   l.image_colors = (info.features & kFeatureMultipleTargets) ? (info.limits.color_targets < webgl::kAccelMaxColors ? info.limits.color_targets : webgl::kAccelMaxColors) : 1;
@@ -717,7 +718,8 @@ bool WebGlAccelerator::write_layer(uint32_t handle, uint32_t layer, ConstByteVie
 bool WebGlAccelerator::write_image(uint32_t handle, uint32_t level, ConstByteView pixels) {
   kernel::ScopedMutex guard(lock_);
   Texture* t = texture_at(handle);
-  if (!t || t->format == webgl::AccelFormat::Depth || t->format == webgl::AccelFormat::DepthStencil || level >= t->levels) return false;
+  if (!t || level >= t->levels) return false;
+  if (t->format == webgl::AccelFormat::Depth || t->format == webgl::AccelFormat::DepthStencil) return level == 0 && depth_planes(*t->image, t->format == webgl::AccelFormat::DepthStencil, pixels, nullptr);
   const uint32_t w = t->width >> level ? t->width >> level : 1, h = t->height >> level ? t->height >> level : 1;
   const uint64_t texels = uint64_t{w} * h;
   const bool floats = t->format == webgl::AccelFormat::Rgba16F || t->format == webgl::AccelFormat::Rgba32F;
@@ -749,7 +751,8 @@ bool WebGlAccelerator::write_image(uint32_t handle, uint32_t level, ConstByteVie
 bool WebGlAccelerator::read_image(uint32_t handle, ByteView pixels) {
   kernel::ScopedMutex guard(lock_);
   Texture* t = texture_at(handle);
-  if (!t || t->format == webgl::AccelFormat::Depth || t->format == webgl::AccelFormat::DepthStencil) return false;
+  if (!t) return false;
+  if (t->format == webgl::AccelFormat::Depth || t->format == webgl::AccelFormat::DepthStencil) return depth_planes(*t->image, t->format == webgl::AccelFormat::DepthStencil, ConstByteView(), &pixels);
   const uint64_t texels = uint64_t{t->width} * t->height;
   const bool floats = t->format == webgl::AccelFormat::Rgba16F || t->format == webgl::AccelFormat::Rgba32F;
   if (pixels.size() != texels * (floats ? 16 : 4)) return false;
@@ -786,6 +789,49 @@ bool WebGlAccelerator::read_image(uint32_t handle, ByteView pixels) {
 }
 
 // The inverse of read_color: the same rows, the pixels as 0xAARRGGBB.
+// The planes of a depth image to or from `bytes` (`out` null: written to the image from `in`; else read into *out): 4 bytes a texel - the depth as a float -, or with
+// `stencil` 8 - the depth, then the stencil in a word -, all little-endian, level 0, rows as the image's colour transfers have them.
+bool WebGlAccelerator::depth_planes(IImage& image, bool stencil, ConstByteView in, ByteView* out) {
+  if (!(device_.info().features2 & kFeature2DepthCopies)) return false;
+  const Extent2D e = image.extent();
+  const uint64_t texels = uint64_t{e.width} * e.height, texel = stencil ? 8u : 4u;
+  if ((out ? out->size() : in.size()) != texels * texel) return false;
+  ArrayView<float> depth = allocate_view<float>(allocator_, texels);
+  ArrayView<uint8_t> stencil_plane = stencil ? allocate_view<uint8_t>(allocator_, texels) : ArrayView<uint8_t>();
+  bool ok = !depth.empty() && (!stencil || !stencil_plane.empty());
+  if (ok && out) {
+    ok = image.read_depth_subresource(0, 0, depth, stencil_plane);
+    ByteWriter w(*out);
+    for (uint64_t i = 0; ok && i < texels; ++i) {
+      w.le32(__builtin_bit_cast(uint32_t, depth[i]));
+      if (stencil) w.le32(stencil_plane[i]);
+    }
+    ok = ok && w.ok();
+  } else if (ok) {
+    ByteReader r(in);
+    for (uint64_t i = 0; i < texels; ++i) {
+      depth[i] = __builtin_bit_cast(float, r.le32());
+      if (stencil) stencil_plane[i] = static_cast<uint8_t>(r.le32());
+    }
+    ok = r.ok() && image.write_depth_subresource(0, 0, depth, stencil_plane);
+  }
+  if (!depth.empty()) release_view(allocator_, depth);
+  if (!stencil_plane.empty()) release_view(allocator_, stencil_plane);
+  return ok;
+}
+
+bool WebGlAccelerator::write_depth(uint32_t handle, ConstByteView depth) {
+  kernel::ScopedMutex guard(lock_);
+  Target* t = target_at(handle);
+  return t && t->depth && depth_planes(*t->depth, false, depth, nullptr);
+}
+
+bool WebGlAccelerator::read_depth(uint32_t handle, ByteView depth) {
+  kernel::ScopedMutex guard(lock_);
+  Target* t = target_at(handle);
+  return t && t->depth && depth_planes(*t->depth, false, ConstByteView(), &depth);
+}
+
 bool WebGlAccelerator::write_color(uint32_t handle, ConstByteView rgba) {
   kernel::ScopedMutex guard(lock_);
   Target* t = target_at(handle);

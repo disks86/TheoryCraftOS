@@ -65,7 +65,8 @@ for a in "${words[@]}"; do
   if [ $skip = 1 ]; then skip=0; elif [ "$a" = -qmp ]; then skip=1; else
     case "$a" in
       gtk,gl=on*) a=egl-headless ;;
-      virtio-gpu-gl-pci) [ "${VENUS:-off}" = off ] || a="virtio-gpu-gl-pci,venus=on,blob=on,hostmem=${HOSTMEM:-2G}" ;;
+      # (a screen large enough for the window: the device's preferred mode)
+      virtio-gpu-gl-pci) if [ "${VENUS:-off}" = off ]; then a="virtio-gpu-gl-pci,xres=${SCREEN_WIDTH:-1920},yres=${SCREEN_HEIGHT:-1080}"; else a="virtio-gpu-gl-pci,venus=on,blob=on,hostmem=${HOSTMEM:-2G},xres=${SCREEN_WIDTH:-1920},yres=${SCREEN_HEIGHT:-1080}"; fi ;;
     esac
     args+=("$a")
   fi
