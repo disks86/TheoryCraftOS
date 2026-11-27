@@ -58,7 +58,11 @@ bool register_dxg_node(dxgk::Kernel& kernel, RenderNode& node, allocators::IAllo
   }
   // The CPU renderer keeps its images in system memory: a framebuffer-only card's memory size (a few megabytes of scanout on the standard VGA) is no
   // budget for it - with 3 MB, one 640 x 480 depth buffer and two targets in a list left no room and every pass after that was refused.
-  if (device == &node.software_device()) config.local_memory_budget = dxgk::AdapterConfig().local_memory_budget;
+  // (so it has the share of the RAM a GPU without memory of its own has, or the default)
+  if (device == &node.software_device()) {
+    config.local_memory_budget = shared_memory > dxgk::AdapterConfig().local_memory_budget ? shared_memory : dxgk::AdapterConfig().local_memory_budget;
+    if (config.local_memory_budget > config.system_memory_limit) config.system_memory_limit = config.local_memory_budget;
+  }
   return kernel.add_adapter(*device, config) != dxgk::kInvalidIndex;
 }
 

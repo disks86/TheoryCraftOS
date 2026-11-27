@@ -86,8 +86,18 @@ class Stream {
   uint32_t count() const { return count_; }
   const uint32_t* data() const { return data_.data(); }
   void reset() { count_ = 0; }
+  // Where a full stream goes (set_sink): a command that does not fit in what is left sends what is there to the host first - the host keeps the context's state
+  // between the parts - and starts the next part. (Without a sink the stream overflows.)
+  void set_sink(bool (*sink)(void* context), void* context) {
+    sink_ = sink;
+    sink_context_ = context;
+  }
   // Room for `dwords` more (including the header), or the stream has overflowed.
   bool command(uint32_t cmd, uint32_t object, uint32_t length) {
+    if (count_ + length + 1 > kCapacity && sink_ && count_ != 0 && length + 1 <= kCapacity && !sink_(sink_context_)) {
+      overflow_ = true;
+      return false;
+    }
     if (count_ + length + 1 > kCapacity) {
       overflow_ = true;
       return false;
@@ -108,6 +118,8 @@ class Stream {
   ArrayView<uint32_t> data_;
   uint32_t count_ = 0;
   bool overflow_ = false;
+  bool (*sink_)(void*) = nullptr;
+  void* sink_context_ = nullptr;
 };
 
 constexpr uint32_t kFillQueries = 16;   // the device's own queries in a submit (how far stream output buffers got)
@@ -2259,6 +2271,8 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
     stream.reset();
     return true;
   };
+  // (a command larger than what is left of the stream - a stage's constants are up to 4096 words - sends the rest first: the stream never overflows)
+  stream.set_sink([](void* f) { return (*static_cast<decltype(flush)*>(f))(); }, &flush);
 
   // A stage's storage as its module's TgsiBindings number it: the host's shader made for what is bound (a variant, for a module with images or views of buffers), SET_SHADER_BUFFERS of
   // its buffers, SET_SHADER_IMAGES of its images (a texture's level and layers, or a buffer: the host's image is the whole buffer, the view's first element and count are the variant's),
