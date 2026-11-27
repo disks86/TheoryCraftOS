@@ -77,7 +77,8 @@ class GlService {
   // its draws go to, null when there is none.
   bool hardware_stats(uint64_t pid, uint32_t context, webgl::GlContext::HardwareStats* out, const char** accelerator = nullptr);
   // Told, for each context that goes (deleted, or its process exited) and drew something, how many of its draws the 3D hardware took (the kernel logs it).
-  using ReportFunction = void (*)(uint64_t pid, const webgl::GlContext::HardwareStats& stats);
+  // (`what`: which draws - "" for all of a context's, else a name of a part of them)
+  using ReportFunction = void (*)(uint64_t pid, const webgl::GlContext::HardwareStats& stats, const char* what);
   void set_report(ReportFunction report) { report_ = report; }
   allocators::IAllocator& allocator() { return a_; }
 
@@ -90,7 +91,10 @@ class GlService {
     uint64_t thread = 0;      // current on (0: none)
     uint64_t window = 0;
     ContextRequest request;
+    uint32_t frames_since_report = 0;   // (swaps of its surface since its draw statistics were last reported)
   };
+  static constexpr uint32_t kReportFrames = 30;
+  static constexpr uint64_t kReportDraws = 5000;
   struct Surface {
     uint64_t window = 0;
     UniquePointer<GlSurface> surface;

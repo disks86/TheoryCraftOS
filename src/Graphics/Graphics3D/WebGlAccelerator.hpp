@@ -54,11 +54,21 @@ class WebGlAccelerator final : public webgl::IAccelerator {
   bool draw(uint32_t target, uint32_t program, const webgl::AccelState& state, ConstByteView vertices, uint32_t vertex_count, ConstByteView constants) override;
   bool read_color(uint32_t target, ByteView rgba) override;
   bool write_color(uint32_t target, ConstByteView rgba) override;
+  uint32_t create_image(uint32_t w, uint32_t h, webgl::AccelFormat format, uint32_t levels) override;
+  bool write_image(uint32_t image, uint32_t level, ConstByteView pixels) override;
+  uint32_t create_layered(uint32_t w, uint32_t h, uint32_t layers, webgl::AccelKind kind) override;
+  bool write_layer(uint32_t image, uint32_t layer, ConstByteView rgba) override;
+  bool read_image(uint32_t image, ByteView pixels) override;
+  bool clear_images(const webgl::AccelAttachments& a, bool color, const float rgba[4], bool depth, float depth_value) override;
+  bool draw_images(const webgl::AccelAttachments& a, uint32_t program, const webgl::AccelState& state, ConstByteView vertices, uint32_t vertex_count, ConstByteView constants) override;
 
  private:
   // A pipeline of a program for one state: the pipeline state of an AccelState packed into a key.
   struct Variant {
-    uint64_t key = 0;
+    uint64_t key = 0, key2 = 0;
+    float bias_slope = 0, bias_units = 0;
+    bool per_target = false;
+    webgl::AccelState::TargetBlend targets[webgl::kAccelMaxColors] = {};
     IPipeline* pipeline = nullptr;
   };
   struct Program {
@@ -74,22 +84,40 @@ class WebGlAccelerator final : public webgl::IAccelerator {
     uint32_t patch_vertices = 0;    // with tessellation: the vertices of a patch
     String gs_text, tcs_text, tes_text;   // (the device may read a module's text again when it makes a pipeline: these copies live as long as the modules)
   };
+  // A texture (create_texture / create_texture_float, sampled only) or a device image (create_image, which draws may also render into).
   struct Texture {
     IImage* image = nullptr;
     uint32_t width = 0, height = 0;
-    bool floats = false;   // R32G32B32A32Float (create_texture_float)
+    webgl::AccelFormat format = webgl::AccelFormat::Rgba8;
+    uint32_t levels = 1;
+    bool renderable = false;   // a colour or depth attachment as well
+    uint32_t layers = 0;       // create_layered: its layers (0: a 2D texture)
   };
-  uint32_t make_texture(uint32_t w, uint32_t h, bool floats);
+  uint32_t make_texture(uint32_t w, uint32_t h, webgl::AccelFormat format, uint32_t levels, bool renderable);
+  uint32_t add_texture(UniquePointer<Texture>&& t);
   struct Target {
     IImage* color = nullptr;
     IImage* depth = nullptr;
     uint32_t width = 0, height = 0;
   };
+  // The render pass of draw_images / clear_images: the images of `a`, which must exist, be renderable and have one size (a depth-only pass gets a colour image of
+  // its own: the device's passes have one, see blank_color). False if not.
+  bool images_pass(const webgl::AccelAttachments& a, RenderPassBegin* pass, uint32_t* width, uint32_t* height);
+  IImage* blank_color(uint32_t w, uint32_t h);
+  struct Blank {
+    IImage* image = nullptr;
+    uint32_t width = 0, height = 0;
+  };
+  List<Blank> blanks_;   // (the colour images of depth-only passes, one per size)
 
   void destroy_program_locked(Program& p);
-  IPipeline* pipeline_for(Program& p, const webgl::AccelState& state);
+  IPipeline* pipeline_for(Program& p, const webgl::AccelState& state, uint32_t color_count = 1);
   bool run_pass(Target& t, bool clear_color, const Vec4& color, bool clear_depth, float depth, Program* program, const webgl::AccelState* state, ConstByteView vertices,
                 uint32_t vertex_count, ConstByteView constants);
+  // One pass: `pass` (its clears as they are) and, with a program, one draw of `color_count` colour outputs into a width x height target.
+  bool run_pass_on(const RenderPassBegin& pass, uint32_t width, uint32_t height, uint32_t color_count, Program* program, const webgl::AccelState* state, ConstByteView vertices,
+                   uint32_t vertex_count, ConstByteView constants);
+  bool draw_checks(Program& p, const webgl::AccelState& state, ConstByteView vertices, uint32_t vertex_count, ConstByteView constants);
   Program* program_at(uint32_t handle) { return handle && handle <= programs_.count() ? programs_[handle - 1].get() : nullptr; }
   Texture* texture_at(uint32_t handle) { return handle && handle <= textures_.count() ? textures_[handle - 1].get() : nullptr; }
   Target* target_at(uint32_t handle) { return handle && handle <= targets_.count() ? targets_[handle - 1].get() : nullptr; }

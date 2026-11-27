@@ -414,12 +414,13 @@ uint32_t* GlContext::bound_texture_slot(uint32_t target) {
   return nullptr;
 }
 
-Texture* GlContext::bound_texture_for(uint32_t target, uint32_t* face) {
+Texture* GlContext::bound_texture_for(uint32_t target, uint32_t* face, bool pixels) {
   uint32_t* slot = bound_texture_slot(target);
   if (!slot) { set_error(INVALID_ENUM); return nullptr; }
   *face = face_index(target);
   Texture* t = texture_at(*slot);
   if (!t) set_error(INVALID_OPERATION);
+  else if (pixels) hw_sync_texture(*t);
   return t;
 }
 
@@ -867,7 +868,7 @@ uint32_t GlContext::attachment_layers(const Attachment& at, const Image& im) {
   return at.face_target >= 0x8515 && at.face_target <= 0x851A ? 6 : im.d;
 }
 
-void GlContext::resolve_target(uint32_t fb_id, bool draw, Target* t, uint32_t select) {
+void GlContext::resolve_target(uint32_t fb_id, bool draw, Target* t, uint32_t select, bool sync) {
   *t = Target();
   t->fb = fb_id;
   if (fb_id == 0) {
@@ -924,6 +925,7 @@ void GlContext::resolve_target(uint32_t fb_id, bool draw, Target* t, uint32_t se
   for (uint32_t i = 0; i < kMaxDrawBuffers; ++i)
     if (t->color[i]) { first = t->color[i]; break; }
   if (first) t->ss = first->ss;
+  if (sync) hw_sync_target(*t);
 }
 
 bool GlContext::framebuffer_complete(uint32_t fb_id, uint32_t* status) {

@@ -583,7 +583,7 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
   uint32_t status;
   if (!framebuffer_complete(draw_fb_, &status)) { set_error(INVALID_FRAMEBUFFER_OPERATION); return false; }
   Target target;
-  resolve_target(draw_fb_, true, &target);
+  resolve_target(draw_fb_, true, &target, 0, false);
   if (!target.ok) { set_error(INVALID_FRAMEBUFFER_OPERATION); return false; }
   if (draw_fb_ != 0) {
     bool any = false;
@@ -646,13 +646,15 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
   }
 
   // The 3D hardware takes the draw if it can (default framebuffer, shaders and state the device has); otherwise the picture is brought back to the CPU first.
-  if (target.is_default && !desktop.primitive_sink && (mode <= 6 || p->has_extra())) {
+  // (a framebuffer object's images and the textures on the device: their copies there come back to the CPU first, when they are newer)
+  if (!desktop.primitive_sink && (mode <= 6 || p->has_extra())) {
     if (hw_draw(*p, target, mode, first, count, index_type, idx, indexed, instances)) return true;
-    hw_cpu_write();
-  } else if (target.is_default) {
-    hw_cpu_write();      // (the CPU draws over the device's picture: it comes back first)
+    if (target.is_default) hw_cpu_write();
+  } else {
+    if (target.is_default) hw_cpu_write();      // (the CPU draws over the device's picture: it comes back first)
     hw_stats_.refused(desktop.primitive_sink ? "selection or feedback" : "adjacency or patches without a geometry or tessellation stage");
   }
+  hw_sync_for_cpu_draw(target);
 
   // varying flags for the rasterizer
   gpu::RasterState rs;
@@ -988,7 +990,7 @@ void GlContext::clear(uint32_t mask) {
   uint32_t status;
   if (!framebuffer_complete(draw_fb_, &status)) { set_error(INVALID_FRAMEBUFFER_OPERATION); return; }
   Target t;
-  resolve_target(draw_fb_, true, &t);
+  resolve_target(draw_fb_, true, &t, 0, false);
   if (!t.ok) return;
   int32_t x0 = 0, y0 = 0, x1 = static_cast<int32_t>(t.w), y1 = static_cast<int32_t>(t.h);
   if (scissor_test_) {
@@ -1000,6 +1002,14 @@ void GlContext::clear(uint32_t mask) {
   }
   if (x0 >= x1 || y0 >= y1) return;
   const bool whole = x0 == 0 && y0 == 0 && x1 == static_cast<int32_t>(t.w) && y1 == static_cast<int32_t>(t.h);
+  if (!t.is_default) {
+    // A framebuffer object's clear on the device when it can (its images stay there); else its images come back and the CPU clears them.
+    if (whole && hw_fbo_clear(mask, t)) {
+      ++version_;
+      return;
+    }
+    hw_sync_target(t);
+  }
   if (t.is_default) {
     // A clear of the whole drawing buffer that the 3D hardware can do is done there only: the picture is then the device's, the CPU's colour comes back with
     // hw_sync() when something needs it, and its depth and stencil are cleared then (hw_apply_pending_clears) - a frame drawn on the device never touches them.

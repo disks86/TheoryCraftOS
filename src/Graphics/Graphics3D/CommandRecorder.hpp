@@ -64,7 +64,9 @@ struct RecordedCommand {
 
 class CommandRecorder : public ICommandBuffer {
  public:
-  explicit CommandRecorder(allocators::IAllocator& allocator) : commands_(allocator), constants_(allocator) {}
+  // (max_constant_bytes: what push_constants takes - a device's DeviceLimits::shader_constant_bytes, or kMaxPushConstantBytes)
+  explicit CommandRecorder(allocators::IAllocator& allocator, uint32_t max_constant_bytes = kMaxPushConstantBytes)
+      : commands_(allocator), constants_(allocator), max_constant_bytes_(max_constant_bytes > kMaxShaderConstantBytes ? kMaxShaderConstantBytes : max_constant_bytes) {}
 
   void begin() override {
     commands_.clear();
@@ -103,7 +105,7 @@ class CommandRecorder : public ICommandBuffer {
     add(c);
   }
   void push_constants(const void* data, uint32_t size) override {
-    if (!data || size > kMaxPushConstantBytes || size % 16 != 0) {
+    if (!data || size > max_constant_bytes_ || size % 16 != 0) {
       ok_ = false;
       return;
     }
@@ -394,6 +396,7 @@ class CommandRecorder : public ICommandBuffer {
 
   List<RecordedCommand> commands_;
   List<uint8_t> constants_;
+  uint32_t max_constant_bytes_ = kMaxPushConstantBytes;
   uint64_t results_[kMaxOcclusionQueries][kMaxQueryValues] = {};
   bool result_done_[kMaxOcclusionQueries] = {};
   bool ok_ = true;

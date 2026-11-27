@@ -31,6 +31,33 @@
 namespace webgl {
 
 namespace {
+// GL's blend factors and equations as the device's (graphics::BlendFactor / BlendOp numbers); a constant colour has no device factor
+bool factor(uint32_t f, uint8_t* out) {
+  switch (f) {
+    case 0: *out = 0; return true;
+    case 1: *out = 1; return true;
+    case 0x0300: *out = 2; return true;
+    case 0x0301: *out = 3; return true;
+    case 0x0302: *out = 4; return true;
+    case 0x0303: *out = 5; return true;
+    case 0x0306: *out = 6; return true;
+    case 0x0307: *out = 7; return true;
+    case 0x0304: *out = 8; return true;
+    case 0x0305: *out = 9; return true;
+    case 0x0308: *out = 10; return true;
+    default: return false;
+  }
+}
+bool equation(uint32_t e, uint8_t* out) {
+  switch (e) {
+    case 0x8006: *out = 0; return true;
+    case 0x800A: *out = 1; return true;
+    case 0x800B: *out = 2; return true;
+    case 0x8007: *out = 3; return true;
+    case 0x8008: *out = 4; return true;
+    default: return false;
+  }
+}
 inline float u2f(uint32_t u) { return __builtin_bit_cast(float, u); }
 inline uint32_t f2u(float f) { return __builtin_bit_cast(uint32_t, f); }
 
@@ -45,21 +72,455 @@ void GlContext::hw_forget_texture(uint32_t name) {
   if (hw_owner_) hw_textures_.forget(*hw_owner_, name);
 }
 
-// The texture bound to `unit` as the device can read sampler `ts`: a 2D (or 1D, rectangle) texture with no mipmapping in use and a filter and wrap mode the device has, of
-// 8-bit RGBA texels - or, for a shadow sampler, of depth, sent as a float texture with the depth in R and read with nearest filtering (the shader filters and
-// compares, by `params`: the sampler's four CONST rows, see TgsiSampler). Its texels are on the device when this returns true. False: the CPU samples it.
+// --- Device copies of images ---------------------------------------------------------------------------------------------------------------------------------
+
+// The kind of device image an image's pixels go to: 8-bit RGBA (sRGB encoded or not), floats, or depth. False: the device has no such image (integer and signed
+// normalised formats).
+bool GlContext::hw_format(const Image& im, AccelFormat* format, const char** why) const {
+  const IAccelerator* acc = accelerator();
+  const AccelLimits l = acc ? acc->limits() : AccelLimits();
+  switch (im.info->store) {
+    case Store::U8x4:
+      if (im.info->is_signed) break;
+      if (im.info->srgb) {
+        if (!l.srgb_images) break;
+        *format = AccelFormat::Rgba8Srgb;
+        return true;
+      }
+      *format = AccelFormat::Rgba8;
+      return true;
+    case Store::F32x4:
+      if (!l.float_images) break;
+      *format = AccelFormat::Rgba32F;
+      return true;
+    case Store::Depth:
+      *format = AccelFormat::Depth;
+      return true;
+    case Store::DepthStencil:      // (with its stencil plane on the device when the device has one: the stencil test is then the device's too)
+      *format = l.stencil ? AccelFormat::DepthStencil : AccelFormat::Depth;
+      return true;
+    default: break;
+  }
+  *why = "an image format the device does not have";
+  return false;
+}
+
+// The device copy of `im` as a `format` image: the one it has, or a new one (which holds nothing yet: hw_current fills it).
+AccelImage* GlContext::hw_image(Image& im, AccelFormat format, const char** why) {
+  IAccelerator* acc = accelerator();
+  if (!acc) {
+    *why = "no accelerator";
+    return nullptr;
+  }
+  if (im.hw && im.hw->owner == acc && im.hw->format == format && im.hw->w == im.w && im.hw->h == im.h && im.hw->levels == 1) return im.hw.get();
+  if (im.hw && im.hw->ahead) hw_sync_image(im);      // (a copy of another kind that is newer: its pixels come back before it goes)
+  im.hw.reset();
+  if (im.d != 1 || im.ss != 1) {
+    *why = "a layered or multisampled image";
+    return nullptr;
+  }
+  if (im.w > 8192 || im.h > 8192) {
+    *why = "an image larger than the device takes";
+    return nullptr;
+  }
+  const uint32_t handle = acc->create_image(im.w, im.h, format, 1);
+  if (!handle) {
+    *why = "the device refused an image";
+    return nullptr;
+  }
+  im.hw = UniquePointer<AccelImage>::make(a_);
+  if (!im.hw) {
+    acc->destroy_texture(handle);
+    *why = "out of memory";
+    return nullptr;
+  }
+  im.hw->owner = acc;
+  im.hw->handle = handle;
+  im.hw->format = format;
+  im.hw->w = im.w;
+  im.hw->h = im.h;
+  im.hw->ahead_count = &objects_->hw_ahead;
+  return im.hw.get();
+}
+
+// Brings the device copy up to date with the CPU's pixels if they are newer (a colour image: written up; a depth image cannot be, and is then out of date).
+bool GlContext::hw_current(Image& im, AccelImage& copy) {
+  if (copy.ahead) {
+    if (!copy.cpu_seen || copy.cpu_seen == im.version()) return true;
+    copy.set_ahead(false);      // (the CPU wrote the depth after it was handed its older one: neither copy is whole, the device's is out of date)
+    copy.cpu_seen = 0;
+    copy.synced = 0;
+    return false;
+  }
+  const uint64_t version = im.version();
+  if (copy.synced == version) return true;
+  if (copy.format == AccelFormat::Depth || copy.format == AccelFormat::DepthStencil) return false;
+  const uint64_t bytes = uint64_t{im.w} * im.h * texel_bytes(im.info->store);
+  if (im.px.size() != bytes || !copy.owner->write_image(copy.handle, 0, im.px.view())) return false;
+  copy.synced = version;
+  copy.cleared = false;
+  return true;
+}
+
+// The device copy is newer than the pixels: they come back. A depth copy cannot be read; if a clear is all the device did to it since, the CPU does the same clear,
+// else the depth the device drew is lost to the CPU (counted in the draw statistics) and both copies go on from the CPU's.
+void GlContext::hw_sync_image(Image& im) {
+  if (!im.hw || !im.hw->ahead) return;
+  AccelImage& copy = *im.hw;
+  const bool depth_copy = copy.format == AccelFormat::Depth || copy.format == AccelFormat::DepthStencil;
+  if (depth_copy && !copy.cleared) {
+    // (the device drew depth the CPU cannot have: the CPU goes on with what it has, the device keeps its own until the CPU writes the image - hw_current)
+    if (!copy.cpu_seen) hw_stats_.note("depth the device drew that the CPU then needed");
+    copy.cpu_seen = im.version();
+    return;
+  }
+  copy.set_ahead(false);
+  if (depth_copy) {      // (only clears since: the CPU does them - the depth, the stencil plane)
+    const uint32_t depth = f2u(copy.cleared_value);
+    const bool stencil = copy.stencil_cleared >= 0 && im.info->store == Store::DepthStencil;
+    if (copy.depth_cleared || stencil)
+      for (uint32_t y = 0; y < im.h; ++y)
+        for (uint32_t x = 0; x < im.w; ++x) {
+          uint32_t raw[4];
+          read_texel(im, x, y, 0, raw);
+          if (copy.depth_cleared) raw[0] = depth;
+          if (stencil) raw[1] = static_cast<uint32_t>(copy.stencil_cleared);
+          write_texel(im, x, y, 0, raw);
+        }
+    copy.synced = im.version();
+    copy.cleared = copy.depth_cleared = false;
+    copy.stencil_cleared = -1;
+    return;
+  }
+  ByteView dst = im.px.writable_view();
+  im.touched();
+  if (dst.size() == uint64_t{im.w} * im.h * texel_bytes(im.info->store) && copy.owner->read_image(copy.handle, dst)) {
+    copy.synced = im.version();
+    copy.cleared = false;
+  } else {
+    hw_stats_.note("an image the device would not give back");
+    copy.synced = 0;
+  }
+}
+
+void GlContext::hw_sync_texture(Texture& t) {
+  if (objects_->hw_ahead <= 0) return;
+  for (const UniquePointer<Image>& im : t.images)
+    if (im) hw_sync_image(*im);
+}
+
+void GlContext::hw_sync_images() {
+  if (objects_->hw_ahead <= 0) return;
+  for (const UniquePointer<Texture>& t : objects_->textures)
+    if (t) hw_sync_texture(*t);
+  for (const UniquePointer<Renderbuffer>& rb : objects_->rbos)
+    if (rb) hw_sync_image(rb->image);
+}
+
+void GlContext::hw_sync_for_cpu_draw(const Target& target) {
+  if (objects_->hw_ahead <= 0) return;
+  hw_sync_target(target);
+  for (const TextureUnit& u : units_) {
+    const uint32_t names[] = {u.tex2d, u.cube, u.tex3d, u.array, u.tex1d, u.rect, u.array1d, u.cube_array, u.ms2d, u.ms2d_array};
+    for (uint32_t name : names)
+      if (Texture* t = name && name <= objects_->textures.count() ? objects_->textures[name - 1].get() : nullptr) hw_sync_texture(*t);
+  }
+}
+
+void GlContext::hw_sync_target(const Target& t) {
+  if (objects_->hw_ahead <= 0 || t.is_default) return;
+  for (Image* im : t.color)
+    if (im) hw_sync_image(*im);
+  if (t.depth) hw_sync_image(*t.depth);
+  if (t.stencil && t.stencil != t.depth) hw_sync_image(*t.stencil);
+}
+
+// The colour images of a framebuffer object as the device draws into them (fragment output n to image n, which hw_program's translation gives each draw buffer):
+// draw buffers 0 .. n-1 with an image each, none left out between, all 2D images (or one face of a cube) of one size. `masks`: the channels the device may write of
+// each (an 8-bit image without alpha keeps its alpha at 1).
+bool GlContext::hw_fbo_colors(const Target& t, uint32_t* count, const char** why) {
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < kMaxDrawBuffers; ++i)
+    if (t.color[i]) n = i + 1;
+  for (uint32_t i = 0; i < n; ++i) {
+    if (!t.color[i]) {
+      *why = "a draw buffer without an image between two with one";
+      return false;
+    }
+    if (t.color[i]->w != t.w || t.color[i]->h != t.h || t.color[i]->d != 1 || t.layer[i] != 0) {
+      *why = "framebuffer images of different sizes, or a layer of a texture";
+      return false;
+    }
+  }
+  *count = n;
+  return true;
+}
+
+namespace {
+uint8_t channels_kept(const Image& im) {
+  const uint32_t base = im.info->base;
+  return im.info->store == Store::U8x4 && (base == 0x1907 || base == 0x8227 || base == 0x1903) ? 7 : 15;
+}
+}  // namespace
+
+// A clear of a whole framebuffer object on the device: its colour images to the clear colour (every channel; one colour for all, as GL clears them), its depth to
+// the clear depth. The device copies are then newer than the pixels; a stencil plane (which the device never uses) is cleared on the CPU when the depth comes back,
+// or now. False: the CPU clears (after hw_sync_target).
+bool GlContext::hw_fbo_clear(uint32_t mask, const Target& t) {
+  IAccelerator* acc = accelerator();
+  if (!acc || acc->limits().image_colors == 0 || t.ss != 1 || t.layered || (desktop.active && desktop.per_buffer_masks)) return false;
+  const char* why = nullptr;
+  const bool color = (mask & 0x4000) != 0;
+  const bool depth = (mask & 0x100) != 0 && t.depth && dmask_;
+  const auto no = [&](const char* reason) {
+    hw_stats_.note(reason);
+    return false;
+  };
+  if (color && !(cmask_[0] && cmask_[1] && cmask_[2] && cmask_[3])) return no("a framebuffer object clear with a colour mask (on the CPU)");
+  uint32_t n = 0;
+  if (color && !hw_fbo_colors(t, &n, &why)) return no(why);
+  if (n > acc->limits().image_colors) return no("a framebuffer object clear of more draw buffers than the device has");
+  AccelAttachments att;
+  AccelImage* copies[kMaxDrawBuffers] = {};
+  float rgba[4] = {clear_color_[0], clear_color_[1], clear_color_[2], clear_color_[3]};
+  for (uint32_t i = 0; i < n; ++i) {
+    Image& im = *t.color[i];
+    AccelFormat f;
+    if (!hw_format(im, &f, &why) || f == AccelFormat::Depth || f == AccelFormat::DepthStencil) return no(why ? why : "a framebuffer object clear of an image format the device has not");
+    if (f == AccelFormat::Rgba8Srgb) return no("a framebuffer object clear of an sRGB image (on the CPU)");      // (the CPU encodes the clear colour itself: see clear())
+    if (channels_kept(im) != 15 && rgba[3] != 1.0f) {      // (an image without alpha keeps it at 1: only a clear colour with alpha 1 is the same for all)
+      bool all_without = true;
+      for (uint32_t k = 0; k < n; ++k) all_without = all_without && channels_kept(*t.color[k]) != 15;
+      if (!all_without) return no("a framebuffer object clear of images with and without alpha");
+      rgba[3] = 1.0f;
+    }
+    copies[i] = hw_image(im, f, &why);
+    if (!copies[i]) return no(why);
+    att.colors[i] = copies[i]->handle;
+  }
+  att.color_count = n;
+  AccelImage* dcopy = nullptr;
+  // the stencil plane: cleared on the device with the depth when the device has it (every bit written), else on the CPU
+  const bool stencil = (mask & 0x400) && t.stencil && t.stencil->info->store == Store::DepthStencil;
+  AccelFormat dformat = AccelFormat::Depth;
+  if (t.depth && !hw_format(*t.depth, &dformat, &why)) return no(why);
+  const bool device_stencil = stencil && t.stencil == t.depth && dformat == AccelFormat::DepthStencil && (swmask_[0] & 255) == 255;
+  if (depth || device_stencil) {
+    if (t.depth->w != t.w || t.depth->h != t.h || t.depth->d != 1 || t.depth_layer != 0) return no("framebuffer images of different sizes, or a layer of a texture");
+    dcopy = hw_image(*t.depth, dformat, &why);
+    if (!dcopy) return no(why);
+    att.depth = dcopy->handle;
+    if (device_stencil) att.stencil_clear = clear_stencil_ & 255;
+    // (a stencil clear alone leaves the depth as it is: a depth the device does not have stays out of date)
+    if (!depth && !hw_current(*t.depth, *dcopy)) return no("a stencil clear of a depth the device does not have");
+  }
+  if (!n && !dcopy) return no("a framebuffer object clear the device cannot do");
+  if (stencil && !device_stencil && dcopy) return no("a stencil clear with a write mask (on the CPU)");
+  const float d = clear_depth_ < 0 ? 0 : (clear_depth_ > 1 ? 1 : clear_depth_);
+  if (!acc->clear_images(att, n > 0, rgba, depth, d)) return no("the device failed a clear");
+  for (uint32_t i = 0; i < n; ++i) {
+    copies[i]->set_ahead(true);
+    copies[i]->cleared = false;
+  }
+  if (dcopy) {
+    // (a depth image the device has the only copy of: what the CPU would have, its clears, is remembered for hw_sync_image - after a device draw it is not
+    // whole any more)
+    const bool was_clears_only = !dcopy->ahead || dcopy->cleared;
+    dcopy->set_ahead(true);
+    dcopy->cpu_seen = 0;
+    if (depth) {
+      dcopy->depth_cleared = true;
+      dcopy->cleared_value = d;
+    }
+    if (device_stencil) dcopy->stencil_cleared = clear_stencil_ & 255;
+    // (clears only: a clear of all of it, or one on top of clears only - the part it leaves is still what the CPU has or what an earlier clear left)
+    const bool whole = depth && (dformat == AccelFormat::Depth || device_stencil);
+    dcopy->cleared = whole || was_clears_only;
+  }
+  if (stencil && !device_stencil) {      // (a device without the stencil plane: the stencil is the CPU's, but its image's version must not make the device depth look out of date)
+    Image& s = *t.stencil;
+    const uint32_t wm = swmask_[0] & 255;
+    for (uint32_t y = 0; y < s.h; ++y)
+      for (uint32_t x = 0; x < s.w; ++x) {
+        uint32_t raw[4];
+        read_texel(s, x, y, 0, raw);
+        raw[1] = (raw[1] & ~wm) | (static_cast<uint32_t>(clear_stencil_) & wm & 255);
+        write_texel(s, x, y, 0, raw);
+      }
+  }
+  ++hw_stats_.gpu_clears;
+  return true;
+}
+
+// A texture sampled with a mipmapped filter: one device image with its levels (from the base level up, as far as they are complete and the device takes them), each
+// written up when its pixels changed. Only 8-bit colour images have device mipmaps.
+bool GlContext::hw_mip_texture(Texture& t, const SamplerObj& so, uint32_t* handle, AccelSampler* sampler, const char** why) {
+  IAccelerator* acc = accelerator();
+  const auto no = [why](const char* reason) { *why = reason; return false; };
+  if (!acc || !acc->limits().mip_images) return no("a mipmapped texture filter");
+  const int32_t base = t.base_level < 0 ? 0 : t.base_level;
+  if (base >= static_cast<int32_t>(kMaxLevels) || static_cast<uint64_t>(base) >= t.images.count() || !t.images[static_cast<uint64_t>(base)]) return no("an incomplete texture");
+  Image& b = *t.images[static_cast<uint64_t>(base)];
+  AccelFormat f;
+  if (!hw_format(b, &f, why)) return false;
+  if (f != AccelFormat::Rgba8 && f != AccelFormat::Rgba8Srgb) return no("a mipmapped texture of a format the device has no mipmaps of");
+  if (b.d != 1 || b.ss != 1 || b.w > 8192 || b.h > 8192) return no("a texture larger than the device takes");
+  // the levels: base, base + 1 ... while each is half the one before (texture_complete checked them), up to max_level and the 1 x 1 level
+  const int32_t last = t.max_level < base ? base : (t.max_level > static_cast<int32_t>(kMaxLevels) - 1 ? static_cast<int32_t>(kMaxLevels) - 1 : t.max_level);
+  uint32_t levels = 1, w = b.w, h = b.h;
+  for (int32_t l = base + 1; l <= last && (w > 1 || h > 1); ++l) {
+    w = w > 1 ? w / 2 : 1;
+    h = h > 1 ? h / 2 : 1;
+    if (static_cast<uint64_t>(l) >= t.images.count() || !t.images[static_cast<uint64_t>(l)] || !t.images[static_cast<uint64_t>(l)]->defined()) break;
+    ++levels;
+  }
+  AccelImage* copy = t.hw_mips.get();
+  if (!copy || copy->owner != acc || copy->format != f || copy->w != b.w || copy->h != b.h || copy->levels != levels || t.hw_mip_base != base) {
+    t.hw_mips.reset();
+    const uint32_t made = acc->create_image(b.w, b.h, f, levels);
+    if (!made) return no("the device refused a mipmapped texture");
+    t.hw_mips = UniquePointer<AccelImage>::make(a_);
+    if (!t.hw_mips) {
+      acc->destroy_texture(made);
+      return no("out of memory");
+    }
+    copy = t.hw_mips.get();
+    copy->owner = acc;
+    copy->handle = made;
+    copy->format = f;
+    copy->w = b.w;
+    copy->h = b.h;
+    copy->levels = levels;
+    t.hw_mip_base = base;
+    for (uint64_t& v : t.hw_mip_versions) v = 0;
+  }
+  for (uint32_t k = 0; k < levels; ++k) {
+    Image& im = *t.images[static_cast<uint64_t>(base) + k];
+    hw_sync_image(im);      // (a level the device drew into comes back: the mipmapped copy is made from the pixels)
+    const uint64_t v = im.version();
+    if (t.hw_mip_versions[k] == v) continue;
+    if (im.info != b.info || !acc->write_image(copy->handle, k, im.px.view())) return no("the device refused a mipmapped texture");
+    t.hw_mip_versions[k] = v;
+  }
+  const bool nearest_within = so.min_filter == 0x2700 || so.min_filter == 0x2702;
+  const bool linear_mag = so.mag_filter == 0x2601;
+  if (nearest_within == linear_mag) return no("different filters within and between levels");      // (the device has one filter for both)
+  sampler->linear = linear_mag;
+  sampler->mip = so.min_filter == 0x2702 || so.min_filter == 0x2703 ? 2 : 1;
+  sampler->min_lod = so.min_lod < 0 ? 0 : so.min_lod;
+  sampler->max_lod = so.max_lod;
+  sampler->lod_bias = so.lod_bias + t.lod_bias;
+  *handle = copy->handle;
+  return true;
+}
+
+// A 3D, cube or 2D array texture as the device samples it (AccelLimits::layered_textures): one device texture of layers (Texture::hw_layers) holding the base level,
+// each layer written up when its pixels changed. The device's layered textures have one level: a mipmapped filter reads the base level with the filter it has within
+// a level. 8-bit colour only.
+bool GlContext::hw_layered_texture(const TgsiSampler& ts, uint32_t unit, uint32_t* handle, AccelSampler* sampler, const char** why) {
+  const auto no = [why](const char* reason) { *why = reason; return false; };
+  IAccelerator* acc = accelerator();
+  if (!acc || !acc->limits().layered_textures) return no("a 3D, cube or array texture on a device without them");
+  const TextureUnit& u = units_[unit];
+  const bool cube = ts.dim == shader::kDimCube, volume = ts.dim == shader::kDim3D;
+  const uint32_t name = cube ? u.cube : (volume ? u.tex3d : u.array);
+  const uint32_t target = cube ? 0x8513 : (volume ? 0x806F : 0x8C1A);
+  Texture* t = name && name <= objects_->textures.count() ? objects_->textures[name - 1].get() : nullptr;
+  if (!t || t->target != target) return no("a texture of a kind the device cannot sample");
+  SamplerObj so;
+  if (u.sampler && u.sampler <= objects_->samplers.count() && objects_->samplers[u.sampler - 1]) so = *objects_->samplers[u.sampler - 1];
+  else {
+    so.min_filter = t->min_filter;
+    so.mag_filter = t->mag_filter;
+    so.wrap_s = t->wrap_s;
+    so.wrap_t = t->wrap_t;
+    so.compare_mode = t->compare_mode;
+  }
+  if (t->swizzle[0] != 0x1903 || t->swizzle[1] != 0x1904 || t->swizzle[2] != 0x1905 || t->swizzle[3] != 0x1906) return no("a texture swizzle");
+  if (so.compare_mode != 0) return no("a texture comparison");
+  // (the filter within a level: a mipmapped one's NEAREST_MIPMAP_* / LINEAR_MIPMAP_* part)
+  const uint32_t within = so.min_filter == 0x2700 || so.min_filter == 0x2702 ? 0x2600 : (so.min_filter == 0x2701 || so.min_filter == 0x2703 ? 0x2601 : so.min_filter);
+  if (within != so.mag_filter || (within != 0x2600 && within != 0x2601)) return no("different filters for minification and magnification");
+  auto wrap = [](uint32_t mode, bool* repeat, bool* mirror) {
+    *repeat = mode == 0x2901 || mode == 0x8370;
+    *mirror = mode == 0x8370;
+    return mode == 0x2901 || mode == 0x812F || mode == 0x8370;
+  };
+  if (!wrap(so.wrap_s, &sampler->repeat_s, &sampler->mirror_s) || !wrap(so.wrap_t, &sampler->repeat_t, &sampler->mirror_t)) return no("a texture wrap mode");
+  sampler->linear = within == 0x2601;
+  sampler->mip = 0;
+  SamplerObj base_only = so;
+  base_only.min_filter = within;
+  bool is_cube;
+  if (!texture_complete(*t, base_only, &is_cube)) return no("an incomplete texture");
+  const int32_t base = t->base_level < 0 ? 0 : t->base_level;
+  if (base >= static_cast<int32_t>(kMaxLevels)) return no("an incomplete texture");
+  const uint32_t faces = cube ? 6 : 1;
+  Image* images[6] = {};
+  for (uint32_t f = 0; f < faces; ++f) {
+    const uint64_t at = uint64_t{f} * kMaxLevels + static_cast<uint32_t>(base);
+    if (at >= t->images.count() || !t->images[at] || !t->images[at]->defined()) return no("an incomplete texture");
+    images[f] = t->images[at].get();
+    const Image& im = *images[f];
+    if (im.info->store != Store::U8x4 || im.info->srgb || im.info->is_signed || im.ss != 1) return no("a 3D, cube or array texture of a format the device has not");
+    if (im.w > 8192 || im.h > 8192) return no("a texture larger than the device takes");
+  }
+  const Image& b = *images[0];
+  const uint32_t layers = cube ? 6 : b.d;
+  if (layers == 0 || layers > 256 || (!cube && b.d < 1)) return no("a texture of more layers than the device takes");
+  AccelImage* copy = t->hw_layers.get();
+  if (!copy || copy->owner != acc || copy->w != b.w || copy->h != b.h || copy->levels != layers || t->hw_layer_kind != ts.dim) {
+    t->hw_layers.reset();
+    const uint32_t made = acc->create_layered(b.w, b.h, layers, cube ? AccelKind::Cube : (volume ? AccelKind::Volume : AccelKind::Array));
+    if (!made) return no("the device refused a 3D, cube or array texture");
+    t->hw_layers = UniquePointer<AccelImage>::make(a_);
+    if (!t->hw_layers) {
+      acc->destroy_texture(made);
+      return no("out of memory");
+    }
+    copy = t->hw_layers.get();
+    copy->owner = acc;
+    copy->handle = made;
+    copy->w = b.w;
+    copy->h = b.h;
+    copy->levels = layers;      // (here: the layers)
+    t->hw_layer_kind = ts.dim;
+    for (uint64_t& v : t->hw_layer_versions) v = 0;
+  }
+  const uint64_t layer_bytes = uint64_t{b.w} * b.h * 4;
+  for (uint32_t f = 0; f < faces; ++f) {
+    Image& im = *images[f];
+    hw_sync_image(im);      // (a face a framebuffer object drew into comes back first)
+    const uint64_t v = im.version();
+    if (t->hw_layer_versions[f] == v) continue;
+    if (im.w != b.w || im.h != b.h) return no("an incomplete texture");
+    const ConstByteView px = im.px.view();
+    const uint32_t slices = cube ? 1 : layers;
+    if (px.size() != layer_bytes * slices) return no("an incomplete texture");
+    for (uint32_t k = 0; k < slices; ++k)
+      if (!acc->write_layer(copy->handle, cube ? f : k, px.subview(k * layer_bytes, layer_bytes))) return no("the device refused a 3D, cube or array texture");
+    t->hw_layer_versions[f] = v;
+  }
+  *handle = copy->handle;
+  return true;
+}
+
+// The texture bound to `unit` as the device can read sampler `ts`: a 2D (or 1D, rectangle) texture with a filter and wrap mode the device has. Its image goes to the
+// device as its copy there (Image::hw), which is what a framebuffer object drew into when it did (no CPU copy then); a mipmapped filter takes the texture's levels
+// (hw_mip_texture). A shadow sampler reads depth (a depth image the device drew into, or the CPU's depth sent as floats in R) with nearest filtering; the shader
+// filters and compares, by `params`: the sampler's four CONST rows, see TgsiSampler. False: the CPU samples it.
 bool GlContext::hw_texture(const TgsiSampler& ts, uint32_t unit, uint32_t* handle, AccelSampler* sampler, float params[16], const char** why) {
   const auto no = [why](const char* reason) { *why = reason; return false; };
-  // (a larger texture than the device can make is refused by create_texture, and the draw is then the CPU's; the cost of a large one is its upload and a hash of
-  // its texels at each use, far less than drawing with it on the CPU: Unigine Heaven's 2048-wide loading picture took 4 s a frame there)
+  // (a larger texture than the device can make is refused, and the draw is then the CPU's; the cost of a large one is its upload once, far less than drawing with it
+  // on the CPU: Unigine Heaven's 2048-wide loading picture took 4 s a frame there)
   constexpr uint32_t kMaxSide = 8192;
   if (unit >= kMaxTextureUnits) return no("a texture unit past the last");
+  if (ts.dim == shader::kDim3D || ts.dim == shader::kDimCube || ts.dim == shader::kDim2DArray) return hw_layered_texture(ts, unit, handle, sampler, why);
   const TextureUnit& u = units_[unit];
   const uint32_t name = ts.dim == shader::kDim1D ? u.tex1d : (ts.dim == shader::kDimRect ? u.rect : u.tex2d);
   const uint32_t target = ts.dim == shader::kDim1D ? 0x0DE0 : (ts.dim == shader::kDimRect ? 0x84F5 : 0x0DE1);
-  const Texture* t = texture_at(name);
+  Texture* t = name && name <= objects_->textures.count() ? objects_->textures[name - 1].get() : nullptr;      // (no hw_sync_texture: the device reads its copies)
   if (!t || t->target != target) return no("a texture of a kind the device cannot sample");
-  if (t->base_level != 0) return no("a texture with a base level");
   SamplerObj so;
   if (u.sampler && u.sampler <= objects_->samplers.count() && objects_->samplers[u.sampler - 1]) so = *objects_->samplers[u.sampler - 1];
   else {
@@ -69,23 +530,31 @@ bool GlContext::hw_texture(const TgsiSampler& ts, uint32_t unit, uint32_t* handl
     so.wrap_t = t->wrap_t;
     so.compare_mode = t->compare_mode;
     so.compare_func = t->compare_func;
+    so.min_lod = t->min_lod;
+    so.max_lod = t->max_lod;
+    so.lod_bias = t->lod_bias;
   }
+  if (t->swizzle[0] != 0x1903 || t->swizzle[1] != 0x1904 || t->swizzle[2] != 0x1905 || t->swizzle[3] != 0x1906) return no("a texture swizzle");
+  const bool mipmapped = so.min_filter >= 0x2700 && so.min_filter <= 0x2703;
   const bool nearest = so.min_filter == 0x2600 && so.mag_filter == 0x2600, linear = so.min_filter == 0x2601 && so.mag_filter == 0x2601;
-  if (!nearest && !linear) return no("a mipmapped texture filter");   // (a mipmapped minification filter, or different filters for the two)
-  auto wrap = [](uint32_t mode, bool* repeat) {
-    *repeat = mode == 0x2901;
-    return mode == 0x2901 || mode == 0x812F;
+  if (!mipmapped && !nearest && !linear) return no("different filters for minification and magnification");
+  auto wrap = [](uint32_t mode, bool* repeat, bool* mirror) {
+    *repeat = mode == 0x2901 || mode == 0x8370;
+    *mirror = mode == 0x8370;
+    return mode == 0x2901 || mode == 0x812F || mode == 0x8370;
   };
-  if (!wrap(so.wrap_s, &sampler->repeat_s) || !wrap(so.wrap_t, &sampler->repeat_t)) return no("a texture wrap mode");
+  if (!wrap(so.wrap_s, &sampler->repeat_s, &sampler->mirror_s) || !wrap(so.wrap_t, &sampler->repeat_t, &sampler->mirror_t)) return no("a texture wrap mode");
   if (!ts.shadow && so.compare_mode != 0) return no("a texture comparison");      // (a comparison through a sampler that is not a shadow one: the CPU's)
   if (ts.dim == shader::kDim1D) sampler->repeat_t = true;
   sampler->linear = linear && !ts.shadow;
   bool cube;
-  if (!texture_complete(*t, so, &cube) || t->images.count() == 0 || !t->images[0] || !t->images[0]->defined()) return no("an incomplete texture");
-  const Image& im = *t->images[0];
+  if (!texture_complete(*t, so, &cube) || t->images.count() == 0) return no("an incomplete texture");
+  const int32_t base = t->base_level < 0 ? 0 : t->base_level;
+  if (static_cast<uint64_t>(base) >= t->images.count() || !t->images[static_cast<uint64_t>(base)] || !t->images[static_cast<uint64_t>(base)]->defined()) return no("an incomplete texture");
+  Image& im = *t->images[static_cast<uint64_t>(base)];
   if (im.w > kMaxSide || im.h > kMaxSide) return no("a texture larger than the device takes");
   if (im.d != 1 || im.ss != 1) return no("a layered or multisampled texture");
-  IAccelerator* acc = hw_owner_;
+  IAccelerator* acc = accelerator();
   if (!acc) return no("no accelerator");
   if (ts.params >= 0) {
     for (uint32_t i = 0; i < 16; ++i) params[i] = 0;
@@ -95,7 +564,7 @@ bool GlContext::hw_texture(const TgsiSampler& ts, uint32_t unit, uint32_t* handl
     params[0] = bits & 1 ? 1.0f : 0.0f;
     params[1] = bits & 2 ? 1.0f : 0.0f;
     params[2] = bits & 4 ? 1.0f : 0.0f;
-    params[3] = linear ? 1.0f : 0.0f;
+    params[3] = linear || (mipmapped && so.mag_filter == 0x2601) ? 1.0f : 0.0f;
     // row 1: the size
     params[4] = static_cast<float>(im.w);
     params[5] = static_cast<float>(im.h);
@@ -106,13 +575,41 @@ bool GlContext::hw_texture(const TgsiSampler& ts, uint32_t unit, uint32_t* handl
     const uint32_t mode = t->depth_mode == 0x8049 ? 1 : (t->depth_mode == 0x1906 ? 2 : (t->depth_mode == 0x1903 ? 3 : 0));
     for (uint32_t i = 0; i < 8; ++i) params[8 + i] = m[mode][i];
   }
-  if (!ts.shadow) {
+  const bool depth_image = im.info->store == Store::Depth || im.info->store == Store::DepthStencil;
+  if (!ts.shadow && !depth_image && acc->limits().image_colors == 0) {
+    // (a device without images: a texture of 8-bit texels, sent again when they changed - the cache compares them)
+    if (mipmapped) return no("a mipmapped texture filter");
     if (im.info->store != Store::U8x4 || im.info->srgb || im.info->is_signed) return no("a texture format the device cannot sample");
+    if (sampler->mirror_s || sampler->mirror_t) return no("a texture wrap mode");
+    hw_sync_image(im);
     *handle = hw_textures_.get(*acc, name, im.w, im.h, im.px.view());
     return *handle != 0 || no("the device refused the texture");
   }
-  // a shadow sampler: the depth texels as floats
-  if ((im.info->store != Store::Depth && im.info->store != Store::DepthStencil) || !acc->limits().float_textures) return no("a shadow texture the device cannot sample");
+  if (!ts.shadow && !depth_image) {
+    if (mipmapped && !(im.hw && im.hw->ahead)) return hw_mip_texture(*t, so, handle, sampler, why);
+    // (a mipmapped filter on a texture the device drew into: its level 0 alone, which is what a framebuffer's picture sampled at its own size reads)
+    if (mipmapped) {
+      const bool nearest_within = so.min_filter == 0x2700 || so.min_filter == 0x2702;
+      sampler->linear = !nearest_within;
+    }
+    AccelFormat f;
+    if (!hw_format(im, &f, why)) return false;
+    AccelImage* copy = hw_image(im, f, why);
+    if (!copy) return false;
+    if (!hw_current(im, *copy)) return no("the device refused the texture");
+    *handle = copy->handle;
+    return true;
+  }
+  if (!depth_image) return no("a shadow sampler of a colour texture");
+  // A depth texture: its copy the device drew into, if it can sample that; else the CPU's depth as floats in R.
+  sampler->linear = false;
+  sampler->mip = 0;
+  if (im.hw && (im.hw->format == AccelFormat::Depth || im.hw->format == AccelFormat::DepthStencil) && im.hw->owner == acc && acc->limits().sampled_depth && (im.hw->ahead || im.hw->synced == im.version())) {
+    *handle = im.hw->handle;
+    return true;
+  }
+  if (!acc->limits().float_textures) return no("a depth texture the device cannot sample");
+  if (im.hw && im.hw->ahead) hw_sync_image(im);
   ByteBuffer floats(a_);
   for (uint32_t y = 0; y < im.h; ++y)
     for (uint32_t x = 0; x < im.w; ++x) {
@@ -299,7 +796,12 @@ bool GlContext::hw_program(ProgramObj& p, IAccelerator& acc) {
   limits.varyings = al.varyings;
   limits.control_varyings = al.control_varyings;
   limits.samplers = al.textures;
+  limits.colors = al.image_colors ? al.image_colors : 1;
   TgsiStages stages;
+  List<TgsiOutput> outputs(a_);
+  for (const ProgramObj::Output& o : p.outputs)
+    if (!outputs.push_back(TgsiOutput{o.slot, o.location})) return false;
+  stages.outputs = outputs.view();
   stages.gs = p.extra[kStageGeometry] ? p.extra[kStageGeometry]->module.get() : nullptr;
   stages.tcs = p.extra[kStageTessControl] ? p.extra[kStageTessControl]->module.get() : nullptr;
   stages.tes = tess ? p.extra[kStageTessEval]->module.get() : nullptr;
@@ -309,7 +811,30 @@ bool GlContext::hw_program(ProgramObj& p, IAccelerator& acc) {
     p.accel_why = "geometry or tessellation shaders on a device without them";
     return false;
   }
-  if (!translate_program_to_tgsi(a_, *p.vsm, *p.fsm, stages, links.view(), t.get(), &p.accel_why, limits)) return false;
+  if (!translate_program_to_tgsi(a_, *p.vsm, *p.fsm, stages, links.view(), t.get(), &p.accel_why, limits)) {
+    // (the first few programs the device refuses: why, and the source line it was at, for the log - see set_accelerator_log)
+    if (accelerator_log() && hw_logged_ < kMaxLoggedPrograms && t->fail_line) {
+      ++hw_logged_;
+      static constexpr uint32_t kTypes[5] = {0x8B31, 0x8B30, 0x8DD9, 0x8E88, 0x8E87};      // (vertex, fragment, geometry, control, evaluation)
+      const ShaderObj* so = t->fail_stage < 5 ? shader_at(p.first_of(kTypes[t->fail_stage])) : nullptr;
+      StringView line;
+      if (so) {
+        const StringView src = so->source.view();
+        uint32_t at = 1;
+        uint64_t start = 0;
+        for (uint64_t i = 0; i < src.size() && at < t->fail_line; ++i)
+          if (src[i] == '\n') {
+            ++at;
+            start = i + 1;
+          }
+        uint64_t end = start;
+        while (end < src.size() && src[end] != '\n') ++end;
+        if (at == t->fail_line) line = src.substr(start, end - start < 200 ? end - start : 200);
+      }
+      accelerator_log()(p.accel_why ? p.accel_why : "refused", t->fail_stage, t->fail_line, line);
+    }
+    return false;
+  }
   p.accel_why = "the device refused the shaders";
   AccelStages as;
   as.gs = t->gs.size() ? t->gs.c_str() : nullptr;
@@ -350,9 +875,17 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
   const auto no = [why](const char* reason) { *why = reason; return false; };
   IAccelerator* acc = accelerator();
   if (!acc) return no("no accelerator");
-  if (!target.is_default || draw_fb_ != 0) return no("a framebuffer object");
-  if (!default_draw_back_ || target.color[0] != dcolor_ || target.color_count != 1 || !dcolor_->defined() || desktop.front_also) return no("not one default colour buffer");
-  if (instances != 1) return no("instancing");
+  // The default framebuffer's picture (hw_target_), or a framebuffer object's images (their device copies, Image::hw).
+  const bool fbo = !target.is_default;
+  if (!fbo && (draw_fb_ != 0 || !default_draw_back_ || target.color[0] != dcolor_ || target.color_count != 1 || !dcolor_->defined() || desktop.front_also))
+    return no("not one default colour buffer");
+  if (fbo) {
+    if (acc->limits().image_colors == 0) return no("framebuffer objects on a device without images");
+    if (target.ss != 1) return no("a multisampled framebuffer object");
+    if (target.layered) return no("a layered framebuffer object");
+  }
+  if (instances < 1) return no("instancing");
+  if (instances != 1 && !acc->limits().instancing) return no("instancing");
   const AccelLimits limits = acc->limits();
   // What the rasterizer gets: the last stage's primitives (the geometry shader's, the tessellator's, or the draw's own).
   const ExtraStage* gs = p.extra[kStageGeometry].get();
@@ -385,51 +918,26 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
     if (desktop.logic_op && desktop.logic_mode != 0x1503) return no("a logic op");
     if (desktop.polygon_stipple && !lines && !points) return no("polygon stipple");
     if (desktop.depth_clamp) return no("depth clamp");
-    if (desktop.per_buffer_masks || desktop.per_buffer_blend) return no("per-buffer blending or masks");
+    if ((desktop.per_buffer_masks || desktop.per_buffer_blend) && !(limits.independent_blend && limits.blend_state)) return no("per-buffer blending or masks");
   }
-  if (stencil_test_) return no("the stencil test");
-  if (offset_fill_ || (desktop.active && (desktop.offset_line || desktop.offset_point))) return no("polygon offset");
+  if (stencil_test_ && (!fbo || !limits.stencil)) return no("the stencil test");
+  const uint8_t bias_modes = static_cast<uint8_t>((offset_fill_ ? 1 : 0) | (desktop.active && desktop.offset_line ? 2 : 0) | (desktop.active && desktop.offset_point ? 4 : 0));
+  if (bias_modes && !limits.depth_bias) return no("polygon offset");
   if (alpha_to_coverage_ || sample_coverage_en_) return no("sample coverage");
   const uint8_t color_mask = static_cast<uint8_t>((cmask_[0] ? 1 : 0) | (cmask_[1] ? 2 : 0) | (cmask_[2] ? 4 : 0) | (cmask_[3] ? 8 : 0));
-  const bool depth = ddepth_->defined();
+  const bool depth = fbo ? target.depth != nullptr : ddepth_->defined();
   const bool depth_test = depth_test_ && depth;
+  const bool dst_alpha = fbo || attrs_.alpha;      // (a framebuffer object's images without alpha read it as 1, as the device's do: see channels_kept)
   // Blending, the colour mask and the depth function: the device's own state when it has it; else only source over destination, every channel and LEQUAL
   // (LESS is taken as LEQUAL: they differ only for equal depths).
   bool custom = false;
   uint8_t factors[4] = {1, 0, 1, 0}, ops[2] = {0, 0};
   if (limits.blend_state) {
-    // GL's factors and equations as the device's (graphics::BlendFactor / BlendOp numbers); a constant colour has no device factor
-    const auto factor = [](uint32_t f, uint8_t* out) {
-      switch (f) {
-        case 0: *out = 0; return true;
-        case 1: *out = 1; return true;
-        case 0x0300: *out = 2; return true;
-        case 0x0301: *out = 3; return true;
-        case 0x0302: *out = 4; return true;
-        case 0x0303: *out = 5; return true;
-        case 0x0306: *out = 6; return true;
-        case 0x0307: *out = 7; return true;
-        case 0x0304: *out = 8; return true;
-        case 0x0305: *out = 9; return true;
-        case 0x0308: *out = 10; return true;
-        default: return false;
-      }
-    };
-    const auto equation = [](uint32_t e, uint8_t* out) {
-      switch (e) {
-        case 0x8006: *out = 0; return true;
-        case 0x800A: *out = 1; return true;
-        case 0x800B: *out = 2; return true;
-        case 0x8007: *out = 3; return true;
-        case 0x8008: *out = 4; return true;
-        default: return false;
-      }
-    };
     if (blend_) {
       if (!factor(blend_sr_, &factors[0]) || !factor(blend_dr_, &factors[1]) || !factor(blend_sa_, &factors[2]) || !factor(blend_da_, &factors[3])) return no("a blend factor");
       if (!equation(blend_eq_rgb_, &ops[0]) || !equation(blend_eq_a_, &ops[1])) return no("a blend equation");
       // (a drawing buffer without alpha reads its alpha as 1: the device's image keeps whatever was written there)
-      if (!attrs_.alpha)
+      if (!dst_alpha)
         for (uint8_t f : factors) if (f == 8 || f == 9 || f == 10) return no("a destination alpha factor without alpha");
     }
     custom = true;
@@ -440,21 +948,64 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
       const bool add = blend_eq_rgb_ == 0x8006 && blend_eq_a_ == 0x8006;
       const bool over = blend_sr_ == 0x0302 && blend_dr_ == 0x0303;
       const bool alpha_same = blend_sa_ == blend_sr_ && blend_da_ == blend_dr_;
-      if (!add || !over || (attrs_.alpha && !alpha_same)) return no("a blend function");
+      if (!add || !over || (dst_alpha && !alpha_same)) return no("a blend function");
     }
   }
   if (!hw_program(p, *acc) || !p.tgsi) return no(p.accel_why ? p.accel_why : "the shaders");
-  if (!hw_target(acc)) return no("no device target");
-  // A device picture that is out of date is written up from the CPU's before the draw (hw_upload), but not its depth: a draw with the depth test then stays here.
-  if (depth_test && (!hw_valid_ || hw_depth_stale_)) return no(hw_valid_ ? "the device depth is out of date" : "the device picture is out of date");
-  if (!hw_valid_ && !acc->limits().color_upload) return no("the device picture is out of date");
   const TgsiProgram& t = *p.tgsi;
+  AccelAttachments att;
+  AccelImage* copies[kMaxDrawBuffers] = {};
+  AccelImage* dcopy = nullptr;
+  if (!fbo) {
+    if (!hw_target(acc)) return no("no device target");
+    // A device picture that is out of date is written up from the CPU's before the draw (hw_upload), but not its depth: a draw with the depth test then stays here.
+    if (depth_test && (!hw_valid_ || hw_depth_stale_)) return no(hw_valid_ ? "the device depth is out of date" : "the device picture is out of date");
+    if (!hw_valid_ && !acc->limits().color_upload) return no("the device picture is out of date");
+  } else {
+    // A framebuffer object: its images' device copies, made or brought up to date (a colour image's pixels are written up when they are newer; a depth image's
+    // cannot be, and a draw that needs the depth then stays here until the device clears it).
+    uint32_t n = 0;
+    if (!hw_fbo_colors(target, &n, why)) return false;
+    if (n > acc->limits().image_colors) return no("more draw buffers than the device has");
+    if (p.frag_writes_all && n > 1) return no("gl_FragColor into several draw buffers");
+    for (uint32_t i = 0; i < n; ++i) {
+      Image& im = *target.color[i];
+      AccelFormat f;
+      if (!hw_format(im, &f, why)) return false;
+      if (f == AccelFormat::Depth || f == AccelFormat::DepthStencil) return no("an image format the device does not have");
+      if (channels_kept(im) != 15) return no("a colour image without alpha");      // (its alpha must stay 1: a mask per image the state here does not have yet)
+      copies[i] = hw_image(im, f, why);
+      if (!copies[i]) return false;
+      if (!hw_current(im, *copies[i])) return no("the device refused an image");
+      att.colors[i] = copies[i]->handle;
+    }
+    att.color_count = n;
+    if (depth && (depth_test || dmask_ || stencil_test_)) {
+      Image& dim = *target.depth;
+      if (dim.w != target.w || dim.h != target.h || dim.d != 1 || target.depth_layer != 0) return no("framebuffer images of different sizes, or a layer of a texture");
+      AccelFormat dformat;
+      if (!hw_format(dim, &dformat, why)) return false;
+      if (stencil_test_ && (dformat != AccelFormat::DepthStencil || target.stencil != target.depth)) return no("the stencil test");
+      dcopy = hw_image(dim, dformat, why);
+      if (!dcopy) return false;
+      if (!hw_current(dim, *dcopy)) {
+        if (depth_test || stencil_test_) return no("the device depth is out of date");
+        dcopy = nullptr;      // (no test: drawn without the depth, which stays out of date on the device until it is cleared there)
+      } else {
+        att.depth = dcopy->handle;
+      }
+    }
+    if (n == 0 && !dcopy) return no("a framebuffer object without images the draw writes");
+    if (n == 0 && !custom) return no("a depth-only draw on a device without a colour mask");
+  }
   if (t.no_color && !custom) return no("a fragment shader without a color output");      // (its draws mask every channel: the device's colour mask)
   if (t.uses_frag_coord && target.ss != 1) return no("gl_FragCoord on an antialiased drawing buffer");
+  if (fbo && t.color_outputs > att.color_count && att.color_count) {}      // (outputs past the images: the device drops them, as GL does)
 
   // the attributes of the translated shader, in the order of its IN[] registers
   Vao* vao = current_vao_ptr();
   const VertexAttrib* attribs[kTgsiMaxAttributes] = {};
+  uint32_t instanced = 0;      // (bit k: IN[k] steps per instance)
   const uint32_t nattr = static_cast<uint32_t>(t.attributes.count());
   if (nattr == 0 || nattr > kTgsiMaxAttributes) return no("the number of attributes");
   for (uint32_t k = 0; k < nattr; ++k) {
@@ -465,7 +1016,10 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
     // (the fixed-function arrays of desktop GL are the slots past kMaxAttribs)
     if (!info || info->location < 0 || static_cast<uint32_t>(info->location) >= (desktop.active ? kMaxAttribSlots : kMaxAttribs)) return no("an attribute location");
     attribs[k] = &vao->attribs[info->location];
-    if (attribs[k]->divisor) return no("an instanced attribute");
+    if (attribs[k]->divisor && attribs[k]->enabled) {      // (a per-instance array: its values follow the vertices, one per instance - see below)
+      if (!limits.instancing) return no("an instanced attribute");
+      instanced |= 1u << k;
+    }
   }
 
   // the primitives of the draw, as a list of vertex indices (the primitive modes and restart markers of the software path)
@@ -558,42 +1112,55 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
   if (!ok) return no("too many vertices");
   if (tris.count() == 0) return true;
 
-  // vertex data: four floats per attribute per vertex
+  // vertex data: four floats per attribute per vertex (IN[] order, the per-instance ones left out), then four per per-instance attribute per instance
   ByteBuffer vertices(a_);
+  const auto put_attribute = [&](uint32_t k, uint32_t index) {
+    if (!attribs[k]) {
+      const uint32_t x = t.attributes[k].slot == kTgsiVertexId ? f2u(static_cast<float>(index)) : 0;
+      return vertices.put32(x) && vertices.put32(0) && vertices.put32(0) && vertices.put32(0);
+    }
+    const VertexAttrib& at = *attribs[k];
+    uint32_t lanes[4];
+    if (at.enabled) {
+      const Buffer* b = buffer_at(at.buffer);
+      const uint32_t esize = vertex_attrib_element_bytes(at);
+      const uint32_t stride = at.stride ? at.stride : esize;
+      if (!b || at.offset + uint64_t{index} * stride + esize > b->data.size()) {
+        *why = "an attribute past its buffer";
+        return false;
+      }
+      if (t.attributes[k].convert == kTgsiAsIs) {
+        read_vertex_attrib(at, b->data.view().data() + at.offset + uint64_t{index} * stride, lanes);
+      } else {      // an integer input: read as the CPU reads it (integers), sent as their float values
+        read_vertex_attrib_int(at, b->data.view().data() + at.offset + uint64_t{index} * stride, lanes);
+        for (uint32_t l : lanes)
+          if (t.attributes[k].convert == kTgsiFromUint ? l > kExactInt : !exact_int(static_cast<int32_t>(l))) {
+            *why = "an integer the device cannot hold exactly";
+            return false;
+          }
+        for (uint32_t& l : lanes) l = f2u(t.attributes[k].convert == kTgsiFromUint ? static_cast<float>(l) : static_cast<float>(static_cast<int32_t>(l)));
+      }
+    } else if (t.attributes[k].convert != kTgsiAsIs) {
+      for (int i = 0; i < 4; ++i) lanes[i] = f2u(static_cast<float>(at.cur_is_int ? at.cur_i[i] : static_cast<int32_t>(at.cur_f[i])));
+    } else {
+      for (int i = 0; i < 4; ++i) lanes[i] = f2u(at.cur_is_int ? static_cast<float>(at.cur_i[i]) : at.cur_f[i]);
+    }
+    for (uint32_t i = 0; i < 4; ++i)
+      if (!vertices.put32(lanes[i])) {
+        *why = "out of memory";
+        return false;
+      }
+    return true;
+  };
+  if (instanced && instanced == (nattr >= 32 ? ~0u : (1u << nattr) - 1u)) return no("an instanced draw without a per-vertex attribute");
   for (uint64_t v = 0; v < tris.count(); ++v) {
     const uint32_t index = static_cast<uint32_t>(tris[v]);
-    for (uint32_t k = 0; k < nattr; ++k) {
-      if (!attribs[k]) {
-        const uint32_t x = t.attributes[k].slot == kTgsiVertexId ? f2u(static_cast<float>(index)) : 0;
-        if (!vertices.put32(x)) return no("out of memory");
-        for (uint32_t i = 1; i < 4; ++i)
-          if (!vertices.put32(0)) return no("out of memory");
-        continue;
-      }
-      const VertexAttrib& at = *attribs[k];
-      uint32_t lanes[4];
-      if (at.enabled) {
-        const Buffer* b = buffer_at(at.buffer);
-        const uint32_t esize = vertex_attrib_element_bytes(at);
-        const uint32_t stride = at.stride ? at.stride : esize;
-        if (!b || at.offset + uint64_t{index} * stride + esize > b->data.size()) return no("an attribute past its buffer");
-        if (t.attributes[k].convert == kTgsiAsIs) {
-          read_vertex_attrib(at, b->data.view().data() + at.offset + uint64_t{index} * stride, lanes);
-        } else {      // an integer input: read as the CPU reads it (integers), sent as their float values
-          read_vertex_attrib_int(at, b->data.view().data() + at.offset + uint64_t{index} * stride, lanes);
-          for (uint32_t l : lanes)
-            if (t.attributes[k].convert == kTgsiFromUint ? l > kExactInt : !exact_int(static_cast<int32_t>(l))) return no("an integer the device cannot hold exactly");
-          for (uint32_t& l : lanes) l = f2u(t.attributes[k].convert == kTgsiFromUint ? static_cast<float>(l) : static_cast<float>(static_cast<int32_t>(l)));
-        }
-      } else if (t.attributes[k].convert != kTgsiAsIs) {
-        for (int i = 0; i < 4; ++i) lanes[i] = f2u(static_cast<float>(at.cur_is_int ? at.cur_i[i] : static_cast<int32_t>(at.cur_f[i])));
-      } else {
-        for (int i = 0; i < 4; ++i) lanes[i] = f2u(at.cur_is_int ? static_cast<float>(at.cur_i[i]) : at.cur_f[i]);
-      }
-      for (uint32_t i = 0; i < 4; ++i)
-        if (!vertices.put32(lanes[i])) return no("out of memory");
-    }
+    for (uint32_t k = 0; k < nattr; ++k)
+      if (!(instanced & (1u << k)) && !put_attribute(k, index)) return false;
   }
+  for (uint32_t i = 0; instanced && i < static_cast<uint32_t>(instances); ++i)      // (the element of instance i: i / divisor, after the base instance)
+    for (uint32_t k = 0; k < nattr; ++k)
+      if ((instanced & (1u << k)) && !put_attribute(k, i / attribs[k]->divisor + desktop.base_instance)) return false;
 
   // uniforms: the CONST rows
   ByteBuffer constants(a_);
@@ -674,8 +1241,39 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
   st.front_ccw = front_face_ == 0x0901;
   st.depth_test = depth_test;
   st.depth_write = dmask_ && depth;
+  if (fbo && !dcopy) st.depth_test = st.depth_write = false;
+  // the stencil test (a framebuffer object's depth-stencil image on the device: one state for both faces)
+  bool stencil_writes = false;
+  if (stencil_test_) {
+    static constexpr uint32_t kOps[8] = {0x1E00, 0, 0x1E01, 0x1E02, 0x1E03, 0x150A, 0x8507, 0x8508};      // (KEEP ZERO REPLACE INCR DECR INVERT INCR_WRAP DECR_WRAP)
+    const auto op = [](uint32_t gl, uint8_t* out) {
+      for (uint8_t k = 0; k < 8; ++k)
+        if (kOps[k] == gl) {
+          *out = k;
+          return true;
+        }
+      return false;
+    };
+    if (sfunc_[0] != sfunc_[1] || sref_[0] != sref_[1] || (smask_[0] & 255) != (smask_[1] & 255) || sfail_[0] != sfail_[1] || sdpfail_[0] != sdpfail_[1] ||
+        sdppass_[0] != sdppass_[1] || (swmask_[0] & 255) != (swmask_[1] & 255))
+      return no("a stencil test of two faces");
+    st.stencil_test = true;
+    st.stencil_compare = static_cast<uint8_t>(sfunc_[0] >= 0x0200 && sfunc_[0] <= 0x0207 ? sfunc_[0] - 0x0200 : 7);
+    if (!op(sfail_[0], &st.stencil_fail) || !op(sdpfail_[0], &st.stencil_depth_fail) || !op(sdppass_[0], &st.stencil_pass)) return no("a stencil operation");
+    st.stencil_reference = static_cast<uint8_t>(sref_[0] < 0 ? 0 : (sref_[0] > 255 ? 255 : sref_[0]));
+    st.stencil_read_mask = static_cast<uint8_t>(smask_[0] & 255);
+    st.stencil_write_mask = static_cast<uint8_t>(swmask_[0] & 255);
+    stencil_writes = st.stencil_write_mask && (st.stencil_fail || st.stencil_depth_fail || st.stencil_pass);
+  }
   st.blend = blend_;
   st.topology = topology;
+  st.instances = static_cast<uint32_t>(instances);
+  if (bias_modes && (po_factor_ != 0 || po_units_ != 0)) {
+    st.depth_bias_modes = bias_modes;
+    st.depth_bias_factor = po_factor_;
+    st.depth_bias_units = po_units_;
+  }
+  st.instanced = instanced;
   st.patch_vertices = topology == 3 ? desktop.patch_vertices : 0;
   st.clip_mask = desktop.active ? static_cast<uint8_t>(desktop.clip_mask) : 0;
   if (lines || points) st.cull = 0;      // (only polygons are culled)
@@ -687,8 +1285,51 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
     st.dst_alpha = factors[3];
     st.op_rgb = ops[0];
     st.op_alpha = ops[1];
-    st.color_mask = t.no_color ? 0 : color_mask;
+    st.color_mask = t.no_color || (fbo && att.color_count == 0) ? 0 : color_mask;
     st.depth_compare = static_cast<uint8_t>(dfunc_ >= 0x0200 && dfunc_ <= 0x0207 ? dfunc_ - 0x0200 : 3);
+  }
+  // glBlendFunci / glColorMaski / glEnablei(GL_BLEND, i): each colour image's own blending and mask (AccelState::per_target)
+  if (desktop.active && (desktop.per_buffer_masks || desktop.per_buffer_blend)) {
+    const uint32_t n = fbo ? att.color_count : 1;
+    st.per_target = true;
+    for (uint32_t i = 0; i < n && i < kAccelMaxColors; ++i) {
+      AccelState::TargetBlend& tb = st.targets[i];
+      const DesktopState::BufferBlend& bb = desktop.blend[i];
+      tb.blend = desktop.per_buffer_blend ? bb.enabled : blend_;
+      const uint32_t sr = desktop.per_buffer_blend ? bb.sr : blend_sr_, dr = desktop.per_buffer_blend ? bb.dr : blend_dr_;
+      const uint32_t sa = desktop.per_buffer_blend ? bb.sa : blend_sa_, da = desktop.per_buffer_blend ? bb.da : blend_da_;
+      const uint32_t er = desktop.per_buffer_blend ? bb.eq_rgb : blend_eq_rgb_, ea = desktop.per_buffer_blend ? bb.eq_a : blend_eq_a_;
+      if (tb.blend) {
+        if (!factor(sr, &tb.src_rgb) || !factor(dr, &tb.dst_rgb) || !factor(sa, &tb.src_alpha) || !factor(da, &tb.dst_alpha)) return no("a blend factor");
+        if (!equation(er, &tb.op_rgb) || !equation(ea, &tb.op_alpha)) return no("a blend equation");
+      }
+      tb.color_mask = t.no_color ? 0 : (desktop.per_buffer_masks ? static_cast<uint8_t>(desktop.color_mask[i] & 15) : color_mask);
+    }
+    // (target 0 is also the pipeline's own state)
+    st.blend = st.targets[0].blend;
+    st.src_rgb = st.targets[0].src_rgb;
+    st.dst_rgb = st.targets[0].dst_rgb;
+    st.src_alpha = st.targets[0].src_alpha;
+    st.dst_alpha = st.targets[0].dst_alpha;
+    st.op_rgb = st.targets[0].op_rgb;
+    st.op_alpha = st.targets[0].op_alpha;
+    st.color_mask = st.targets[0].color_mask;
+  }
+  if (fbo) {
+    // (a draw that samples one of its own images is the CPU's: the device refuses it, and nothing is drawn)
+    for (uint32_t k = 0; k < st.texture_count; ++k) {
+      for (uint32_t i = 0; i < att.color_count; ++i)
+        if (st.textures[k] == att.colors[i]) return no("a texture the draw also renders into");
+      if (dcopy && st.textures[k] == att.depth) return no("a texture the draw also renders into");
+    }
+    if (!acc->draw_images(att, p.accel_program, st, vertices.view(), static_cast<uint32_t>(tris.count()), constants.view())) return no("the device failed the draw");
+    for (uint32_t i = 0; i < att.color_count; ++i) copies[i]->set_ahead(true);
+    if (dcopy && (st.depth_write || stencil_writes)) {
+      dcopy->set_ahead(true);
+      dcopy->cleared = false;
+    }
+    ++version_;
+    return true;
   }
   if (!hw_valid_ && !hw_upload(acc)) return no("the device picture is out of date");
   if (!acc->draw(hw_target_, p.accel_program, st, vertices.view(), static_cast<uint32_t>(tris.count()), constants.view())) {

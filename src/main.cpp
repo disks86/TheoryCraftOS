@@ -1003,10 +1003,14 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
   opengl::install_linux_gl(system_gl);
   media::install_windows_cabinet();      // (cabinet.dll's FDI reaches the cabinet reader with NtTcosCabinet)
   desktop::install_linux_builtin_shell();      // (the Linux tree's /bin/sh: launcher scripts run by the OS's own shell)
-  system_gl.set_report([](uint64_t pid, const webgl::GlContext::HardwareStats& stats) {
-    Entry(Level::Info, "OpenGL").text("process ").dec(pid).text(": ").dec(stats.gpu_draws).text(" draws on the GPU, ").dec(stats.cpu_draws).text(" on the CPU");
+  webgl::set_accelerator_log([](const char* why, uint32_t stage, uint32_t line, StringView text) {
+    Entry(Level::Info, "OpenGL").text("the device refused a program: ").text(why).text(" (stage ").dec(stage).text(", line ").dec(line).text(")");
+    if (!text.empty()) Entry(Level::Info, "OpenGL").text("  ").text(text);
+  });
+  system_gl.set_report([](uint64_t pid, const webgl::GlContext::HardwareStats& stats, const char* what) {
+    Entry(Level::Info, "OpenGL").text("process ").dec(pid).text(": ").text(what).dec(stats.gpu_draws).text(" draws on the GPU, ").dec(stats.cpu_draws).text(" on the CPU, ").dec(stats.gpu_clears).text(" framebuffer object clears on the GPU");
     for (const auto& r : stats.reasons)      // (a line each: a log entry has a length)
-      if (r.why) Entry(Level::Info, "OpenGL").text("process ").dec(pid).text(": ").dec(r.count).text(" because of ").text(r.why);
+      if (r.why) Entry(Level::Info, "OpenGL").text("process ").dec(pid).text(": ").text(what).dec(r.count).text(" because of ").text(r.why);
   });
   process::win32k::register_process_exit_hook([](uint64_t pid) { if (opengl::GlService* gl = opengl::system_gl()) gl->process_exited(pid); });
   // What each accelerated GPU really does with Direct3D 9 / 10 / 11 programs, against the CPU renderer (dxgk::run_conformance): the verdicts are in the log.

@@ -21,6 +21,7 @@
 namespace webgl {
 namespace {
 IAccelerator* g_accelerator = nullptr;
+AcceleratorLog g_log = nullptr;
 }
 
 uint32_t AccelTextureCache::get(IAccelerator& acc, uint64_t key, uint32_t w, uint32_t h, ConstByteView rgba, bool floats) {
@@ -79,5 +80,7 @@ void AccelTextureCache::release(IAccelerator& acc) {
 
 void set_accelerator(IAccelerator* accelerator) { g_accelerator = accelerator; }
 IAccelerator* accelerator() { return g_accelerator; }
+void set_accelerator_log(AcceleratorLog log) { g_log = log; }
+AcceleratorLog accelerator_log() { return g_log; }
 
 }  // namespace webgl

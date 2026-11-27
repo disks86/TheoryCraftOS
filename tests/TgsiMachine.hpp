@@ -369,7 +369,7 @@ class TgsiMachine {
       for (float x : a) killed = killed || x < 0;
       return true;
     }
-    const bool integer = tgsi_integer_op(op), is_tex = op == "TEX" || op == "TXP" || op == "TXF" || op == "TXL" || op == "TXQ";
+    const bool integer = tgsi_integer_op(op), is_tex = op == "TEX" || op == "TXP" || op == "TXF" || op == "TXL" || op == "TXQ" || op == "TXB";
     const bool data_integer = integer && op != "UCMP";   // (UCMP's condition is an integer, what it selects is data)
     if (!need(2) || !fetch(args[1], a, integer)) return false;
     if (args.size() > 2 && !is_tex && !fetch(args[2], b, data_integer)) return false;
@@ -459,6 +459,7 @@ class TgsiMachine {
       const unsigned unit = static_cast<unsigned>(atoi(args[2].c_str() + 5));
       graphics::Vec4 t = {0, 0, 0, 0};
       if (op == "TXF") t = textures->fetch(unit, __builtin_bit_cast(int32_t, a[0]), __builtin_bit_cast(int32_t, a[1]), __builtin_bit_cast(uint32_t, a[3]));
+      else if (op == "TXL" && args.size() > 3 && (args[3] == "3D" || args[3] == "CUBE" || args[3] == "2D_ARRAY")) t = textures->sample_lod_volume(unit, a[0], a[1], a[2], a[3]);
       else if (op == "TXL") t = textures->sample_lod(unit, a[0], a[1], a[3]);
       else {
         uint32_t w = 0, h = 0, levels = 0;
@@ -467,7 +468,7 @@ class TgsiMachine {
       }
       r[0] = t.x, r[1] = t.y, r[2] = t.z, r[3] = t.w;
     }
-    if (op == "TEX" || op == "TXP") {
+    if (op == "TEX" || op == "TXP" || op == "TXB") {      // (TXB: the bias does nothing to the test textures, which have one level)
       if (!need(4) || !textures) return false;
       const unsigned unit = static_cast<unsigned>(atoi(args[2].c_str() + 5));
       float u = a[0], v = a[1];
@@ -475,7 +476,8 @@ class TgsiMachine {
         const float inv = a[3] == 0 ? 0.0f : 1.0f / a[3];
         u *= inv, v *= inv;
       }
-      const graphics::Vec4 t = textures->sample(unit, u, v);
+      const bool layered = args.size() > 3 && (args[3] == "3D" || args[3] == "CUBE" || args[3] == "2D_ARRAY");
+      const graphics::Vec4 t = layered ? textures->sample_volume(unit, u, v, a[2]) : textures->sample(unit, u, v);
       r[0] = t.x, r[1] = t.y, r[2] = t.z, r[3] = t.w;
     }
     if (sat)

@@ -1389,15 +1389,16 @@ class VirglPipeline final : public VirglPipelineBase {
     const bool quad_lines = desc.line_mode == LineMode::QuadrilateralWide || desc.line_mode == LineMode::QuadrilateralNarrow;
     const bool offset = desc.depth_bias.enabled() && !desc.depth_bias.unorm_bits;   // (a normalised format's bias is the fragment shader's)
     cmd[n++] = (gl_text ? 0u : 1u << 4) /*flatshade first*/ | (desc.depth_clip ? 1u << 1 : 0u) /*depth clip*/ | (1u << 2) /*clip half z*/ | (desc.stream_output_count && desc.rasterized_stream < 0 ? 1u << 3 : 0u) /*rasterizer discard*/ | (cull << 8) |
-               (fill << 10) | (fill << 12) /*fill front, back*/ | (1u << 14) /*scissor*/ | ((front_ccw ? 1u : 0u) << 15) | (offset ? (1u << 18) | (1u << 20) : 0u) /*offset line (a wireframe triangle's), tri*/ |
+               (fill << 10) | (fill << 12) /*fill front, back*/ | (1u << 14) /*scissor*/ | ((front_ccw ? 1u : 0u) << 15) | (desc.depth_bias_modes ? ((desc.depth_bias_modes & 2u) ? 1u << 18 : 0u) | ((desc.depth_bias_modes & 4u) ? 1u << 19 : 0u) | ((desc.depth_bias_modes & 1u) ? 1u << 20 : 0u)
+                                                                                                  : offset ? (1u << 18) | (1u << 20) : 0u) /*offset line (a wireframe triangle's), point, tri; OpenGL's per primitive kind*/ |
                (desc.multisample || quad_lines ? 1u << 25 : 0u) /*multisample*/ | (desc.line_mode == LineMode::AlphaAntialiased ? 1u << 26 : 0u) /*line smooth*/ |
                (1u << 29) /*half pixel center*/ | (1u << 30) /*bottom edge rule*/;
     cmd[n++] = float_bits(1.0f);  // point size
     cmd[n++] = 0;                 // sprite coord enable
     cmd[n++] = uint32_t{desc.clip_distances} << 24;   // line stipple, clip planes (the clip distances enabled)
     cmd[n++] = float_bits(desc.line_mode == LineMode::QuadrilateralWide ? 1.4f : 1.0f);  // line width (Direct3D's quadrilateral lines: 1.4 or 1.0 pixels)
-    cmd[n++] = float_bits(offset ? static_cast<float>(desc.depth_bias.constant) : 0.0f);   // offset units
-    cmd[n++] = float_bits(offset ? desc.depth_bias.slope : 0.0f);                                                         // offset scale
+    cmd[n++] = float_bits(desc.depth_bias_modes ? desc.depth_bias_units : offset ? static_cast<float>(desc.depth_bias.constant) : 0.0f);   // offset units
+    cmd[n++] = float_bits(desc.depth_bias_modes ? desc.depth_bias_slope : offset ? desc.depth_bias.slope : 0.0f);                                                       // offset scale
     cmd[n++] = float_bits(offset ? desc.depth_bias.clamp : 0.0f);                                                         // offset clamp
 
     // Vertex elements. Element n is the vertex shader's input n on the host, so they are laid out by location (a location nothing feeds repeats the first attribute: the
@@ -1903,7 +1904,7 @@ IPipeline* VirglDevice::create_compute_pipeline(const IShaderModule* shader) {
   return make<VirglComputePipeline>(gpu_.allocator(), *static_cast<const VirglShaderModule*>(shader));
 }
 
-ICommandBuffer* VirglDevice::create_command_buffer() { return make<CommandRecorder>(gpu_.allocator(), gpu_.allocator()); }
+ICommandBuffer* VirglDevice::create_command_buffer() { return make<CommandRecorder>(gpu_.allocator(), gpu_.allocator(), limits().shader_constant_bytes); }
 void VirglDevice::destroy_command_buffer(ICommandBuffer* commands) {
   destroy(gpu_.allocator(), static_cast<CommandRecorder*>(commands));
 }
@@ -2118,7 +2119,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
   Rect2D scissors[kMaxViewports];
   uint32_t viewport_count = 1, scissor_count = 1;
   const uint32_t host_viewports = (info().features2 & kFeature2Viewports) ? kMaxViewports : 1u;
-  uint32_t constants[kMaxPushConstantBytes / 4] = {};
+  ConstByteView constants;      // (the last push_constants block: in the recorder's pool, which outlives the submit; up to DeviceLimits::shader_constant_bytes)
   uint32_t constants_dwords = 0;
   bool constants_dirty = false;
   // The constants a stage is given: the push constants and, for a pipeline whose shaders compare (ShaderModuleDesc::sampler_constants), the comparisons of the units' samplers
@@ -2132,7 +2133,8 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
     stream.put(0);
     for (uint32_t k = 0; k < dwords; ++k) {
       if (k < constants_dwords) {
-        stream.put(constants[k]);
+        stream.put(static_cast<uint32_t>(constants[k * 4]) | static_cast<uint32_t>(constants[k * 4 + 1]) << 8 | static_cast<uint32_t>(constants[k * 4 + 2]) << 16 |
+                   static_cast<uint32_t>(constants[k * 4 + 3]) << 24);
       } else if (k < kSamplerCompareRegister * 4) {
         stream.put(0);
       } else if (k >= kRasterizerRegister * 4) {
@@ -2793,7 +2795,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
       case RecordedCommand::Type::PushConstants: {
         ConstByteView block;
         if (!pool.try_subview(cmd.constants_offset, cmd.constants_size, &block)) return false;
-        for (uint32_t k = 0; k < block.size(); ++k) reinterpret_cast<uint8_t*>(constants)[k] = block[k];
+        constants = block;
         constants_dwords = cmd.constants_size / 4;
         constants_dirty = true;
         compute_constants_dirty = true;

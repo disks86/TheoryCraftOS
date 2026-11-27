@@ -1931,7 +1931,7 @@ static void test_hardware_path() {
     GlService service(g_alloc);
     static uint64_t reported_gpu = 0;
     reported_gpu = 0;
-    service.set_report([](uint64_t, const webgl::GlContext::HardwareStats& st) { reported_gpu += st.gpu_draws; });
+    service.set_report([](uint64_t, const webgl::GlContext::HardwareStats& st, const char*) { reported_gpu += st.gpu_draws; });
     ContextRequest r;
     uint32_t a = 0;
     CHECK(service.create_context(2, r, &a) == GlStatus::Ok);

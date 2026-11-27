@@ -47,6 +47,8 @@ constexpr uint32_t kMaxVaryings = 16;           // values passed from the vertex
 constexpr uint32_t kMaxVertexBuffers = 8;       // vertex buffers (input slots) bound at once
 // The most a command buffer may carry as shader constants; what a device really takes is DeviceInfo::max_push_constant_bytes (most take 128: eight vec4s).
 constexpr uint32_t kMaxPushConstantBytes = 4096;
+// A device that takes larger constant blocks says so in DeviceLimits::shader_constant_bytes (at most this); its command buffers take push_constants of that size.
+constexpr uint32_t kMaxShaderConstantBytes = 16384;
 constexpr uint32_t kMaxTextureUnits = 16;
 // The colour images one render pass can draw into at once (kFeatureMultipleTargets): RenderPassBegin::color and up to seven more.
 constexpr uint32_t kMaxColorTargets = 8;
@@ -66,6 +68,10 @@ struct DeviceLimits {
   uint32_t color_targets = kBaseColorTargets;           // kFeatureMultipleTargets: colour images of a pass
   uint32_t vertex_buffers = kBaseVertexBuffers;         // bind_vertex_buffer_slot slots
   uint32_t control_varyings = 0;                        // tessellation: the vectors of each control point from the hull to the domain stage (0: `varyings`)
+  bool depth_bias = false;                              // GraphicsPipelineDesc::depth_bias_*
+  bool sampled_depth = false;                           // a D32Float image with kImageDepthAttachment | kImageSampled: drawn into, then bound as a texture whose red channel is the depth
+  uint32_t shader_constant_bytes = 0;                   // push_constants up to this many bytes (above kMaxPushConstantBytes; 0: kMaxPushConstantBytes)
+  bool stencil = false;                                 // D32Float images with a stencil plane (ImageDesc::stencil) and GraphicsPipelineDesc::stencil
 };
 
 // --- Resources ---------------------------------------------------------------
@@ -1082,6 +1088,10 @@ struct GraphicsPipelineDesc {
   StencilState stencil;
   BlendState blend;                                   // kFeatureBlendState
   CompareOp depth_compare = CompareOp::LessEqual;     // kFeatureBlendState: what depth_test compares with (a device without it always uses LessEqual)
+  // DeviceLimits::depth_bias: the depth of the primitives `depth_bias_modes` names (bit 0 triangles, 1 lines, 2 points) moved by depth_bias_slope times their depth slope plus
+  // depth_bias_units times the smallest step of the depth image, before the depth test (glPolygonOffset's factor and units).
+  float depth_bias_slope = 0, depth_bias_units = 0;
+  uint8_t depth_bias_modes = 0;
   // kFeatureIndependentBlend: with independent_blend, colour target 0 uses `blend` (or alpha_blend) and target n (1..3) uses target_blend[n - 1], which is taken as it is (custom or
   // not: a state that is not custom means no blending and every channel written). Without it every target uses `blend`.
   bool independent_blend = false;

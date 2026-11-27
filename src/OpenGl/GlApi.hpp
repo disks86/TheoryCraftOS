@@ -120,6 +120,7 @@ class GlApi {
   // What the 3D hardware drew is brought into the surface's images (GlService, before a swap or a read of the front buffer).
   void sync_hardware() { gl_.hw_sync(); }
   const webgl::GlContext::HardwareStats& hardware_stats() const { return gl_.hardware_stats(); }
+  void reset_hardware_stats() { gl_.reset_hardware_stats(); }
   // The surface changed its size or swapped: the engine's images are where the surface now has them.
   void surface_changed();
 
@@ -315,7 +316,7 @@ class GlApi {
   void create_default_textures();
   void release_internal_objects();      // what this context made in its share group for itself
   static uint32_t default_texture_index(uint32_t target);
-  webgl::Texture* texture_for_target(uint32_t target, uint32_t* face);
+  webgl::Texture* texture_for_target(uint32_t target, uint32_t* face, bool pixels = true);   // (pixels: the caller reads or writes them - GlContext::hw_sync_texture)
   void tex_image_multisample(uint32_t target, int32_t samples, uint32_t internal, int32_t w, int32_t h, int32_t d);
   void store_floats(webgl::Image& image, uint32_t xo, uint32_t yo, uint32_t zo, uint32_t w, uint32_t h, uint32_t d, ConstByteView rgba, bool srgb_source);
   void texture_image(uint32_t target, int32_t level, int32_t internal, uint32_t w, uint32_t h, uint32_t d, int32_t border, uint32_t format, uint32_t type, UserPtr pixels, uint32_t dims);
