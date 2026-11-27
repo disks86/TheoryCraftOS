@@ -308,7 +308,9 @@ static HRESULT dv_set_render_state(D3dDevice *dev, DWORD state, DWORD value) {
     return D3D_OK;
   }
   case D3DRENDERSTATE_TEXTUREMAPBLEND:
-    if (value == dev->texture_map_blend && dev->legacy_blend) return D3D_OK;
+    /* (the value it has already does nothing, not even when texture stage states ended the legacy blending since: Windows, Wine's ddraw4
+     * test_texturemapblend; another value takes stage 0 over again) */
+    if (value == dev->texture_map_blend) return D3D_OK;
     if (dev->texture_map_blend == D3DTBLEND_MODULATEMASK || !dev->legacy_blend) dev->dirty.tss[1] |= (1u << D3DTSS_COLOROP) | (1u << D3DTSS_ALPHAOP);
     dev->texture_map_blend = value;
     dev->legacy_blend = TRUE;

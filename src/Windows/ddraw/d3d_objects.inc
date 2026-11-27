@@ -231,6 +231,12 @@ static HRESULT STDMETHODCALLTYPE vp_GetViewport(IDirect3DViewport3 *i, D3DVIEWPO
   else {
     DlViewport1 v = vp->vp1;
     if (vp->set == 2) dl_viewport1_from_v2(&vp->vp2, &v);
+    else {
+      /* (Windows keeps a viewport as its clip rectangle and gives the scale back as dwWidth / clip width: a scale of 0 set comes back as
+       * infinity, Wine's d3d ViewportTest; other scales come back as they were set) */
+      if (!(v.dvScaleX > 0.0f || v.dvScaleX < 0.0f)) v.dvScaleX = dl_div_inf((float)v.dwWidth, 0.0f);
+      if (!(v.dvScaleY > 0.0f || v.dvScaleY < 0.0f)) v.dvScaleY = dl_div_inf((float)v.dwHeight, 0.0f);
+    }
     const DWORD size = out->dwSize < sizeof v ? out->dwSize : (DWORD)sizeof v;
     v.dwSize = out->dwSize;
     memcpy(out, &v, size);

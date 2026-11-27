@@ -472,6 +472,8 @@ static HRESULT d3_flush(D3dDevice *dev) {
   ctx.texture_map_blend = 0;
   ctx.texture = 0;
   ctx.depth_bits = depth_bits(attached_depth(dev->target));
+  /* (the render state loop clears whole words of dirty bits: whether TEXTUREMAPBLEND is to be applied again is taken before it) */
+  const BOOL map_blend_dirty = MASK_HAS(dev->dirty.rs, D3DRENDERSTATE_TEXTUREMAPBLEND);
   /* render states */
   for (UINT w = 0; w < 8; ++w) {
     DWORD bits = dev->dirty.rs[w];
@@ -501,7 +503,7 @@ static HRESULT d3_flush(D3dDevice *dev) {
   }
   bind_textures(dev);
   ctx.texture = stage0_kind(dev);
-  if (dev->legacy_blend && MASK_HAS(dev->dirty.rs, D3DRENDERSTATE_TEXTUREMAPBLEND)) {
+  if (dev->legacy_blend && (map_blend_dirty || MASK_HAS(dev->dirty.rs, D3DRENDERSTATE_TEXTUREMAPBLEND))) {
     dev->dirty.rs[D3DRENDERSTATE_TEXTUREMAPBLEND >> 5] &= ~(1u << (D3DRENDERSTATE_TEXTUREMAPBLEND & 31u));
     DlStateOps ops;
     if (dl_texture_map_blend(dev->texture_map_blend, 0, ctx.texture, &ops) == DL_OK) ops_apply(dev, &ops);

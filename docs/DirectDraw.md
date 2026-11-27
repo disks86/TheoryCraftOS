@@ -65,6 +65,8 @@ separate part of the same library that plugs into the hooks below (see "The Dire
 | d3d9 `draw.inc` | D3DSHADE_FLAT in the fixed-function vertex stage: each primitive's vertices copied with the colour and specular colour of its first vertex (a fan's second) and drawn as a list - there is no provoking-vertex state below (Wine's test_shademode). |
 | d3d9 `ff_stages.h`, `d3d9.c` | stage state 33, `TCOS_TSS_KEY_KILL` (d3d9.dll's own, which ddraw.dll sets): a texel of alpha 0 of the stage's texture takes the pixel away (texkill) before the stages and the alpha test - DirectDraw's colour key. `tests/FfStagesTest.cpp` checks it. |
 | `SystemDxg.cpp` | the CPU renderer's adapter (the standard VGA card) gets the default 256 MB video memory budget instead of the framebuffer card's 3 MB: a 640x480 target with a z buffer and its copies were evicted, and the draws into them lost. |
+| d3d9 `draw.inc`, `ff_stages.h`, `ff_lighting.h` | linear fog with start = end: by the vertex everything is fog, by the pixel a step at end (`fog_terms`); DESTALPHA / INVDESTALPHA / SRCALPHASAT on a target without alpha (X8R8G8B8, R5G6B5, X1R5G5B5, ...) blend with a destination alpha of 1 (`target_without_alpha`); the fixed-function stages declare a cube or volume sampler for a cube or volume texture and get the third texture coordinate (`FfsStage.dimension`; before, they sampled such a texture as 2D, by u and v). Wine's ddraw7 `test_fog_special`, visual.c alpha_test and cubemap_test; d3d9test checks each. |
+| `Win32kUserMessage.cpp` | `op_continue` looks the thread's queue and operation up again after waiting for another thread's window procedure: a process ending while one of its threads waited there had that operation freed under it, and the call through the freed operation's step was a kernel panic at a low address ("invalid opcode", Wine's `test_coop_level_threaded`, about one run in two of the whole split). A kernel panic also prints the faulting code's frame-pointer chain and `TCOS_IMAGE_BASE` now. |
 | `SoftwareDevice.cpp` | window positions are snapped to 1/256 pixel (Direct3D's 16.8 fixed point, as GPUs do): a vertex a rounding error past a pixel centre (Direct3D 9's whole-number centres moved by half a pixel through the viewport) no longer takes that pixel (Wine's test_viewport). |
 
 ## The Direct3D part (hooks)
@@ -149,11 +151,14 @@ What is not there, and why:
   room for after dwVertexOffset, dwVertexCount does not gate them. Material handles are one per device (`test_multiple_devices`); a surface without
   DDSCAPS_TEXTURE set as a texture in Direct3D 1-3 is kept (GetTexture) and drawn by the software devices only (`test_texture_wrong_caps`);
   IDirect3DDevice2 keeps the reference SetCurrentViewport took for good (Windows' leak, `test_viewport_object`).
+- GetViewport of a viewport set with SetViewport gives a scale of 0 back as infinity (Windows keeps the clip rectangle; Wine's d3d ViewportTest).
+  TEXTUREMAPBLEND set to the value it has does nothing, even after a texture stage state ended the legacy blending; another value takes stage 0
+  over again, and is applied at the next draw whatever else changed (`test_texturemapblend`).
 - Found by Wine's tests and not fixed yet (numbers in `tests/windows/wine/README.md`): user clip planes (Direct3D 9 here has
-  none: SetClipPlane is DDERR_INVALIDPARAMS, `test_compute_sphere_visibility`), DESTALPHA blending on an X8R8G8B8 target and fog with start = end
-  (`test_fog_special`) in Direct3D 9's renderer, a depth range beyond [0, 1] is cut to [0, 1] for Direct3D 9 (depths inside it scale differently
-  from Windows'), the managed cube map of visual.c's cubemap_test samples as no texture. `test_colorkey_precision` is correct as far as it gets but
-  runs past the 40 s limit of the split runs on the CPU renderer.
+  none: SetClipPlane is DDERR_INVALIDPARAMS, `test_compute_sphere_visibility` of ddraw7; that of ddraw4 has two cases Wine also gets wrong), a
+  depth range beyond [0, 1] is cut to [0, 1] for Direct3D 9 (depths inside it scale differently from Windows'), the first
+  DrawIndexedPrimitiveVB of an unlocked buffer is D3D_OK, Windows E_FAIL (`test_draw_primitive`, todo in Wine). `test_colorkey_precision` is
+  correct as far as it gets but runs past the 40 s limit of the split runs on the CPU renderer (about 0.5 s per 640x480 quad there).
 
 ## Not done, and why
 
@@ -179,10 +184,13 @@ What is not there, and why:
 - Wine's tests (`tests/windows/wine/ddraw`): `scripts/winetest.sh ddraw` from a short path (a symlink to the checkout, QEMU's socket path); results in
   `tests/windows/wine/README.md`. A test that hangs stops the rest of its program: run one test function per process with a split copy whose
   START_TEST runs only the function `DDRAW_ONLY` names (generated, not committed) and `WINETEST_QUIET=200 WINETEST_ENV=WINERUN_TIMEOUT_MS=40000`.
-- Numbers (2026-11-26 gap pass, 64-bit, CPU renderer, DirectDraw and Direct3D): 411 test functions run, 383 pass; failed checks ddraw1 9, ddraw2 12,
-  ddraw4 88, ddraw7 262, d3d 4, dsurface 0, refcount 0, visual 5 (first pass: 316 pass; ddraw1 47, ddraw2 55, ddraw4 163, ddraw7 428, d3d 24, dsurface
-  82, refcount 12, visual 10) (per test in `tests/windows/wine/README.md`). `test_map_synchronisation` is left out of the split runs (its draw sizes come from how fast the
-  first draw was: minutes on the CPU renderer). `tests/windows/ddrawtest.c` 101 checks and `tests/windows/d3dimtest.c` 89 pass on both widths and on virgl.
+- Numbers (2026-11-26, both gap passes merged, 64-bit, CPU renderer, DirectDraw and Direct3D): 413 test functions run, 395 pass; failed checks
+  ddraw1 9, ddraw2 8, ddraw4 10, ddraw7 36, d3d, dsurface, refcount, visual and ddrawmodes 0 (first pass: 316 pass; ddraw1 47, ddraw2 55, ddraw4
+  163, ddraw7 428, d3d 24, dsurface 82, refcount 12, visual 10) (per test in `tests/windows/wine/README.md`). `test_map_synchronisation` is left
+  out of the split runs (its draw sizes come from how fast the first draw was: minutes on the CPU renderer). `tests/windows/ddrawtest.c` 101
+  checks and `tests/windows/d3dimtest.c` 89 pass on both widths and on virgl. The 32-bit builds of Wine's tests (`CC=i686-w64-mingw32-gcc
+  tests/windows/wine.py build`) do not run yet: winerun.exe is 64-bit only, and a 32-bit program it starts stops at once (invalid opcode at
+  0x1000xxxx, exit 0x86).
 - `tests/windows/d3dimtest.c`: Direct3D 1, 2, 3 and 7 - devices, Clear, draws read back, z buffers, colour-keyed textures, lights, state blocks, vertex
   buffers, a 640x480 target with a 24-bit z buffer, a 3D flipping chain, execute buffers, clipping. `GPU=std tests/d3d12_qemu.sh d3dimtest`, the same
   with the default virgl, and `tests/wow64_qemu.sh d3dimtest`.

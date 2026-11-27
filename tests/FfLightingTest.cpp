@@ -350,7 +350,7 @@ static void test_texture_coordinates() {
   run(uvw, 3, 1);
   CHECK(out[0] == 0.25f && out[1] == 0.75f && out[2] == 0.5f && out[3] == 1.0f);
   run(uvw, 3, 0);
-  CHECK(out[2] == 0.0f && out[3] == 1.0f);
+  CHECK(out[2] == 0.5f && out[3] == 1.0f);      // (the third number reaches the stages too: cube and volume textures are sampled by it)
   const float nothing[4] = {0, 0, 0, 1};
   run(nothing, 0, 0);
   CHECK(out[0] == 0.0f && out[1] == 0.0f && out[3] == 1.0f);

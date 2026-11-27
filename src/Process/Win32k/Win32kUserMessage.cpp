@@ -273,7 +273,10 @@ uint64_t op_continue(Call& call, Op& start) {
     Op* op = find_op(op_id);
     if (!op) return 0;
     if (op->waiting_on != 0) {
-      struct Ctx { Call* call; uint64_t upcall; Queue* queue; bool interrupted; } ctx{&call, op->waiting_on, q, false};
+      // (the wait lets the lock go: the thread's queue and operations are looked up again by their numbers after it, and in it - a process that
+      // ends while this thread waits has its threads' queues and operations taken away by another thread, and a pointer kept across the wait
+      // would be to freed memory: a call through a freed Op's step was a kernel panic at a low address in Wine's test_coop_level_threaded)
+      struct Ctx { Call* call; uint64_t upcall; uint64_t thread; bool interrupted; } ctx{&call, op->waiting_on, q->thread, false};
       uint64_t timeout = ~uint64_t{0};
       if (op->deadline_ns != ~uint64_t{0} && op->deadline_ns != 0) {
         const uint64_t now = now_ns(call.process());
@@ -284,10 +287,14 @@ uint64_t op_continue(Call& call, Op& start) {
         Upcall* u = find_upcall(x.upcall);
         if (!u || u->state == Upcall::Done || u->failed) return true;
         if (!thread_alive(*x.call, u->thread)) { u->failed = true; return true; }
-        if (x.queue->upcalls.count() > 0) { x.interrupted = true; return true; }
+        Queue* own = find_queue(x.thread);
+        if (!own) return true;
+        if (own->upcalls.count() > 0) { x.interrupted = true; return true; }
         return false;
       }, &ctx);
       op = find_op(op_id);
+      q = find_queue(thread_of(call));
+      if (!op || !q) return 0;      // (the thread's operations went with its process while it waited)
       Upcall* u = find_upcall(op->waiting_on);
       if (ctx.interrupted && u && u->state != Upcall::Done && !u->failed) { q->last_due_has_op = true; return kUpcallDue; }
       if (!ok && u && u->state != Upcall::Done) {      // timed out (or the process is ending): the sender gives up
@@ -316,6 +323,7 @@ uint64_t op_continue(Call& call, Op& start) {
       }
     }
     op = find_op(op_id);
+    if (!op) return 0;
     if (op->outstanding > 0) { q->last_due_has_op = true; return kUpcallDue; }
     if (op->notes.count() >= 3) {
       // messages the operation still has to send: the ones for windows of this thread are queued together, one for another thread is sent (and waited for) alone

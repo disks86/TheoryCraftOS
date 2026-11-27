@@ -27,6 +27,7 @@
 
 extern "C" {
 extern const uint64_t tcos_isr_table[256];
+extern uint64_t g_image_base;      // (main.cpp: where the firmware loaded the kernel)
 kernel::Frame* tcos_interrupt_dispatch(kernel::Frame* frame);
 }
 
@@ -193,7 +194,23 @@ void panic(const char* what, const Frame* frame) {
       const uint64_t* words = reinterpret_cast<const uint64_t*>(frame->rsp);      // (the panicking core's own stack; a diagnostic read of 16 words)
       for (uint32_t i = 0; i < 16; ++i) { console::puts(" "); console::put_hex(words[i]); }
       console::puts("\n");
+      // The faulting code's callers by its frame-pointer chain (the kernel keeps frame pointers): a jump through a bad pointer leaves rip useless,
+      // the chain still names the code that made it. A link is followed only while it points further up the same stack, 8-byte aligned.
+      console::puts("frames");
+      uint64_t fp = frame->rbp;
+      for (uint32_t i = 0; i < 16 && fp > frame->rsp && (fp & 7) == 0 && fp - frame->rsp < 0x10000; ++i) {
+        const uint64_t* link = reinterpret_cast<const uint64_t*>(fp);      // (a diagnostic read of the panicking core's own stack)
+        console::puts(" ");
+        console::put_hex(link[1]);
+        if (link[0] <= fp) break;
+        fp = link[0];
+      }
+      console::puts("\n");
     }
+    // (the base those addresses are relative to: the boot's own line with it is often cut from a test's log)
+    console::puts("TCOS_IMAGE_BASE=");
+    console::put_hex(g_image_base);
+    console::puts("\n");
   }
 #if defined(__x86_64__)
   if (!frame) {

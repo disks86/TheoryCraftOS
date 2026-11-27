@@ -286,8 +286,9 @@ typedef struct FflTextureStage {
  * Direct3D 9 puts a 1 after the numbers a set has before the matrix is applied - (u, v) is (u, v, 1, 0) - so a matrix moves two numbers by
  * its third row. Generated coordinates are three numbers.
  *
- * `out` for the fixed-function pixel stage (`for_program` 0) is u, v, 0 and the number the pixel stage divides u and v by (1 unless the
- * coordinates are projected); for a program's pixel shader it is the numbers as they are, 0 0 0 1 where there are none. */
+ * `out` for the fixed-function pixel stage (`for_program` 0) is u, v, w (the third number, which a cube or a volume texture is sampled by; 0
+ * where there is none) and the number the pixel stage divides them by (1 unless the coordinates are projected); for a program's pixel shader
+ * it is the numbers as they are, 0 0 0 1 where there are none. */
 static void ffl_texture_coordinates(const FflTextureStage *stage, const float world_view[4][4], const float normal_matrix[3][3], int normalize, const float position[3],
                                     const float normal[3], const float *vertex, int components, int for_program, float out[4]) {
   float in[4] = {0.0f, 0.0f, 0.0f, 1.0f};
@@ -325,7 +326,7 @@ static void ffl_texture_coordinates(const FflTextureStage *stage, const float wo
   if (stage->count <= 0) {
     out[0] = in[0];
     out[1] = in[1];
-    out[2] = for_program ? in[2] : 0.0f;
+    out[2] = in[2];
     out[3] = for_program ? in[3] : 1.0f;
     return;
   }
@@ -343,7 +344,7 @@ static void ffl_texture_coordinates(const FflTextureStage *stage, const float wo
   }
   out[0] = moved[0];
   out[1] = count >= 2 ? moved[1] : 0.0f;
-  out[2] = 0.0f;
+  out[2] = count >= 3 && !(stage->projected && count == 3) ? moved[2] : 0.0f;      /* (three numbers projected: the third is the divisor, not a w) */
   out[3] = stage->projected ? moved[count - 1] : 1.0f;
 }
 
