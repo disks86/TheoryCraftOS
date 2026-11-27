@@ -58,6 +58,7 @@
 #define D9_TS_TEXTURE0 16u
 #define D9_TS_WORLD 256u
 #define D9_RS_ALPHATESTENABLE 15u
+#define D9_USAGE_LOCKABLE_DEPTH 0x40000000u /* d3d9.dll's own usage (TCOS_USAGE_LOCKABLE_DEPTH): a depth buffer of any format that Lock reads and writes */
 #define D9_TSS_KEY_KILL 33u            /* d3d9.dll's own stage state (TCOS_TSS_KEY_KILL): a texel of alpha 0 takes the pixel away */
 #define D9_RS_ALPHAREF 24u
 #define D9_RS_ALPHAFUNC 25u
@@ -162,6 +163,7 @@ typedef struct D3dRes {
   DWORD key_low, key_high;
   BOOL has_alpha;                /* the texture's alpha means something (the format's alpha; a colour key is not) */
   BOOL fresh;                    /* just made: everything must be sent */
+  BOOL depth_lockable;           /* a depth buffer with stencil that d3d9.dll locks (TCOS_USAGE_LOCKABLE_DEPTH: depth in the low 24 bits, stencil above) */
   DWORD lod;
 } D3dRes;
 
@@ -679,6 +681,9 @@ static uint32_t depth_raw(UINT fmt, float z) {
   return dd_depth_from_u32(fmt, (uint32_t)((double)z * 4294967295.0 + 0.5));
 }
 
+/* A depth buffer's raw value as a 24-bit depth code (d3d9.dll's lockable D24S8). */
+static uint32_t depth_code24(UINT fmt, uint32_t raw) { return (uint32_t)(((uint64_t)dd_depth_to_u32(fmt, raw) * 0xFFFFFFu + 0x7FFFFFFFu) / 0xFFFFFFFFu); }
+
 static HRESULT depth_upload(Surface *s, D3dRes *r, const RECT *rect) {
   D3dDD *d = r->owner;
   RECT rc;
@@ -688,6 +693,21 @@ static HRESULT depth_upload(Surface *s, D3dRes *r, const RECT *rect) {
   surface_image(s, &im, NULL);
   const DdFormatInfo *f = dd_format(s->fmt);
   uint32_t raw;
+  if (r->format == D3DFMT_D24S8 && r->depth_lockable) {      /* (d3d9.dll's lockable D24S8: depth codes in the low 24 bits, the stencil above) */
+    D3DLOCKED_RECT lr;
+    HRESULT hr = D3D_CALL(r->surface, LockRect, &lr, &rc, 0);
+    if (FAILED(hr)) return hr;
+    for (LONG y = rc.top; y < rc.bottom; ++y) {
+      DWORD *out = (DWORD *)((BYTE *)lr.pBits + (SIZE_T)(y - rc.top) * lr.Pitch);
+      for (LONG x = rc.left; x < rc.right; ++x) {
+        const uint32_t v = dd_get_raw(&im, (uint32_t)x, (uint32_t)y);
+        uint32_t stencil = f->g ? (v & f->g) >> dd_mask_shift(f->g) : 0;
+        if (stencil > 255u) stencil = 255u;
+        out[x - rc.left] = depth_code24(s->fmt, v) | stencil << 24;
+      }
+    }
+    return D3D_CALL(r->surface, UnlockRect);
+  }
   if (r->format == D3DFMT_D24S8) {
     /* (a depth buffer with stencil cannot be written by the CPU in Direct3D 9: the first value of the rectangle is cleared over it) */
     raw = dd_get_raw(&im, (uint32_t)rc.left, (uint32_t)rc.top);
@@ -730,7 +750,7 @@ static HRESULT depth_upload(Surface *s, D3dRes *r, const RECT *rect) {
 }
 
 static HRESULT depth_download(Surface *s, D3dRes *r) {
-  if (r->format != D3DFMT_D32F_LOCKABLE) return D3D_OK;      /* (D24S8: Direct3D 9 does not give it back; see docs/DirectDraw.md) */
+  if (r->format != D3DFMT_D32F_LOCKABLE && !r->depth_lockable) return D3D_OK;      /* (a D24S8 that d3d9.dll would not make lockable: not given back) */
   D3DLOCKED_RECT lr;
   HRESULT hr = D3D_CALL(r->surface, LockRect, &lr, NULL, D9_LOCK_READONLY);
   if (FAILED(hr)) return hr;
@@ -739,10 +759,21 @@ static HRESULT depth_download(Surface *s, D3dRes *r) {
   const DdFormatInfo *f = dd_format(s->fmt);
   const uint32_t w = s->desc.dwWidth < r->width ? s->desc.dwWidth : r->width, h = s->desc.dwHeight < r->height ? s->desc.dwHeight : r->height;
   for (uint32_t y = 0; y < h; ++y) {
-    const float *in = (const float *)((const BYTE *)lr.pBits + (SIZE_T)y * lr.Pitch);
+    const BYTE *in = (const BYTE *)lr.pBits + (SIZE_T)y * lr.Pitch;
     for (uint32_t x = 0; x < w; ++x) {
       const uint32_t old = dd_get_raw(&im, x, y);
-      dd_put_raw(&im, x, y, (old & ~f->r) | depth_raw(s->fmt, in[x]));
+      if (r->format == D3DFMT_D32F_LOCKABLE) {
+        float z;
+        memcpy(&z, in + (SIZE_T)x * 4, 4);
+        dd_put_raw(&im, x, y, (old & ~f->r) | depth_raw(s->fmt, z));
+      } else {      /* (D24S8: the depth codes and the stencil both come back) */
+        uint32_t v;
+        memcpy(&v, in + (SIZE_T)x * 4, 4);
+        const uint32_t code = v & 0xFFFFFFu, z = code << 8 | code >> 16;      /* (24 bits widened to 32, 0xFFFFFF to 0xFFFFFFFF) */
+        uint32_t raw = (old & ~(f->r | f->g)) | dd_depth_from_u32(s->fmt, z);
+        if (f->g) raw |= ((v >> 24) << dd_mask_shift(f->g)) & f->g;
+        dd_put_raw(&im, x, y, raw);
+      }
     }
   }
   return D3D_CALL(r->surface, UnlockRect);
@@ -797,7 +828,15 @@ static D3dRes *depth_res(D3dDD *d, Surface *s) {
     r->height = s->desc.dwHeight;
     r->levels = 1;
     r->format = dd_format(s->fmt)->g ? D3DFMT_D24S8 : D3DFMT_D32F_LOCKABLE;
-    if (FAILED(D3D_CALL(d->dev, CreateDepthStencilSurface, r->width, r->height, r->format, D3DMULTISAMPLE_NONE, 0, FALSE, &r->surface, NULL))) {
+    /* (with stencil: a D24S8 that d3d9.dll's own usage makes lockable, so that Lock reads what was drawn - IDirect3DDevice9Ex::CreateDepthStencilSurfaceEx,
+     * which every device of d3d9.dll has, after the 119 methods of IDirect3DDevice9 and 12 more of 9Ex; a plain D24S8 if that is refused) */
+    if (r->format == D3DFMT_D24S8) {
+      typedef HRESULT(STDMETHODCALLTYPE * CreateDepthEx)(IDirect3DDevice9 *, UINT, UINT, D3DFORMAT, D3DMULTISAMPLE_TYPE, DWORD, WINBOOL, IDirect3DSurface9 **, HANDLE *, DWORD);
+      CreateDepthEx create;
+      memcpy(&create, (void *const *)d->dev->lpVtbl + sizeof(IDirect3DDevice9Vtbl) / sizeof(void *) + 12, sizeof create);
+      r->depth_lockable = SUCCEEDED(create(d->dev, r->width, r->height, r->format, D3DMULTISAMPLE_NONE, 0, FALSE, &r->surface, NULL, D9_USAGE_LOCKABLE_DEPTH));
+    }
+    if (!r->depth_lockable && FAILED(D3D_CALL(d->dev, CreateDepthStencilSurface, r->width, r->height, r->format, D3DMULTISAMPLE_NONE, 0, FALSE, &r->surface, NULL))) {
       res_free(r);
       return NULL;
     }
@@ -827,7 +866,24 @@ static UINT texture_levels(const Surface *root) {
 }
 static BOOL texture_is_cube(const Surface *root) { return (root->desc.ddsCaps.dwCaps2 & DDSCAPS2_CUBEMAP) != 0; }
 
-/* Sends one level of a texture as A8R8G8B8 (the colour key as alpha 0 when `keyed`). */
+/* The Direct3D 9 format of a bump map's (the signed formats, whose pixels go to d3d9.dll as they are: their layouts are the same), else 0. */
+static D3DFORMAT bump_format(UINT fmt) {
+  switch (fmt) {
+    case DD_FMT_V8U8: return D3DFMT_V8U8;
+    case DD_FMT_L6V5U5: return D3DFMT_L6V5U5;
+    case DD_FMT_X8L8V8U8: return D3DFMT_X8L8V8U8;
+    case DD_FMT_Q8W8V8U8: return D3DFMT_Q8W8V8U8;
+    case DD_FMT_V16U16: return D3DFMT_V16U16;
+    default: return (D3DFORMAT)0;
+  }
+}
+
+/* The bytes of a pixel of a Direct3D 9 bump format; 0 for the others. */
+static UINT bump_bytes(D3DFORMAT f) {
+  return f == D3DFMT_V8U8 || f == D3DFMT_L6V5U5 ? 2u : f == D3DFMT_X8L8V8U8 || f == D3DFMT_Q8W8V8U8 || f == D3DFMT_V16U16 ? 4u : 0u;
+}
+
+/* Sends one level of a texture as A8R8G8B8 (the colour key as alpha 0 when `keyed`), or a bump map's pixels as they are. */
 static HRESULT texture_send_level(D3dRes *r, Surface *level_surface, UINT face, UINT level, BOOL keyed, DWORD key_low, DWORD key_high) {
   D3DLOCKED_RECT lr;
   HRESULT hr;
@@ -845,7 +901,13 @@ static HRESULT texture_send_level(D3dRes *r, Surface *level_surface, UINT face, 
   uint32_t palette[256];
   if (level_surface) surface_image(level_surface, &im, palette);
   const BOOL readable = level_surface && dd_format_has_colour(level_surface->fmt) && level_surface->desc.dwWidth == w && level_surface->desc.dwHeight == h;
-  if (readable) {
+  const UINT bump = bump_bytes(r->format);
+  if (bump && level_surface && bump_format(level_surface->fmt) == r->format && level_surface->desc.dwWidth == w && level_surface->desc.dwHeight == h && im.data &&
+      im.pitch >= w * bump && (size_t)im.pitch * (h - 1) + (size_t)w * bump <= im.size) {
+    for (UINT y = 0; y < h; ++y) memcpy((BYTE *)lr.pBits + (SIZE_T)y * lr.Pitch, im.data + (SIZE_T)y * im.pitch, (SIZE_T)w * bump);
+  } else if (bump) {
+    for (UINT y = 0; y < h; ++y) memset((BYTE *)lr.pBits + (SIZE_T)y * lr.Pitch, 0, (SIZE_T)w * bump);      /* (a level that is not there) */
+  } else if (readable) {
     const DdRect dr = {0, 0, (LONG)w, (LONG)h};
     dd_to_argb(&im, &dr, lr.pBits, (size_t)lr.Pitch * (h - 1) + (size_t)w * 4, (uint32_t)lr.Pitch, keyed, key_low, key_high);
     if (r->format == D3DFMT_X8R8G8B8)
@@ -854,7 +916,7 @@ static HRESULT texture_send_level(D3dRes *r, Surface *level_surface, UINT face, 
         for (UINT x = 0; x < w; ++x) row[x] |= 0xFF000000u;
       }
   } else {
-    /* (bump and depth formats have no colours: Direct3D 9's fixed function here has no bump mapping - docs/DirectDraw.md) */
+    /* (depth formats have no colours) */
     for (UINT y = 0; y < h; ++y) memset((BYTE *)lr.pBits + (SIZE_T)y * lr.Pitch, 0, (SIZE_T)w * 4);
   }
   if (r->target_texture) {
@@ -884,7 +946,8 @@ static D3dRes *texture_res(D3dDD *d, Surface *root, BOOL want_key) {
   }
   const BOOL cube = texture_is_cube(root);
   const UINT levels = texture_levels(root);
-  const D3DFORMAT format = (keyed || format_has_alpha(root->fmt) || dd_format_is_blocks(root->fmt)) ? D3DFMT_A8R8G8B8 : D3DFMT_X8R8G8B8;
+  const D3DFORMAT format = bump_format(root->fmt) ? bump_format(root->fmt)
+                           : (keyed || format_has_alpha(root->fmt) || dd_format_is_blocks(root->fmt)) ? D3DFMT_A8R8G8B8 : D3DFMT_X8R8G8B8;
   BOOL all = FALSE;
   if (r && (r->format != format || r->levels != levels)) {
     res_free(r);

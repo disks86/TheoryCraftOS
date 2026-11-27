@@ -27,11 +27,11 @@ static UINT format_bytes(D3DFORMAT format) {
     case D3DFMT_A32B32G32R32F: return 16;
     case D3DFMT_A16B16G16R16F: case D3DFMT_G32R32F: case D3DFMT_A16B16G16R16: return 8;
     case D3DFMT_A8R8G8B8: case D3DFMT_X8R8G8B8: case D3DFMT_A8B8G8R8: case D3DFMT_X8B8G8R8: case D3DFMT_A2R10G10B10: case D3DFMT_A2B10G10R10: case D3DFMT_G16R16:
-    case D3DFMT_G16R16F: case D3DFMT_R32F:
+    case D3DFMT_G16R16F: case D3DFMT_R32F: case D3DFMT_X8L8V8U8: case D3DFMT_Q8W8V8U8: case D3DFMT_V16U16: case D3DFMT_A2W10V10U10:
       return 4;
     case D3DFMT_R8G8B8: return 3;
     case D3DFMT_R5G6B5: case D3DFMT_X1R5G5B5: case D3DFMT_A1R5G5B5: case D3DFMT_A4R4G4B4: case D3DFMT_X4R4G4B4: case D3DFMT_A8L8: case D3DFMT_A8R3G3B2: case D3DFMT_A8P8:
-    case D3DFMT_L16: case D3DFMT_R16F:
+    case D3DFMT_L16: case D3DFMT_R16F: case D3DFMT_V8U8: case D3DFMT_L6V5U5: case D3DFMT_CxV8U8:
       return 2;
     case D3DFMT_A8: case D3DFMT_L8: case D3DFMT_A4L4: case D3DFMT_R3G3B2: case D3DFMT_P8: return 1;
     default: return 0;
@@ -83,15 +83,35 @@ static DXGI_FORMAT wide_dxgi(D3DFORMAT format) {
   }
 }
 static BOOL format_is_wide(D3DFORMAT format) { return wide_dxgi(format) != DXGI_FORMAT_UNKNOWN; }
+/* The signed (bump map) formats: their Direct3D 12 texture is of signed numbers, -1 .. 1 (row_to_signed). V8U8, Q8W8V8U8 and V16U16 keep their pixels as they
+ * are (R8G8_SNORM, R8G8B8A8_SNORM, R16G16_SNORM); the ones that mix signed and unsigned channels (X8L8V8U8, L6V5U5, A2W10V10U10: an unsigned luminance or
+ * alpha) are R16G16B16A16_SNORM, which holds all of them exactly; CxV8U8 is R8G8B8A8_SNORM with its third number sqrt(1 - u * u - v * v) made at upload.
+ * They are textures only (no targets, no levels made: Windows' drivers have neither). */
+static DXGI_FORMAT signed_dxgi(D3DFORMAT format) {
+  switch (format) {
+    case D3DFMT_V8U8: return DXGI_FORMAT_R8G8_SNORM;
+    case D3DFMT_Q8W8V8U8: case D3DFMT_CxV8U8: return DXGI_FORMAT_R8G8B8A8_SNORM;
+    case D3DFMT_V16U16: return DXGI_FORMAT_R16G16_SNORM;
+    case D3DFMT_X8L8V8U8: case D3DFMT_L6V5U5: case D3DFMT_A2W10V10U10: return DXGI_FORMAT_R16G16B16A16_SNORM;
+    default: return DXGI_FORMAT_UNKNOWN;
+  }
+}
+static BOOL format_is_signed(D3DFORMAT format) { return signed_dxgi(format) != DXGI_FORMAT_UNKNOWN; }
 /* The format of the Direct3D 12 texture of a colour format, and the bytes of a pixel of it. */
-static DXGI_FORMAT gpu_dxgi(D3DFORMAT format) { return format_is_wide(format) ? wide_dxgi(format) : dxt_block(format) ? dxt_dxgi(format) : DXGI_FORMAT_B8G8R8A8_UNORM; }
-static UINT gpu_bytes(D3DFORMAT format) { return format_is_wide(format) ? format_bytes(format) : 4; }
+static DXGI_FORMAT gpu_dxgi(D3DFORMAT format) {
+  return format_is_wide(format) ? wide_dxgi(format) : format_is_signed(format) ? signed_dxgi(format) : dxt_block(format) ? dxt_dxgi(format) : DXGI_FORMAT_B8G8R8A8_UNORM;
+}
+static UINT gpu_bytes(D3DFORMAT format) {
+  if (format_is_wide(format)) return format_bytes(format);
+  if (format_is_signed(format)) return signed_dxgi(format) == DXGI_FORMAT_R16G16B16A16_SNORM ? 8 : format_bytes(format) == 2 && format != D3DFMT_CxV8U8 ? 2 : 4;
+  return 4;
+}
 /* What a sampler of Direct3D 9 reads of a format's missing channels and Direct3D 12 does not: 1 where Direct3D 9 has it and Direct3D 12 0 (x y z w; R16F and R32F are
  * (r, 1, 1, 1), the two-channel ones (r, g, 1, 1)). */
 static void format_fill(D3DFORMAT format, float fill[4]) {
   fill[0] = fill[1] = fill[2] = fill[3] = 0.0f;
   if (format == D3DFMT_R16F || format == D3DFMT_R32F) fill[1] = fill[2] = 1.0f;
-  else if (format == D3DFMT_G16R16F || format == D3DFMT_G32R32F || format == D3DFMT_G16R16) fill[2] = 1.0f;
+  else if (format == D3DFMT_G16R16F || format == D3DFMT_G32R32F || format == D3DFMT_G16R16 || format == D3DFMT_V8U8 || format == D3DFMT_V16U16) fill[2] = 1.0f;
 }
 /* A palette format: its pixels are numbers of the entries of the current palette. */
 static BOOL format_is_palette(D3DFORMAT format) { return format == D3DFMT_P8 || format == D3DFMT_A8P8; }
@@ -316,6 +336,64 @@ static void row_to_gpu(D3DFORMAT format, const BYTE *in, UINT pixels, BYTE *out)
   }
 }
 static void row_from_gpu(D3DFORMAT format, const BYTE *in, UINT pixels, BYTE *out) { row_to_gpu(format, in, pixels, out); }      /* (the swap is its own inverse) */
+
+/* ---- the signed formats ----------------------------------------------------------------------------------------------------------------------------- */
+
+/* A signed number of `bits` bits (the low bits of `v`) as a 16-bit signed normalized code: the lowest code is -1 as the one above it (Direct3D's rule). */
+static INT16 snorm16_of(UINT v, UINT bits) {
+  const int top = (1 << (bits - 1)) - 1;
+  int s = (int)(v & ((1u << bits) - 1u));
+  if (s > top) s -= 1 << bits;
+  if (s < -top) s = -top;
+  return (INT16)((s * 32767 + (s < 0 ? -top / 2 : top / 2)) / top);
+}
+/* An unsigned number of `bits` bits as a 16-bit signed normalized code of 0 .. 1. */
+static INT16 snorm16_unsigned(UINT v, UINT bits) {
+  const UINT top = (1u << bits) - 1u;
+  return (INT16)(((v & top) * 32767u + top / 2u) / top);
+}
+/* The integer square root of a number up to 127 * 127 * 2, rounded down. */
+static UINT isqrt(UINT v) {
+  UINT r = 0;
+  while ((r + 1) * (r + 1) <= v) ++r;
+  return r;
+}
+/* A row of a signed format as its Direct3D 12 texture has it (signed_dxgi), `gpu_bytes` a pixel. */
+static void row_to_signed(D3DFORMAT format, const BYTE *in, UINT pixels, BYTE *out) {
+  for (UINT i = 0; i < pixels; ++i) {
+    UINT v = 0;
+    INT16 w[4];
+    switch (format) {
+      case D3DFMT_V8U8: memcpy(out + 2 * i, in + 2 * i, 2); break;
+      case D3DFMT_Q8W8V8U8: case D3DFMT_V16U16: memcpy(out + 4 * i, in + 4 * i, 4); break;
+      case D3DFMT_CxV8U8: {      /* (u, v and the third number of the unit vector they begin) */
+        const signed char u = (signed char)in[2 * i], vv = (signed char)in[2 * i + 1];
+        const int cu = u < -127 ? -127 : u, cv = vv < -127 ? -127 : vv, rest = 127 * 127 - cu * cu - cv * cv;
+        out[4 * i] = (BYTE)u;
+        out[4 * i + 1] = (BYTE)vv;
+        out[4 * i + 2] = (BYTE)(rest > 0 ? isqrt((UINT)rest) : 0u);
+        out[4 * i + 3] = 127;
+        break;
+      }
+      case D3DFMT_X8L8V8U8:
+        memcpy(&v, in + 4 * i, 4);
+        w[0] = snorm16_of(v, 8); w[1] = snorm16_of(v >> 8, 8); w[2] = snorm16_unsigned(v >> 16, 8); w[3] = 32767;
+        memcpy(out + 8 * i, w, 8);
+        break;
+      case D3DFMT_L6V5U5:
+        v = in[2 * i] | (UINT)in[2 * i + 1] << 8;
+        w[0] = snorm16_of(v, 5); w[1] = snorm16_of(v >> 5, 5); w[2] = snorm16_unsigned(v >> 10, 6); w[3] = 32767;
+        memcpy(out + 8 * i, w, 8);
+        break;
+      case D3DFMT_A2W10V10U10:
+        memcpy(&v, in + 4 * i, 4);
+        w[0] = snorm16_of(v, 10); w[1] = snorm16_of(v >> 10, 10); w[2] = snorm16_of(v >> 20, 10); w[3] = snorm16_unsigned(v >> 30, 2);
+        memcpy(out + 8 * i, w, 8);
+        break;
+      default: break;
+    }
+  }
+}
 
 /* A D3DCOLOR (alpha, red, green, blue from the top byte down) as a B8G8R8A8 pixel. */
 static void colour_to_bgra(D3DCOLOR colour, BYTE out[4]) { out[0] = (BYTE)colour; out[1] = (BYTE)(colour >> 8); out[2] = (BYTE)(colour >> 16); out[3] = (BYTE)(colour >> 24); }

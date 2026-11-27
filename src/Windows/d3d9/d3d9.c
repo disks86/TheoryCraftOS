@@ -105,6 +105,10 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 /* A stage state of this d3d9.dll's own, for ddraw.dll's Direct3D: a texel of alpha 0 of the stage's texture takes the pixel away in the fixed-function
  * pixel stage (a colour-keyed texture: ddraw.dll gives keyed texels alpha 0 and the others at least 1), whatever the stage then does with the alpha. */
 #define TCOS_TSS_KEY_KILL 33u
+/* A usage of this d3d9.dll's own, for ddraw.dll's Direct3D (IDirect3DDevice9Ex::CreateDepthStencilSurfaceEx, on any device): a depth buffer the program
+ * may lock whatever its format (DirectDraw's depth buffers are memory a program locks; Direct3D 9 locks only the D*_LOCKABLE formats). The layouts of
+ * the formats are in tex_depth_copy. */
+#define TCOS_USAGE_LOCKABLE_DEPTH 0x40000000u
 #define MAX_LEVELS 13u                 /* of a texture of 4096 pixels */
 #define MAX_SUBS (MAX_LEVELS * 6u)     /* the subresources of a texture: face * levels + level */
 #define MAX_ELEMENTS 64u
@@ -257,6 +261,7 @@ typedef struct Shader {
   UINT state;                    /* the first of its state registers (a pixel shader's alpha test and fog, a vertex shader's half pixel: sm_to_dxbc.h) */
   UINT fill;                     /* a pixel shader: the first of its fill registers, one a sampler up to sampler_count (what a texture's format has not reads 1) */
   UINT sampler_count;            /* a pixel shader: the highest sampler it reads, and one */
+  UINT bump, bump_stages;        /* a pixel shader 1.x: its first bump register (texbem, texbeml, bem: two a stage, sm_to_dxbc.h), and the stages they are of */
   BYTE sampler_kind[16];         /* ... and what each is declared as (SM_SAMPLER_*: Tex.kind) */
   UINT coordinates;              /* ... and the highest set of texture coordinates */
   SmInput inputs[SHADER_INPUTS]; /* a vertex shader: what each input register is */

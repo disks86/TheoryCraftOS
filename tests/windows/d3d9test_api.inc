@@ -1100,6 +1100,154 @@ done:
   if (cube) IDirect3DCubeTexture9_Release(cube);
 }
 
+/* The signed (bump map) formats and the bump environment operations of the stages; a depth buffer made lockable with d3d9.dll's own usage (ddraw.dll's). */
+static void test_bump_and_depth_locks(void) {
+  check(IDirect3D9_CheckDeviceFormat(g_d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, 0, D3DRTYPE_TEXTURE, D3DFMT_V8U8) == D3D_OK &&
+            IDirect3D9_CheckDeviceFormat(g_d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, D3DUSAGE_QUERY_LEGACYBUMPMAP, D3DRTYPE_TEXTURE, D3DFMT_L6V5U5) == D3D_OK &&
+            IDirect3D9_CheckDeviceFormat(g_d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, D3DUSAGE_RENDERTARGET, D3DRTYPE_TEXTURE, D3DFMT_V8U8) == D3DERR_NOTAVAILABLE &&
+            IDirect3D9_CheckDeviceFormat(g_d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, D3DUSAGE_QUERY_LEGACYBUMPMAP, D3DRTYPE_TEXTURE, D3DFMT_A8R8G8B8) == D3DERR_NOTAVAILABLE,
+        "the signed formats are textures (and bump maps), not targets");
+  D3DCAPS9 caps;
+  IDirect3DDevice9_GetDeviceCaps(g_device, &caps);
+  check((caps.TextureOpCaps & (D3DTEXOPCAPS_BUMPENVMAP | D3DTEXOPCAPS_BUMPENVMAPLUMINANCE)) == (D3DTEXOPCAPS_BUMPENVMAP | D3DTEXOPCAPS_BUMPENVMAPLUMINANCE),
+        "the caps have the bump environment operations");
+  IDirect3DTexture9 *bump = NULL, *x8 = NULL, *colours = NULL;
+  D3DLOCKED_RECT locked;
+  /* V8U8 u -1, v 1 through BLENDFACTORALPHA with a factor of half: (u, v, 1) * 0.5 + 0.5 */
+  HRESULT hr = IDirect3DDevice9_CreateTexture(g_device, 2, 2, 1, 0, D3DFMT_V8U8, D3DPOOL_MANAGED, &bump, NULL);
+  if (SUCCEEDED(hr) && SUCCEEDED(IDirect3DTexture9_LockRect(bump, 0, &locked, NULL, 0))) {
+    for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x) ((WORD *)((BYTE *)locked.pBits + y * locked.Pitch))[x] = 0x7F81;      /* (u -127, v 127) */
+    IDirect3DTexture9_UnlockRect(bump, 0);
+  }
+  IDirect3DDevice9_SetTexture(g_device, 0, (IDirect3DBaseTexture9 *)bump);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_TEXTUREFACTOR, 0x80FFFFFF);
+  IDirect3DDevice9_SetTextureStageState(g_device, 0, D3DTSS_COLOROP, D3DTOP_BLENDFACTORALPHA);
+  IDirect3DDevice9_SetTextureStageState(g_device, 0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+  IDirect3DDevice9_SetTextureStageState(g_device, 0, D3DTSS_COLORARG2, D3DTA_TFACTOR);
+  clear(0xFF000000);
+  textured_quad(0, 0, 64, 64, 0xFFFFFFFF);
+  read_back();
+  check(bump && near_colour(pixel(32, 32), 0, 255, 255), "a V8U8 texture samples as signed numbers, (u, v, 1)");
+  /* X8L8V8U8: u 0, v -1, an unsigned luminance of 0x40 */
+  hr = IDirect3DDevice9_CreateTexture(g_device, 2, 2, 1, 0, D3DFMT_X8L8V8U8, D3DPOOL_MANAGED, &x8, NULL);
+  if (SUCCEEDED(hr) && SUCCEEDED(IDirect3DTexture9_LockRect(x8, 0, &locked, NULL, 0))) {
+    for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x) ((DWORD *)((BYTE *)locked.pBits + y * locked.Pitch))[x] = 0x00408100u;
+    IDirect3DTexture9_UnlockRect(x8, 0);
+  }
+  IDirect3DDevice9_SetTexture(g_device, 0, (IDirect3DBaseTexture9 *)x8);
+  clear(0xFF000000);
+  textured_quad(0, 0, 64, 64, 0xFFFFFFFF);
+  read_back();
+  check(x8 && near_colour(pixel(32, 32), 128, 0, 160), "an X8L8V8U8 texture: signed u, v and an unsigned luminance");
+  /* BUMPENVMAP: stage 0's du of half moves stage 1's u by M00 * du - from the red half of a two-texel texture to the green one */
+  hr = IDirect3DDevice9_CreateTexture(g_device, 2, 1, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &colours, NULL);
+  if (SUCCEEDED(hr) && SUCCEEDED(IDirect3DTexture9_LockRect(colours, 0, &locked, NULL, 0))) {
+    ((DWORD *)locked.pBits)[0] = 0xFFFF0000u;
+    ((DWORD *)locked.pBits)[1] = 0xFF00FF00u;
+    IDirect3DTexture9_UnlockRect(colours, 0);
+  }
+  if (bump && SUCCEEDED(IDirect3DTexture9_LockRect(bump, 0, &locked, NULL, 0))) {
+    for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x) ((WORD *)((BYTE *)locked.pBits + y * locked.Pitch))[x] = 0x0040;      /* (du 64/127, dv 0) */
+    IDirect3DTexture9_UnlockRect(bump, 0);
+  }
+  const float one = 1.0f, zero = 0.0f, half = 0.5f;
+  DWORD one_bits, zero_bits, half_bits;
+  memcpy(&one_bits, &one, 4);
+  memcpy(&zero_bits, &zero, 4);
+  memcpy(&half_bits, &half, 4);
+  IDirect3DDevice9_SetTexture(g_device, 0, (IDirect3DBaseTexture9 *)bump);
+  IDirect3DDevice9_SetTexture(g_device, 1, (IDirect3DBaseTexture9 *)colours);
+  IDirect3DDevice9_SetSamplerState(g_device, 1, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+  IDirect3DDevice9_SetSamplerState(g_device, 1, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+  IDirect3DDevice9_SetSamplerState(g_device, 1, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+  IDirect3DDevice9_SetTextureStageState(g_device, 0, D3DTSS_COLOROP, D3DTOP_BUMPENVMAP);
+  IDirect3DDevice9_SetTextureStageState(g_device, 0, D3DTSS_BUMPENVMAT00, one_bits);
+  IDirect3DDevice9_SetTextureStageState(g_device, 0, D3DTSS_BUMPENVMAT01, zero_bits);
+  IDirect3DDevice9_SetTextureStageState(g_device, 0, D3DTSS_BUMPENVMAT10, zero_bits);
+  IDirect3DDevice9_SetTextureStageState(g_device, 0, D3DTSS_BUMPENVMAT11, zero_bits);
+  IDirect3DDevice9_SetTextureStageState(g_device, 1, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+  IDirect3DDevice9_SetTextureStageState(g_device, 1, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+  IDirect3DDevice9_SetTextureStageState(g_device, 1, D3DTSS_TEXCOORDINDEX, 0);
+  DWORD passes = 0;
+  check(IDirect3DDevice9_ValidateDevice(g_device, &passes) == D3D_OK && passes == 1, "ValidateDevice takes the bump environment operations");
+  clear(0xFF000000);
+  textured_quad(0, 0, 64, 64, 0xFFFFFFFF);
+  read_back();
+  check(colours && near_colour(pixel(10, 32), 0, 255, 0) && near_colour(pixel(54, 32), 0, 255, 0), "BUMPENVMAP moves the next stage's coordinates by the matrix");
+  IDirect3DDevice9_SetTextureStageState(g_device, 0, D3DTSS_BUMPENVMAT00, zero_bits);
+  clear(0xFF000000);
+  textured_quad(0, 0, 64, 64, 0xFFFFFFFF);
+  read_back();
+  check(near_colour(pixel(10, 32), 255, 0, 0) && near_colour(pixel(54, 32), 0, 255, 0), "... and by nothing with a matrix of 0");
+  /* BUMPENVMAPLUMINANCE with V8U8 (luminance 1): the texel times saturate(1 * 0.5 + 0) */
+  IDirect3DDevice9_SetTextureStageState(g_device, 0, D3DTSS_COLOROP, D3DTOP_BUMPENVMAPLUMINANCE);
+  IDirect3DDevice9_SetTextureStageState(g_device, 0, D3DTSS_BUMPENVLSCALE, half_bits);
+  IDirect3DDevice9_SetTextureStageState(g_device, 0, D3DTSS_BUMPENVLOFFSET, zero_bits);
+  clear(0xFF000000);
+  textured_quad(0, 0, 64, 64, 0xFFFFFFFF);
+  read_back();
+  check(near_colour(pixel(10, 32), 128, 0, 0), "BUMPENVMAPLUMINANCE scales the next stage's texel");
+  IDirect3DDevice9_SetTextureStageState(g_device, 0, D3DTSS_BUMPENVLSCALE, zero_bits);
+  IDirect3DDevice9_SetTextureStageState(g_device, 0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+  IDirect3DDevice9_SetTextureStageState(g_device, 0, D3DTSS_COLORARG2, D3DTA_CURRENT);
+  IDirect3DDevice9_SetTextureStageState(g_device, 1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+  IDirect3DDevice9_SetTextureStageState(g_device, 1, D3DTSS_TEXCOORDINDEX, 1);
+  IDirect3DDevice9_SetSamplerState(g_device, 1, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+  IDirect3DDevice9_SetTexture(g_device, 0, NULL);
+  IDirect3DDevice9_SetTexture(g_device, 1, NULL);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_TEXTUREFACTOR, 0xFFFFFFFF);
+  if (bump) IDirect3DTexture9_Release(bump);
+  if (x8) IDirect3DTexture9_Release(x8);
+  if (colours) IDirect3DTexture9_Release(colours);
+  /* depth buffers: D24S8 locks only when made with TCOS_USAGE_LOCKABLE_DEPTH, depth in the low 24 bits and stencil above; what was written comes back */
+  IDirect3DSurface9 *plain = NULL, *lockable = NULL, *d16 = NULL;
+  IDirect3DDevice9Ex *ex = (IDirect3DDevice9Ex *)g_device;
+  IDirect3DDevice9_CreateDepthStencilSurface(g_device, 8, 8, D3DFMT_D24S8, D3DMULTISAMPLE_NONE, 0, FALSE, &plain, NULL);
+  ex->lpVtbl->CreateDepthStencilSurfaceEx(ex, SIZE, SIZE, D3DFMT_D24S8, D3DMULTISAMPLE_NONE, 0, FALSE, &lockable, NULL, 0x40000000u);
+  ex->lpVtbl->CreateDepthStencilSurfaceEx(ex, 8, 8, D3DFMT_D16, D3DMULTISAMPLE_NONE, 0, FALSE, &d16, NULL, 0x40000000u);
+  check(plain && IDirect3DSurface9_LockRect(plain, &locked, NULL, 0) == D3DERR_INVALIDCALL, "a D24S8 depth buffer cannot be locked");
+  DWORD back24 = 0;
+  WORD back16 = 0;
+  if (lockable && SUCCEEDED(IDirect3DSurface9_LockRect(lockable, &locked, NULL, 0))) {
+    for (int y = 0; y < SIZE; ++y) for (int x = 0; x < SIZE; ++x) ((DWORD *)((BYTE *)locked.pBits + y * locked.Pitch))[x] = 0x5A123456u;
+    IDirect3DSurface9_UnlockRect(lockable);
+    if (SUCCEEDED(IDirect3DSurface9_LockRect(lockable, &locked, NULL, D3DLOCK_READONLY))) {
+      back24 = ((const DWORD *)((const BYTE *)locked.pBits + 3 * locked.Pitch))[5];
+      IDirect3DSurface9_UnlockRect(lockable);
+    }
+  }
+  check(back24 == 0x5A123456u, "... made lockable it can, and what was written comes back from the device");
+  if (lockable) {      /* (cleared by the device: depth 0.5, stencil 7) */
+    IDirect3DSurface9 *old = NULL;
+    IDirect3DDevice9_GetDepthStencilSurface(g_device, &old);
+    IDirect3DDevice9_SetDepthStencilSurface(g_device, lockable);
+    D3DVIEWPORT9 vp = {0, 0, SIZE, SIZE, 0.0f, 1.0f}, was;      /* (a buffer as large as the target: a smaller one is not drawn with) */
+    IDirect3DDevice9_GetViewport(g_device, &was);
+    IDirect3DDevice9_SetViewport(g_device, &vp);
+    IDirect3DDevice9_Clear(g_device, 0, NULL, D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, 0, 0.5f, 7);
+    IDirect3DDevice9_SetDepthStencilSurface(g_device, old);
+    IDirect3DDevice9_SetViewport(g_device, &was);
+    if (old) IDirect3DSurface9_Release(old);
+    if (SUCCEEDED(IDirect3DSurface9_LockRect(lockable, &locked, NULL, D3DLOCK_READONLY))) {
+      back24 = ((const DWORD *)locked.pBits)[0];
+      IDirect3DSurface9_UnlockRect(lockable);
+    }
+    check(back24 >> 24 == 7 && (back24 & 0xFFFFFF) >= 0x7FFFFE && (back24 & 0xFFFFFF) <= 0x800001, "... and what the device cleared is read back");
+  }
+  if (d16 && SUCCEEDED(IDirect3DSurface9_LockRect(d16, &locked, NULL, 0))) {
+    for (int y = 0; y < 8; ++y) for (int x = 0; x < 8; ++x) ((WORD *)((BYTE *)locked.pBits + y * locked.Pitch))[x] = 0x1234;
+    IDirect3DSurface9_UnlockRect(d16);
+    if (SUCCEEDED(IDirect3DSurface9_LockRect(d16, &locked, NULL, D3DLOCK_READONLY))) {
+      back16 = ((const WORD *)locked.pBits)[9];
+      IDirect3DSurface9_UnlockRect(d16);
+    }
+  }
+  check(back16 == 0x1234, "a D16 made lockable keeps 16 bits exactly");
+  if (plain) IDirect3DSurface9_Release(plain);
+  if (lockable) IDirect3DSurface9_Release(lockable);
+  if (d16) IDirect3DSurface9_Release(d16);
+}
+
 /* Each part leaves the device's references as they were: what it made is gone with its last reference. */
 static void api_part(void (*part)(void), const char *name) {
   const ULONG before = refs(g_device);
@@ -1122,6 +1270,7 @@ static void test_api(void) {
   api_part(test_device_misc, "the device's other methods");
   api_part(test_vertex_processing, "vertex processing");
   api_part(test_wide_formats, "wide formats");
+  api_part(test_bump_and_depth_locks, "bump maps and depth locks");
   api_part(test_level_targets, "levels and cube faces as targets");
   api_part(test_process_vertices, "ProcessVertices, draws with what is not set, a smaller target than the depth buffer");
   api_part(test_ex, "Direct3D 9Ex");

@@ -288,15 +288,25 @@ static HRESULT tex_upload_rows(Dev *d, Tex *t, UINT sub, const RECT *rect, const
   ID3D12Resource_Release(upload);
   return D3D_OK;
 }
-/* The depth of a lockable depth buffer (D16_LOCKABLE, D32F_LOCKABLE and D32_LOCKABLE are D32_FLOAT in Direct3D 12) between the device and the program's copy:
- * the whole buffer through a buffer of floats (Direct3D 12 copies depth buffers whole), converted to the lock's format (16 or 32 bits of the depth range, or floats). */
+/* The depth of a lockable depth buffer between the device and the program's copy. D16_LOCKABLE, D32F_LOCKABLE and D32_LOCKABLE (and D16 and D32 made lockable
+ * with TCOS_USAGE_LOCKABLE_DEPTH) are D32_FLOAT in Direct3D 12; the 24-bit formats and those with stencil (D24S8, D24X8, D24X4S4, D15S1, made lockable with
+ * TCOS_USAGE_LOCKABLE_DEPTH) are D24_UNORM_S8_UINT, two planes: 24-bit depth codes and a byte of stencil. The whole buffer goes through a buffer of rows
+ * (Direct3D 12 copies depth buffers whole), converted to the lock's format: 16 or 32 bits of the depth range, floats, or the 24-bit formats with the depth in
+ * the low 24 bits and the stencil above it (D24S8: bits 24-31, D24X4S4: 24-27; D15S1: depth in bits 0-14, stencil in bit 15) - the layouts DirectDraw's
+ * depth formats name with their masks, which is what such a lock is for (ddraw.dll). */
+static UINT32 depth_code(float z, double top) { return !(z > 0.0f) ? 0u : z >= 1.0f ? (UINT32)top : (UINT32)((double)z * top + 0.5); }
 static HRESULT tex_depth_copy(Dev *d, Tex *t, UINT sub, BOOL to_device) {
   BYTE *shadow = tex_shadow(t, sub);
   if (!shadow) return E_OUTOFMEMORY;
-  if (!t->res || !t->depth || !format_depth_lockable(t->format) || t->kind != 0) return D3D_OK;
-  const UINT w = sub_width(t, sub), h = sub_height(t, sub), pitch = format_pitch(t->format, w);
-  const UINT row_pitch = (w * 4u + 255u) & ~255u;
-  ID3D12Resource *buffer = make_buffer(d, to_device ? D3D12_HEAP_TYPE_UPLOAD : D3D12_HEAP_TYPE_READBACK, (UINT64)row_pitch * h);
+  if (!t->res || !t->depth || !t->lockable || t->kind != 0) return D3D_OK;
+  const D3DFORMAT f = t->format;
+  if (f == D3DFMT_D24FS8) return D3DERR_INVALIDCALL;      /* (its depth is a 20-bit float the device does not keep: never made lockable) */
+  const BOOL planes2 = depth_dxgi(f) == DXGI_FORMAT_D24_UNORM_S8_UINT;
+  const UINT w = sub_width(t, sub), h = sub_height(t, sub), pitch = format_pitch(f, w), bytes = depth_bytes(f);
+  const UINT plane_pitch[2] = {(w * 4u + 255u) & ~255u, (w + 255u) & ~255u};
+  const UINT64 plane_at[2] = {0, ((UINT64)plane_pitch[0] * h + 511u) & ~(UINT64)511u};
+  const UINT64 total = planes2 ? plane_at[1] + (UINT64)plane_pitch[1] * h : (UINT64)plane_pitch[0] * h;
+  ID3D12Resource *buffer = make_buffer(d, to_device ? D3D12_HEAP_TYPE_UPLOAD : D3D12_HEAP_TYPE_READBACK, total);
   if (!buffer) return E_OUTOFMEMORY;
   BYTE *memory = NULL;
   HRESULT hr = D3D_OK;
@@ -304,12 +314,27 @@ static HRESULT tex_depth_copy(Dev *d, Tex *t, UINT sub, BOOL to_device) {
     hr = ID3D12Resource_Map(buffer, 0, NULL, (void **)&memory);
     if (SUCCEEDED(hr) && memory) {
       for (UINT y = 0; y < h; ++y) {
-        float *row = (float *)(memory + (SIZE_T)y * row_pitch);
+        BYTE *row = memory + (SIZE_T)y * plane_pitch[0];
+        BYTE *stencil_row = planes2 ? memory + plane_at[1] + (SIZE_T)y * plane_pitch[1] : NULL;
         const BYTE *in = shadow + (SIZE_T)y * pitch;
         for (UINT x = 0; x < w; ++x) {
-          if (t->format == D3DFMT_D16_LOCKABLE) row[x] = ((const WORD *)in)[x] / 65535.0f;
-          else if (t->format == D3DFMT_D32_LOCKABLE) row[x] = (float)(((const DWORD *)in)[x] / 4294967295.0);
-          else memcpy(&row[x], in + (SIZE_T)x * 4, 4);
+          UINT32 raw = 0, word = 0;
+          memcpy(&raw, in + (SIZE_T)x * bytes, bytes);
+          float z = 0.0f;
+          BYTE s = 0;
+          switch (f) {
+            case D3DFMT_D16: case D3DFMT_D16_LOCKABLE: z = (float)(raw / 65535.0); break;
+            case D3DFMT_D32: case D3DFMT_D32_LOCKABLE: z = (float)(raw / 4294967295.0); break;
+            case D3DFMT_D24S8: word = raw & 0xFFFFFFu; s = (BYTE)(raw >> 24); break;
+            case D3DFMT_D24X8: word = raw & 0xFFFFFFu; break;
+            case D3DFMT_D24X4S4: word = raw & 0xFFFFFFu; s = (BYTE)((raw >> 24) & 15u); break;
+            case D3DFMT_D15S1: word = depth_code((float)((raw & 0x7FFFu) / 32767.0), 16777215.0); s = (BYTE)((raw >> 15) & 1u); break;
+            default: memcpy(&z, &raw, 4); break;      /* (D32F_LOCKABLE) */
+          }
+          if (planes2) {
+            memcpy(row + (SIZE_T)x * 4, &word, 4);
+            stencil_row[x] = s;
+          } else memcpy(row + (SIZE_T)x * 4, &z, 4);
         }
       }
       ID3D12Resource_Unmap(buffer, 0, NULL);
@@ -320,21 +345,31 @@ static HRESULT tex_depth_copy(Dev *d, Tex *t, UINT sub, BOOL to_device) {
       if (d->clears[i].depth == t) d->clears[i] = d->clears[--d->clear_count]; else ++i;
     }
   }
-  D3D12_TEXTURE_COPY_LOCATION tex, buf;
-  memset(&tex, 0, sizeof tex);
-  memset(&buf, 0, sizeof buf);
-  tex.pResource = t->res;
-  tex.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-  tex.SubresourceIndex = tex_d12_sub(t, sub);
-  buf.pResource = buffer;
-  buf.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-  buf.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32_TYPELESS;
-  buf.PlacedFootprint.Footprint.Width = w;
-  buf.PlacedFootprint.Footprint.Height = h;
-  buf.PlacedFootprint.Footprint.Depth = 1;
-  buf.PlacedFootprint.Footprint.RowPitch = row_pitch;
-  if (to_device) ID3D12GraphicsCommandList_CopyTextureRegion(d->list, &tex, 0, 0, 0, &buf, NULL);
-  else ID3D12GraphicsCommandList_CopyTextureRegion(d->list, &buf, 0, 0, 0, &tex, NULL);
+  /* (a clear of the whole buffer that waits for the next pass with it - Direct3D 12 here clears a depth buffer when a pass begins, not for a copy - is what
+   * a read gives: its depth and stencil take the place of what the copy brings) */
+  const PendingClear *pending = NULL;
+  if (!to_device)
+    for (UINT i = 0; i < d->clear_count; ++i)
+      if (d->clears[i].depth == t) pending = &d->clears[i];
+  const BOOL clear_z = pending && (pending->flags & D3D12_CLEAR_FLAG_DEPTH), clear_s = pending && (pending->flags & D3D12_CLEAR_FLAG_STENCIL);
+  for (UINT plane = 0; plane < (planes2 ? 2u : 1u); ++plane) {
+    D3D12_TEXTURE_COPY_LOCATION tex, buf;
+    memset(&tex, 0, sizeof tex);
+    memset(&buf, 0, sizeof buf);
+    tex.pResource = t->res;
+    tex.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    tex.SubresourceIndex = tex_d12_sub(t, sub) + plane * t->kmips;      /* (the stencil plane's subresources follow the depth plane's) */
+    buf.pResource = buffer;
+    buf.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    buf.PlacedFootprint.Offset = plane_at[plane];
+    buf.PlacedFootprint.Footprint.Format = plane ? DXGI_FORMAT_R8_TYPELESS : DXGI_FORMAT_R32_TYPELESS;
+    buf.PlacedFootprint.Footprint.Width = w;
+    buf.PlacedFootprint.Footprint.Height = h;
+    buf.PlacedFootprint.Footprint.Depth = 1;
+    buf.PlacedFootprint.Footprint.RowPitch = plane_pitch[plane];
+    if (to_device) ID3D12GraphicsCommandList_CopyTextureRegion(d->list, &tex, 0, 0, 0, &buf, NULL);
+    else ID3D12GraphicsCommandList_CopyTextureRegion(d->list, &buf, 0, 0, 0, &tex, NULL);
+  }
   t->used = d->epoch;
   d->recorded = 1;
   flush(d);
@@ -342,13 +377,26 @@ static HRESULT tex_depth_copy(Dev *d, Tex *t, UINT sub, BOOL to_device) {
     hr = ID3D12Resource_Map(buffer, 0, NULL, (void **)&memory);
     if (SUCCEEDED(hr) && memory) {
       for (UINT y = 0; y < h; ++y) {
-        const float *row = (const float *)(memory + (SIZE_T)y * row_pitch);
+        const BYTE *row = memory + (SIZE_T)y * plane_pitch[0];
+        const BYTE *stencil_row = planes2 ? memory + plane_at[1] + (SIZE_T)y * plane_pitch[1] : NULL;
         BYTE *out = shadow + (SIZE_T)y * pitch;
         for (UINT x = 0; x < w; ++x) {
-          const float z = row[x] < 0.0f ? 0.0f : row[x] > 1.0f ? 1.0f : row[x];
-          if (t->format == D3DFMT_D16_LOCKABLE) ((WORD *)out)[x] = (WORD)(z * 65535.0f + 0.5f);
-          else if (t->format == D3DFMT_D32_LOCKABLE) ((DWORD *)out)[x] = (DWORD)(z * 4294967295.0 + 0.5);
-          else memcpy(out + (SIZE_T)x * 4, &row[x], 4);
+          UINT32 word = 0, raw = 0;
+          memcpy(&word, row + (SIZE_T)x * 4, 4);
+          float z = 0.0f;
+          if (!planes2) memcpy(&z, &word, 4);
+          if (clear_z) z = pending->z < 0.0f ? 0.0f : pending->z > 1.0f ? 1.0f : pending->z;
+          const UINT32 code = clear_z ? depth_code(z, 16777215.0) : word & 0xFFFFFFu, s = clear_s ? pending->stencil : planes2 ? stencil_row[x] : 0u;
+          switch (f) {
+            case D3DFMT_D16: case D3DFMT_D16_LOCKABLE: raw = depth_code(z, 65535.0); break;
+            case D3DFMT_D32: case D3DFMT_D32_LOCKABLE: raw = depth_code(z, 4294967295.0); break;
+            case D3DFMT_D24S8: raw = code | s << 24; break;
+            case D3DFMT_D24X8: raw = code; break;
+            case D3DFMT_D24X4S4: raw = code | (s & 15u) << 24; break;
+            case D3DFMT_D15S1: raw = depth_code((float)(code / 16777215.0), 32767.0) | (s & 1u) << 15; break;
+            default: memcpy(&raw, &z, 4); break;
+          }
+          memcpy(out + (SIZE_T)x * bytes, &raw, bytes);
         }
       }
       ID3D12Resource_Unmap(buffer, 0, NULL);
@@ -359,10 +407,19 @@ static HRESULT tex_depth_copy(Dev *d, Tex *t, UINT sub, BOOL to_device) {
 }
 /* Sends a subresource's pixels (the program's copy) to the Direct3D 12 texture: converted to B8G8R8A8 (through the current palette for P8 and A8P8). */
 static HRESULT tex_upload(Dev *d, Tex *t, UINT sub) {
-  if (t->depth && t->res && t->shadow[sub] && format_depth_lockable(t->format)) return tex_depth_copy(d, t, sub, TRUE);
+  if (t->depth && t->res && t->shadow[sub] && t->lockable) return tex_depth_copy(d, t, sub, TRUE);
   if (!t->res || t->depth || !t->shadow[sub] || sub_level(t, sub) >= t->kmips) return D3D_OK;
   const UINT w = sub_width(t, sub), h = sub_height(t, sub), slices = tex_slices(t, sub), bytes = format_bytes(t->format);
   if (dxt_block(t->format)) return tex_upload_rows(d, t, sub, NULL, t->shadow[sub], format_pitch(t->format, w), format_pitch(t->format, w) * format_rows(t->format, h));
+  if (format_is_signed(t->format)) {      /* (signed numbers: row_to_signed) */
+    const UINT gb = gpu_bytes(t->format);
+    BYTE *rows = mem_alloc((SIZE_T)w * gb * h * slices);
+    if (!rows) return E_OUTOFMEMORY;
+    for (UINT row = 0; row < h * slices; ++row) row_to_signed(t->format, t->shadow[sub] + (SIZE_T)row * w * bytes, w, rows + (SIZE_T)row * w * gb);
+    const HRESULT hr = tex_upload_rows(d, t, sub, NULL, rows, w * gb, w * gb * h);
+    mem_free(rows);
+    return hr;
+  }
   if (format_is_wide(t->format)) {      /* (its own pixels: as they are, but for A2R10G10B10's red and blue) */
     BYTE *rows = mem_alloc((SIZE_T)w * bytes * h * slices);
     if (!rows) return E_OUTOFMEMORY;
@@ -416,7 +473,7 @@ static HRESULT tex_download(Dev *d, Tex *t, UINT sub, BYTE *rows, UINT pitch) {
 static HRESULT tex_fetch(Dev *d, Tex *t, UINT sub) {
   BYTE *shadow = tex_shadow(t, sub);
   if (!shadow) return E_OUTOFMEMORY;
-  if (t->depth && t->res && format_depth_lockable(t->format)) return tex_depth_copy(d, t, sub, FALSE);
+  if (t->depth && t->res && t->lockable) return tex_depth_copy(d, t, sub, FALSE);
   if (!tex_device_owned(t) || t->depth) return D3D_OK;
   const UINT w = sub_width(t, sub), h = sub_height(t, sub);
   if (format_is_wide(t->format)) {
@@ -619,7 +676,7 @@ static HRESULT tex_lock(Tex *t, UINT sub, D3DLOCKED_RECT *out, const RECT *rect,
   if (!out) return D3DERR_INVALIDCALL;
   const UINT bytes = format_bytes(t->format), block = dxt_block(t->format);
   if (sub >= tex_subresources(t) || (t->locked[sub] & 0x80000000u) || !tex_lockable(t)) return D3DERR_INVALIDCALL;
-  if (t->depth && !format_depth_lockable(t->format)) return D3DERR_INVALIDCALL;
+  if (t->depth && !t->lockable) return D3DERR_INVALIDCALL;
   if (!t->depth && !bytes && !block && !format_is_yuv(t->format)) return D3DERR_INVALIDCALL;
   const UINT w = sub_width(t, sub), h = sub_height(t, sub);
   /* (Direct3D 9 checks the rectangle of a compressed level only in the default pool: in the others any rectangle locks - Wine's test_surface_blocks

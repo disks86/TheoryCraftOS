@@ -682,6 +682,8 @@ static HRESULT shader_make_ex(Dev *d, const DWORD *code, BOOL vertex, int implic
       s->major = translated->major;
       s->state = translated->state_register;
       s->fill = translated->fill_register;
+      s->bump = translated->bump_register;
+      s->bump_stages = translated->bump_stages;
       for (UINT i = 0; i < 16; ++i) if (translated->sampler_mask >> i & 1) s->sampler_count = i + 1;
       memcpy(s->sampler_kind, translated->sampler_kind, sizeof s->sampler_kind);
       for (UINT i = 0; i < TEXTURE_SETS; ++i) if (translated->varying_mask >> (SM_SLOT_TEXCOORD + i) & 1) s->coordinates = i + 1;

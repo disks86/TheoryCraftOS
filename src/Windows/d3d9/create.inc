@@ -190,6 +190,9 @@ static HRESULT STDMETHODCALLTYPE dev_CreateDepthStencilSurfaceEx(Dev *d, UINT wi
                                                                  IDirect3DSurface9 **out, HANDLE *shared, DWORD usage) {
   (void)discard;
   /* (a call refused for its arguments leaves *out as it was, as Windows does) */
-  if (!format_is_depth(format) || (usage & ~(DWORD)EX_SURFACE_USAGES)) return D3DERR_INVALIDCALL;
-  return surface_create(d, width, height, D3DUSAGE_DEPTHSTENCIL | usage, format, D3DPOOL_DEFAULT, 0, samples, quality, shared, out);
+  if (!format_is_depth(format) || (usage & ~(DWORD)(EX_SURFACE_USAGES | TCOS_USAGE_LOCKABLE_DEPTH))) return D3DERR_INVALIDCALL;
+  const BOOL lockable = (usage & TCOS_USAGE_LOCKABLE_DEPTH) != 0;
+  if (lockable && (format == D3DFMT_D24FS8 || samples != D3DMULTISAMPLE_NONE)) return D3DERR_INVALIDCALL;      /* (tex_depth_copy: no float-24 depth, no samples) */
+  return surface_create(d, width, height, D3DUSAGE_DEPTHSTENCIL | (usage & ~(DWORD)TCOS_USAGE_LOCKABLE_DEPTH), format, D3DPOOL_DEFAULT, lockable ? TEX_LOCKABLE : 0, samples,
+                        quality, shared, out);
 }

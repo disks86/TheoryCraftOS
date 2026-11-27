@@ -426,7 +426,10 @@ void test_pixel_shaders_1(HostAllocator& allocator) {
     const Tokens tokens = a.end();
     return sm_translate(tokens.data(), tokens.size(), &g_shader, &g_context);
   };
-  CHECK(status_of(1, [](Asm& a) { a.ins(66, {dst(kAddr, 0)}).ins(67, {dst(kAddr, 1), src(kAddr, 0)}); }) == SM_UNSUPPORTED);      // texbem
+  CHECK(status_of(1, [](Asm& a) { a.ins(67, {dst(kAddr, 1), src(kAddr, 0), src(kAddr, 2)}); }) != SM_OK);                         // texbem has two parameters
+  CHECK(status_of(4, [](Asm& a) { a.ins(67, {dst(kTemp, 1), src(kTemp, 0)}); }) != SM_OK);                                              // ... and is no 1.4 instruction
+  CHECK(status_of(4, [](Asm& a) { a.ins(89, {dst(kTemp, 1, 0x7), src(kTemp, 0), src(kTemp, 2)}); }) == SM_INVALID);                  // bem writes .rg only
+  CHECK(status_of(1, [](Asm& a) { a.ins(89, {dst(kTemp, 1, 0x3), src(kTemp, 0), src(kTemp, 2)}); }) != SM_OK);                       // ... and is 1.4's
   CHECK(status_of(1, [](Asm& a) { a.ins(73, {dst(kAddr, 1), src(kAddr, 0)}).ins(73, {dst(kAddr, 2), src(kAddr, 0)}).ins(74, {dst(kAddr, 3), src(kAddr, 0)}); }) == SM_UNSUPPORTED);
   CHECK(status_of(4, [](Asm& a) { a.ins(87, {dst(kTemp, 5)}); }) == SM_UNSUPPORTED);                                                // texdepth
   CHECK(status_of(1, [](Asm& a) { a.ins(72, {dst(kAddr, 1), src(kAddr, 0)}); }) == SM_INVALID);                                       // texm3x2tex with no row before it
@@ -439,6 +442,90 @@ void test_pixel_shaders_1(HostAllocator& allocator) {
     const Tokens tokens = a.end();
     CHECK(sm_translate(tokens.data(), tokens.size(), &g_shader, &g_context) == SM_INVALID);
   }
+}
+
+// The bump environment instructions of pixel shaders 1.x (texbem, texbeml; 1.4's bem): a stage's coordinates moved by its matrix (D3DTSS_BUMPENVMAT*,
+// the shader's bump registers after its fill registers) times du, dv of another register; texbeml scaling by the luminance. The textures here give
+// back where they are looked up, so the moved coordinates can be seen.
+struct EchoTextures final : graphics::ITextureSet {
+  graphics::Vec4 sample(uint32_t unit, float u, float v) const override { return {u, v, 0.25f + 0.125f * static_cast<float>(unit), 1.0f}; }
+};
+Result run_bump(HostAllocator& allocator, const Tokens& tokens, const float matrix[6][4], const float luminance[6][2]) {
+  Result r = {};
+  if (sm_translate(tokens.data(), tokens.size(), &g_shader, &g_context) != SM_OK) return r;
+  UniquePointer<D3d9Program> program = compile_translated(allocator, g_shader);
+  if (!program) return r;
+  static uint8_t constants[4096];
+  memset(constants, 0, sizeof constants);
+  for (unsigned n = 0; n < g_shader.float_registers; ++n)
+    for (unsigned k = 0; k < 4; ++k) { const float v = constant_value(n, k); memcpy(constants + n * 16 + k * 4, &v, 4); }
+  put_state(constants);
+  // (the layout draw.inc fills in: stage n's matrix at 2n, its luminance scale and offset at 2n + 1, from bump_register on)
+  if ((g_shader.bump_register + 2 * g_shader.bump_stages) * 16 > sizeof constants || g_shader.constant_registers < g_shader.bump_register + 2 * g_shader.bump_stages) return r;
+  for (unsigned n = 0; n < g_shader.bump_stages; ++n) {
+    memcpy(constants + (g_shader.bump_register + 2 * n) * 16, matrix[n], 16);
+    memcpy(constants + (g_shader.bump_register + 2 * n + 1) * 16, luminance[n], 8);
+  }
+  graphics::Vec4 in[16] = {};
+  for (unsigned i = 0; i < 4; ++i) in[i] = {kIn[i][0], kIn[i][1], kIn[i][2], kIn[i][3]};
+  in[4] = {kMore[0][0], kMore[0][1], kMore[0][2], kMore[0][3]};
+  in[5] = {kMore[1][0], kMore[1][1], kMore[1][2], kMore[1][3]};
+  in[SM_SLOT_TEXCOORD + 8 - 1] = {kFog, 0, 0, 0};
+  graphics::Vec4 colours[graphics::kMaxColorTargets] = {};
+  graphics::FragmentContext context;
+  context.position = {32.5f, 16.5f, 0.0f, 0.0f};
+  EchoTextures textures;
+  r.alive = program->run_fragment_ex(in, context, constants, &textures, &colours[0]);
+  const float c[4] = {colours[0].x, colours[0].y, colours[0].z, colours[0].w};
+  memcpy(r.colour, c, sizeof c);
+  r.ok = true;
+  return r;
+}
+void test_bump(HostAllocator& allocator) {
+  float matrix[6][4] = {}, luminance[6][2] = {};
+  const float m[4] = {0.5f, -0.25f, 1.0f, 2.0f};      // (M00, M01, M10, M11)
+  memcpy(matrix[1], m, sizeof m);
+  luminance[1][0] = 2.0f, luminance[1][1] = 0.1f;
+  // texbem t1, t0: t0 is stage 0 at coordinates 0 (0.125, 0.875), so du 0.125 and dv 0.875 move coordinates 1 (1.5, 0.2) by stage 1's matrix
+  const float *c0 = kIn[2], *c1 = kIn[3];
+  const float u = c1[0] + m[0] * c0[0] + m[2] * c0[1], v = c1[1] + m[1] * c0[0] + m[3] * c0[1];
+  Asm a(false, 1, 1);
+  a.ins(66, {dst(kAddr, 0)}).ins(67, {dst(kAddr, 1), src(kAddr, 0)}).ins(1, {dst(kTemp, 0), src(kAddr, 1)});
+  Result r = run_bump(allocator, a.end(), matrix, luminance);
+  CHECK(g_shader.bump_stages == 2 && g_shader.bump_register == g_shader.fill_register + 2 && g_shader.sampler_mask == 0x3);
+  CHECK(colour_is(r, u, v, 0.375f, 1.0f));
+  // texbeml: the same, times t0's third number (0.25) * the scale + the offset, not clamped
+  Asm b(false, 1, 2);
+  b.ins(66, {dst(kAddr, 0)}).ins(68, {dst(kAddr, 1), src(kAddr, 0)}).ins(1, {dst(kTemp, 0), src(kAddr, 1)});
+  const float l = 0.25f * 2.0f + 0.1f;
+  CHECK(colour_is(run_bump(allocator, b.end(), matrix, luminance), u * l, v * l, 0.375f * l, l));
+  luminance[1][0] = 10.0f;      // (above 1: not clamped)
+  const float big = 0.25f * 10.0f + 0.1f;
+  CHECK(colour_is(run_bump(allocator, b.end(), matrix, luminance), u * big, v * big, 0.375f * big, big));
+  luminance[1][0] = 2.0f;
+  // the source's swizzle and modifier count: texbem t1, t0_bx2 (2 x - 1)
+  Asm c(false, 1, 3);
+  c.ins(66, {dst(kAddr, 0)}).ins(67, {dst(kAddr, 1), src(kAddr, 0, kXyzw, 4)}).ins(1, {dst(kTemp, 0), src(kAddr, 1)});
+  const float du = 2.0f * c0[0] - 1.0f, dv = 2.0f * c0[1] - 1.0f;
+  CHECK(colour_is(run_bump(allocator, c.end(), matrix, luminance), c1[0] + m[0] * du + m[2] * dv, c1[1] + m[1] * du + m[3] * dv, 0.375f, 1.0f));
+  // two of them: texbem t1, t0 and texbem t3, t2 with stage 3's matrix
+  float matrix3[6][4] = {};
+  memcpy(matrix3[1], m, sizeof m);
+  const float m3[4] = {-1.0f, 0.5f, 0.25f, 0.0f};
+  memcpy(matrix3[3], m3, sizeof m3);
+  Asm e(false, 1, 3);
+  e.ins(66, {dst(kAddr, 0)}).ins(67, {dst(kAddr, 1), src(kAddr, 0)}).ins(66, {dst(kAddr, 2)}).ins(67, {dst(kAddr, 3), src(kAddr, 2)});
+  e.ins(2, {dst(kTemp, 0), src(kAddr, 1), src(kAddr, 3)});
+  const float *c2 = kMore[0], *c3 = kMore[1];
+  const float u3 = c3[0] + m3[0] * c2[0] + m3[2] * c2[1], v3 = c3[1] + m3[1] * c2[0] + m3[3] * c2[1];
+  Result two = run_bump(allocator, e.end(), matrix3, luminance);
+  CHECK(g_shader.bump_stages == 4 && g_shader.sampler_mask == 0xF);
+  CHECK(colour_is(two, u + u3, v + v3, 0.375f + 0.625f, 2.0f));
+  // bem r3.rg, r1, r2 (1.4): r1.rg + stage 3's matrix times r2's r, g; r3's b and a stay
+  Asm f(false, 1, 4);
+  f.ins(64, {dst(kTemp, 1, 0x7), src(kAddr, 0)}).ins(64, {dst(kTemp, 2, 0x7), src(kAddr, 1)}).ins(1, {dst(kTemp, 3), src(kConst, 0)});
+  f.ins(89, {dst(kTemp, 3, 0x3), src(kTemp, 1), src(kTemp, 2)}).ins(1, {dst(kTemp, 0), src(kTemp, 3)});
+  CHECK(colour_is(run_bump(allocator, f.end(), matrix3, luminance), c0[0] + m3[0] * c1[0] + m3[2] * c1[1], c0[1] + m3[1] * c1[0] + m3[3] * c1[1], cv(0, 2), cv(0, 3)));
 }
 
 // What a pixel shader's end does by its state registers: the alpha test and fog. (The depth of the pixel is 0 here.)
@@ -722,6 +809,7 @@ int main() {
   std::vector<Tokens> shaders;
   test_instructions(allocator);
   test_pixel_shaders_1(allocator);
+  test_bump(allocator);
   test_pixel_state(allocator);
   test_refusals();
   test_fixtures(allocator, &shaders);
