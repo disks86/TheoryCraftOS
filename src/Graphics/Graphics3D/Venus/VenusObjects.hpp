@@ -34,7 +34,7 @@ class VenusBuffer final : public IBuffer {
   uint64_t size() const override { return size_; }
   ByteView map() override;
   void unmap() override {}   // (host-coherent memory: the GPU sees what was written)
-  bool read_back() override { return true; }   // (submit waits for the GPU and makes its writes visible to the host)
+  bool read_back() override;   // (waits for a submit still running: the device makes the GPU's writes visible to the host when it ends)
   VkBuffer buffer() const { return memory_.buffer; }
   uint64_t room() const { return memory_.size; }   // (the memory behind it: a stream output buffer's is a word more than size())
 
@@ -239,7 +239,26 @@ class VenusPipeline final : public IPipeline {
 // The command buffer: CommandRecorder's list, replayed by VenusDevice::submit.
 class VenusCommands final : public CommandRecorder {
  public:
-  explicit VenusCommands(allocators::IAllocator& allocator) : CommandRecorder(allocator) {}
+  VenusCommands(VenusDevice& device, allocators::IAllocator& allocator) : CommandRecorder(allocator), device_(device) {}
+  void defer_completion(bool defer) override { defer_completion_ = defer; }
+  bool completion_deferred() const { return defer_completion_; }
+  // The counts of a submit the device left running (ICommandBuffer::defer_completion) come when it has been waited for: asking for one waits.
+  void begin() override {
+    if (results_pending()) device_.settle();
+    CommandRecorder::begin();
+  }
+  bool query_value(uint32_t slot, uint32_t index, uint64_t* value) const override {
+    if (results_pending()) device_.settle();
+    return CommandRecorder::query_value(slot, index, value);
+  }
+  bool query_results_ready() const override { return !results_pending(); }
+  bool results_pending() const { return __atomic_load_n(&results_pending_, __ATOMIC_ACQUIRE); }
+  void set_results_pending(bool pending) { __atomic_store_n(&results_pending_, pending, __ATOMIC_RELEASE); }   // (the device's, under the queue's lock)
+
+ private:
+  VenusDevice& device_;
+  bool defer_completion_ = false;
+  bool results_pending_ = false;
 };
 
 }  // namespace graphics

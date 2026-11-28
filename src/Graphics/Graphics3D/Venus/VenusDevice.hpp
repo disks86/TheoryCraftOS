@@ -55,6 +55,8 @@ class VenusImage;
 class VenusShaderModule;
 class VenusPipeline;
 class VenusCommands;
+struct VenusQueryReadback;
+class VenusCommands;
 
 // A host-visible allocation the device maps (buffers, the staging buffer, the constant ring).
 struct VenusMemory {
@@ -163,11 +165,23 @@ class VenusDevice final : public IGraphicsDevice {
   const RateAttachment* rate_attachment(VkCommandBuffer cb);
   bool clock_interrupted() const { return __atomic_load_n(&clock_interrupted_, __ATOMIC_ACQUIRE); }
   void clear_clock_interrupted() { __atomic_store_n(&clock_interrupted_, false, __ATOMIC_RELEASE); }
-  // submit's command buffer: begun (the queue's lock taken), and submitted, waited for and reset (the lock let go). Also used to split a long submit.
+  // submit's command buffer: begun (the queue's lock taken), and submitted, waited for and reset (the lock let go). Also used to split a long submit. With
+  // `leave_running` the submit is not waited for: it is the pending one, which whoever takes the queue next waits for (settle).
   VkCommandBuffer begin_main();
-  bool finish_main(VkCommandBuffer cb);
+  bool finish_main(VkCommandBuffer cb, bool leave_running = false);
+  // The queue's lock; taking it first waits for a submit left running (ICommandBuffer::defer_completion) and lets go of what it used.
   bool lock_queue();
   void unlock_queue();
+  // Waits for a submit left running, if there is one: before the CPU reads or writes memory the GPU may be using, or something it uses goes.
+  void settle() {
+    lock_queue();
+    unlock_queue();
+  }
+  // What a submit left running made for itself and may still be using: let go of by settle.
+  [[nodiscard]] bool retire_view(VkBufferView view) { return retired_views_.push_back(view); }
+  [[nodiscard]] bool retire_sets(VenusPipeline* pipeline);
+  // Where the queries of a submit left running wait to be counted (one submit is left running at a time; made on first use). nullptr when memory ran out.
+  VenusQueryReadback* query_readback();
   // Sparse memory bound and unbound on the queue (VenusImage::set_residency), and waited for. False if the host refused it.
   bool bind_sparse(const VkBindSparseInfo& info);
   uint32_t uniform_alignment() const { return uniform_alignment_; }
@@ -181,6 +195,10 @@ class VenusDevice final : public IGraphicsDevice {
   bool begin_once();
   bool end_once();
   bool wait_fence(VkFence fence);
+  void settle_locked();
+  // The counts of a submit left running into its command buffer (`counted`: it ran - else it has none), after the wait; the pools are not reset before.
+  void finish_readback_locked(bool counted);
+  void drop_query_readback();
 
   allocators::IAllocator& allocator_;
   hardware::IGraphicsProcessingUnit& screen_;
@@ -221,6 +239,10 @@ class VenusDevice final : public IGraphicsDevice {
   bool shading_rate_usable_ = false;   // (the host's coarse shading with its R8_UINT attachment, whatever its largest coarse pixel)
   kernel::Mutex staging_lock_;        // staging_ and what is in it
   kernel::Mutex queue_lock_;          // the queue and the two command buffers (images are written from several threads)
+  bool pending_ = false;                         // main_ is submitted and not yet waited for (under the queue's lock)
+  List<VkBufferView> retired_views_;             // (the pending submit's buffer views)
+  List<VenusPipeline*> retired_sets_;            // (the pipelines whose descriptor sets the pending submit uses)
+  VenusQueryReadback* readback_ = nullptr;       // (its queries)
   bool clock_interrupted_ = false;
   bool initialized_ = false;
 };

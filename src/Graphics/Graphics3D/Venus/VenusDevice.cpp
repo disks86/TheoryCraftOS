@@ -35,7 +35,8 @@ constexpr uint64_t kStagingStart = 4u << 20;
 }  // namespace
 
 VenusDevice::VenusDevice(allocators::IAllocator& allocator, hardware::IGraphicsProcessingUnit& screen, MemoryAccount account, void* account_context)
-    : allocator_(allocator), screen_(screen), account_(account), account_context_(account_context), pools_(allocator), samplers_(allocator), resolve_pipelines_(allocator) {}
+    : allocator_(allocator), screen_(screen), account_(account), account_context_(account_context), pools_(allocator), samplers_(allocator), resolve_pipelines_(allocator),
+      retired_views_(allocator), retired_sets_(allocator) {}
 
 void VenusDevice::trace(StringView what, uint32_t line, StringView message) {
   char text[200];
@@ -61,6 +62,8 @@ void VenusDevice::trace(StringView what, uint32_t line, StringView message) {
 
 VenusDevice::~VenusDevice() {
   if (!ctx_.opened()) return;
+  settle();
+  drop_query_readback();
   vk().DeviceWaitIdle(device());
   for (ResolvePipeline& r : resolve_pipelines_) {
     destroy_pipeline(r.pipeline);
@@ -272,9 +275,35 @@ void VenusDevice::add_video_memory(int64_t bytes) {
 
 bool VenusDevice::lock_queue() {
   queue_lock_.lock();
+  settle_locked();
   return true;
 }
 void VenusDevice::unlock_queue() { queue_lock_.unlock(); }
+
+// The submit left running (finish_main's leave_running) waited for, its command buffer reset, and what it used let go of. A wait that fails (the host lost the
+// device, or 20 s passed) leaves nothing pending all the same: the device is lost then, and whatever comes next fails on its own.
+void VenusDevice::settle_locked() {
+  if (!pending_) return;
+  pending_ = false;
+  const bool waited = wait_fence(fence_);
+  finish_readback_locked(waited);
+  vk().ResetCommandBuffer(main_, 0);
+  for (VkBufferView v : retired_views_) vk().DestroyBufferView(device(), v, nullptr);
+  retired_views_.clear();
+  for (VenusPipeline* p : retired_sets_) p->reset_sets();
+  retired_sets_.clear();
+}
+
+bool VenusDevice::retire_sets(VenusPipeline* pipeline) {
+  for (VenusPipeline* p : retired_sets_)
+    if (p == pipeline) return true;
+  return retired_sets_.push_back(pipeline);
+}
+
+bool VenusBuffer::read_back() {
+  device_.settle();
+  return true;
+}
 
 bool VenusDevice::bind_sparse(const VkBindSparseInfo& info) {
   if (!ctx_.caps().sparse_queue) return false;
@@ -571,8 +600,7 @@ bool VenusDevice::widened_96(Format f) const {
 
 bool VenusDevice::format_supports(VkFormat f, VkFormatFeatureFlags features) const {
   if (f == VK_FORMAT_UNDEFINED) return false;
-  VkFormatProperties p{};
-  vk().GetPhysicalDeviceFormatProperties(ctx_.physical(), f, &p);
+  const VkFormatProperties p = ctx_.format_properties(f);
   return (p.optimalTilingFeatures & features) == features;
 }
 
@@ -705,6 +733,7 @@ IBuffer* VenusDevice::create_buffer(uint64_t size, uint32_t usage) {
 
 void VenusDevice::destroy_buffer(IBuffer* buffer) {
   if (!buffer) return;
+  settle();   // (a submit still running may use it)
   VenusBuffer* b = static_cast<VenusBuffer*>(buffer);
   add_video_memory(-static_cast<int64_t>(b->size()));
   free_memory(&b->memory_);
@@ -712,7 +741,10 @@ void VenusDevice::destroy_buffer(IBuffer* buffer) {
   allocator_.deallocate(b);
 }
 
-ByteView VenusBuffer::map() { return ByteView(memory_.map, size_); }
+ByteView VenusBuffer::map() {
+  device_.settle();   // (the CPU's view: after any submit still running that may read or write it)
+  return ByteView(memory_.map, size_);
+}
 
 // ---- images ------------------------------------------------------------------------------------------------------------------------------------------
 IImage* VenusDevice::create_image(const ImageDesc& desc) {
@@ -729,6 +761,7 @@ IImage* VenusDevice::create_image(const ImageDesc& desc) {
 
 void VenusDevice::destroy_image(IImage* image) {
   if (!image) return;
+  settle();   // (a submit still running may use it)
   VenusImage* v = static_cast<VenusImage*>(image);
   v->~VenusImage();
   allocator_.deallocate(v);

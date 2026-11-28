@@ -112,6 +112,7 @@ IPipeline* VenusDevice::create_compute_pipeline(const IShaderModule* shader) {
 
 void VenusDevice::destroy_pipeline(IPipeline* pipeline) {
   if (!pipeline) return;
+  settle();   // (a submit still running may draw with it, and its descriptor sets wait to be given back)
   VenusPipeline* p = static_cast<VenusPipeline*>(pipeline);
   p->~VenusPipeline();
   allocator_.deallocate(p);
@@ -454,8 +455,7 @@ bool VenusPipeline::make(Variant& v) {
         o.attribute_type[a.location] = !vertex_format_is_integer(a.format) ? tgsi::ValueType::Float
                                        : (t == VertexType::Sint8 || t == VertexType::Sint16 || t == VertexType::Sint32) ? tgsi::ValueType::Sint : tgsi::ValueType::Uint;
         const VkFormat f = vertex_vk_format(a.format);
-        VkFormatProperties fp{};
-        vk.GetPhysicalDeviceFormatProperties(ctx.physical(), f, &fp);
+        const VkFormatProperties fp = ctx.format_properties(f);
         if (a.format == VertexFormat::Bgrx8Unorm || (!(fp.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) && widened(f) != VK_FORMAT_UNDEFINED))
           o.attribute_one_w |= static_cast<uint16_t>(1u << a.location);
       }
@@ -621,8 +621,7 @@ bool VenusPipeline::make_graphics(Variant& v, const VkPipelineShaderStageCreateI
     }
     binding_of[i] = static_cast<uint8_t>(found);
     VkFormat f = vertex_vk_format(a.format);
-    VkFormatProperties fp{};
-    vk.GetPhysicalDeviceFormatProperties(ctx.physical(), f, &fp);
+    const VkFormatProperties fp = ctx.format_properties(f);
     if (!(fp.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT)) {
       f = widened(f);   // (the shader sees the fourth component as 1: CompileOptions::attribute_one_w)
       if (f == VK_FORMAT_UNDEFINED) return false;

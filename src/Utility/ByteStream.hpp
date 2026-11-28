@@ -90,8 +90,9 @@ class ByteReader {
       failed_ = true;
       return 0;
     }
+    // (checked once above: the bytes are walked as the view's range, which the compiler makes one load of)
     uint64_t value = 0;
-    for (uint32_t i = 0; i < bytes; ++i) value = (value << 8) | data_[position_ + i];
+    for (const uint8_t byte : data_.subview(position_, bytes)) value = (value << 8) | byte;
     position_ += bytes;
     return value;
   }
@@ -101,7 +102,11 @@ class ByteReader {
       return 0;
     }
     uint64_t value = 0;
-    for (uint32_t i = 0; i < bytes; ++i) value |= uint64_t{data_[position_ + i]} << (8 * i);
+    uint32_t shift = 0;
+    for (const uint8_t byte : data_.subview(position_, bytes)) {
+      value |= uint64_t{byte} << shift;
+      shift += 8;
+    }
     position_ += bytes;
     return value;
   }

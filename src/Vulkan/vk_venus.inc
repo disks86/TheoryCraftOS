@@ -95,23 +95,30 @@ typedef struct VnLock {
 } VnLock;
 static void vn_lock(VnLock *l) {
   for (uint32_t spins = 0; __atomic_exchange_n(&l->taken, 1, __ATOMIC_ACQUIRE); ++spins)
-    if (spins > 64) vk_os_sleep_ns(20000);
+    if (spins > 64) vk_os_sleep_ns(0);   /* (a yield: a sleep would last as long as the timer makes it, and the holder lets go in microseconds) */
 }
 static void vn_unlock(VnLock *l) { __atomic_store_n(&l->taken, 0, __ATOMIC_RELEASE); }
 
-/* Waiting for the host: a few quick looks, then sleeps that grow to a millisecond (the host's ring thread runs on its own CPU; a reply usually takes tens of
- * microseconds). */
+/* Waiting for the host. Its ring thread runs on a CPU of its own and answers a command in tens of microseconds, but a sleep lasts as long as the system's
+ * timer makes it (in the kernel most of a millisecond for any sleep) - with a thousand calls a second that was most of the time. So for the first VN_SPIN_NS
+ * the waiter only gives its CPU to whoever else wants it (a sleep of 0: a yield) and looks again; after that it sleeps, longer each time, up to a millisecond
+ * (a submission still running on the host's GPU, a cold shader compile). */
+#define VN_SPIN_NS 250000ull
 typedef struct VnRelax {
-  uint32_t step;
+  uint32_t sleeps;
+  bool started;
+  uint64_t start;
 } VnRelax;
 static void vn_relax(VnRelax *r) {
-  if (r->step < 16) {
-    ++r->step;
+  const uint64_t now = vk_os_now_ns();
+  if (!r->started) r->started = true, r->start = now;
+  if (now - r->start < VN_SPIN_NS) {
+    vk_os_sleep_ns(0);
     return;
   }
-  uint64_t ns = 10000ull << (r->step - 16 < 7 ? r->step - 16 : 7);
+  uint64_t ns = 10000ull << (r->sleeps < 7 ? r->sleeps : 7);
   if (ns > 1000000) ns = 1000000;
-  ++r->step;
+  ++r->sleeps;
   vk_os_sleep_ns(ns);
 }
 
@@ -214,8 +221,11 @@ static bool vn_renderer_submit(VnRenderer *r, const void *commands, size_t size)
 /* ---- the ring -------------------------------------------------------------------------------------------------------------------------------------------------- */
 #define VN_RING_BUFFER_BYTES (128u * 1024u)
 #define VN_RING_DIRECT_BYTES (VN_RING_BUFFER_BYTES / 16)   /* (bigger commands go in shared memory of their own: vkExecuteCommandStreamsMESA) */
-#define VN_RING_IDLE_TIMEOUT_NS 1000000ull
+/* (how long the host's ring thread keeps looking for commands before it sleeps; a sleeping one must be woken by a command through the device - a virtio kick that
+ * QEMU's main thread takes and passes on - so an idle time shorter than the gaps between a program's calls costs that on almost every call) */
+#define VN_RING_IDLE_TIMEOUT_NS 10000000ull
 #define VN_REPLY_MIN_BYTES (1u << 20)
+#define VN_STREAM_MIN_BYTES (1u << 20)   /* (the big-command memory's first size) */
 
 struct vn_ring {
   VnRenderer *renderer;
@@ -226,6 +236,7 @@ struct vn_ring {
   uint32_t cur;      /* the bytes written so far (wraps): a command's seqno is cur after it */
   VnLock lock;
   VnShmem reply;     /* where replies go (grown when a reply does not fit) */
+  VnShmem stream;    /* where a command too big for the ring goes (grown when one does not fit) */
   bool fatal;
 };
 
@@ -241,7 +252,7 @@ static void vn_ring_wait_seqno(struct vn_ring *ring, uint32_t seqno) {
   VnRelax relax = {0};
   while (!vn_ring_ge_seqno(ring, vn_ring_load_head(ring), seqno)) {
     if (__atomic_load_n(ring->status, __ATOMIC_ACQUIRE) & VK_RING_STATUS_FATAL_BIT_MESA) {
-      ring->fatal = true;
+      __atomic_store_n(&ring->fatal, true, __ATOMIC_RELEASE);
       return;
     }
     vn_relax(&relax);
@@ -267,7 +278,7 @@ static bool vn_ring_submit_direct_locked(struct vn_ring *ring, const void *data,
   VnRelax relax = {0};
   while (ring->cur + size - vn_ring_load_head(ring) > VN_RING_BUFFER_BYTES) {   /* (room: wait for the host to consume) */
     if (__atomic_load_n(ring->status, __ATOMIC_ACQUIRE) & VK_RING_STATUS_FATAL_BIT_MESA) {
-      ring->fatal = true;
+      __atomic_store_n(&ring->fatal, true, __ATOMIC_RELEASE);
       return false;
     }
     vn_relax(&relax);
@@ -276,7 +287,7 @@ static bool vn_ring_submit_direct_locked(struct vn_ring *ring, const void *data,
   __atomic_store_n(ring->tail, ring->cur, __ATOMIC_SEQ_CST);
   const uint32_t status = __atomic_load_n(ring->status, __ATOMIC_SEQ_CST);
   if (status & VK_RING_STATUS_FATAL_BIT_MESA) {
-    ring->fatal = true;
+    __atomic_store_n(&ring->fatal, true, __ATOMIC_RELEASE);
     vk_os_trace("venus: the host stopped the ring (a command it could not decode)\n");
     return false;
   }
@@ -293,19 +304,22 @@ static bool vn_ring_submit_direct_locked(struct vn_ring *ring, const void *data,
 static bool vn_ring_submit_locked(struct vn_ring *ring, const void *data, size_t size, uint32_t *seqno) {
   if (ring->fatal || !size) return false;
   if (size <= VN_RING_DIRECT_BYTES) return vn_ring_submit_direct_locked(ring, data, (uint32_t)size, seqno);
-  /* A big command (a large command buffer, a shader, an update): in shared memory of its own, which the ring points the host at. The memory goes once the host
-   * has consumed the pointer (it executes the stream right then). */
-  VnShmem stream;
-  if (!vn_shmem_create(ring->renderer, size, &stream)) return false;
-  memcpy(stream.map, data, size);
-  const VkCommandStreamDescriptionMESA desc = {stream.res, 0, size};
+  /* A big command (a large command buffer, a shader, an update): in the ring's stream memory, which the ring points the host at. The host executes the stream
+   * when it reaches the pointer, so once it has consumed that the memory is free for the next big command; it is kept (and grown when a command does not fit)
+   * because making and dropping one is a round trip to the device each. */
+  if (ring->stream.size < size) {
+    vn_shmem_destroy(ring->renderer, &ring->stream);
+    const size_t want = size > VN_STREAM_MIN_BYTES ? size : VN_STREAM_MIN_BYTES;
+    if (!vn_shmem_create(ring->renderer, want, &ring->stream)) return false;
+  }
+  memcpy(ring->stream.map, data, size);
+  const VkCommandStreamDescriptionMESA desc = {ring->stream.res, 0, size};
   uint32_t exec[32];
   struct vn_cs_encoder enc = {(uint8_t *)exec, (uint8_t *)exec, (uint8_t *)exec + sizeof exec, false, false};
   vn_encode_vkExecuteCommandStreamsMESA(&enc, 0, 1, &desc, NULL, 0, NULL, 0);
   uint32_t done = 0;
   const bool ok = !enc.fatal && vn_ring_submit_direct_locked(ring, exec, (uint32_t)vn_cs_encoder_get_len(&enc), &done);
   if (ok) vn_ring_wait_seqno(ring, done);
-  vn_shmem_destroy(ring->renderer, &stream);
   if (ok && seqno) *seqno = done;
   return ok;
 }
@@ -341,6 +355,7 @@ static void vn_ring_destroy(struct vn_ring *ring) {
   vn_renderer_submit(ring->renderer, data, vn_cs_encoder_get_len(&enc));
   /* (the host has destroyed the ring when it answers: execbuffer is fenced; after that the memory may go) */
   vn_shmem_destroy(ring->renderer, &ring->reply);
+  vn_shmem_destroy(ring->renderer, &ring->stream);
   vn_shmem_destroy(ring->renderer, &ring->shmem);
 }
 
@@ -1311,7 +1326,10 @@ static void VKAPI_CALL vn_vkDestroyCommandPool(VkDevice device, VkCommandPool po
 static VkResult VKAPI_CALL vn_vkResetCommandPool(VkDevice device, VkCommandPool pool_handle, VkCommandPoolResetFlags flags) {
   VnCommandPool *pool = vn_pool(pool_handle);
   for (VnCommandBuffer *c = pool->buffers; c; c = c->next) c->cs.cur = c->cs.base, c->cs.fatal = false, c->recording = false;
-  return vn_call_vkResetCommandPool(vn_ring_of_device(device), device, pool_handle, flags);
+  /* (not waited for, as Mesa does: a reset can only fail for want of memory, and the ring's order puts it before anything recorded after it) */
+  struct vn_ring *ring = vn_ring_of_device(device);
+  vn_async_vkResetCommandPool(ring, device, pool_handle, flags);
+  return __atomic_load_n(&ring->fatal, __ATOMIC_ACQUIRE) ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
 }
 
 static VkResult VKAPI_CALL vn_vkAllocateCommandBuffers(VkDevice device, const VkCommandBufferAllocateInfo *info, VkCommandBuffer *out) {
@@ -1388,7 +1406,10 @@ static VkResult VKAPI_CALL vn_vkEndCommandBuffer(VkCommandBuffer buffer) {
 static VkResult VKAPI_CALL vn_vkResetCommandBuffer(VkCommandBuffer buffer, VkCommandBufferResetFlags flags) {
   VnCommandBuffer *cmd = vn_command_buffer(buffer);
   cmd->cs.cur = cmd->cs.base, cmd->cs.fatal = false, cmd->recording = false;
-  return vn_call_vkResetCommandBuffer(vn_ring_of_command_buffer(buffer), buffer, flags);
+  /* (not waited for, as Mesa does: see vn_vkResetCommandPool) */
+  struct vn_ring *ring = vn_ring_of_command_buffer(buffer);
+  vn_async_vkResetCommandBuffer(ring, buffer, flags);
+  return __atomic_load_n(&ring->fatal, __ATOMIC_ACQUIRE) ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
 }
 
 /* ---- descriptor update templates: kept by the guest and turned into the descriptor writes they stand for ------------------------------------------------ */

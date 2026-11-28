@@ -95,10 +95,16 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
     if (c->dsv->tex->desc.SampleDesc.Count > 1) key.samples = c->dsv->tex->desc.SampleDesc.Count;
   }
   if (!c->dsv) { key.depth.DepthEnable = FALSE; key.depth.StencilEnable = FALSE; }
+  {
+    UINT h = 2166136261u;   /* (FNV-1a) */
+    const BYTE *bytes = (const BYTE *)&key;
+    for (SIZE_T i = 0; i < offsetof(Pipeline, state); ++i) h = (h ^ bytes[i]) * 16777619u;
+    key.hash = h;
+  }
   Pipeline *oldest = &d->pipelines[0];
   for (UINT i = 0; i < d->pipeline_count; ++i) {
     Pipeline *p = &d->pipelines[i];
-    if (p->vs == key.vs && p->ps == key.ps && p->gs == key.gs && p->hs == key.hs && p->ds == key.ds && p->layout == key.layout && p->targets == key.targets && p->has_depth == key.has_depth && p->samples == key.samples &&
+    if (p->hash == key.hash && p->vs == key.vs && p->ps == key.ps && p->gs == key.gs && p->hs == key.hs && p->ds == key.ds && p->layout == key.layout && p->targets == key.targets && p->has_depth == key.has_depth && p->samples == key.samples &&
         memcmp(p->formats, key.formats, sizeof key.formats) == 0 && p->depth_format == key.depth_format &&
         memcmp(&p->blend, &key.blend, sizeof key.blend) == 0 && memcmp(&p->depth, &key.depth, sizeof key.depth) == 0 && memcmp(&p->raster, &key.raster, sizeof key.raster) == 0 && p->logic_op == key.logic_op && p->conservative == key.conservative &&
         p->forced == key.forced) {

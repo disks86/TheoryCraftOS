@@ -91,7 +91,7 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 #define SPARES_MAX_BYTES (16u << 20)  /* ... in all */
 #define RTV_SLOTS 1024u
 #define DSV_SLOTS 256u
-#define PIPELINES 96u
+#define PIPELINES 1024u             /* pipelines kept (least recently used goes): a scene that draws with more than are kept makes them again and again, a host compile each */
 #define VERTEX_SLOTS 8u
 #define VB_BIND_SLOTS 32u             /* the vertex buffer slots a program binds (D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT): kept and given back; draws read the first VERTEX_SLOTS (a layout of an element past them is not drawn) */
 #define ACTIVE_QUERIES 32u            /* queries begun and not ended at once */
@@ -318,6 +318,7 @@ typedef struct Pipeline {
   DXGI_FORMAT formats[8], depth_format;      /* (a pipeline is made for its targets' formats) */
   ID3D12PipelineState *state;
   UINT last_used;
+  UINT hash;                          /* of everything above `state` (the key was zeroed before it was filled: its padding counts as zero): looked at first */
 } Pipeline;
 
 /* The immediate context: what is bound. Every pointer is a reference. */

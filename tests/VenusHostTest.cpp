@@ -24,9 +24,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <atomic>
+#include <thread>
 #include "Graphics/BlockCompression.hpp"
 #include "Graphics/Graphics3D/Software/SoftwareDevice.hpp"
 #include "Graphics/Graphics3D/Venus/KernelVulkan.h"
+#include "Graphics/Graphics3D/LockedDevice.hpp"
 #include "Graphics/Graphics3D/Venus/VenusDevice.hpp"
 #include "Graphics/Graphics3D/WebGlAccelerator.hpp"
 #include "Kernel/Dxgkrnl/Conformance.hpp"
@@ -229,6 +232,121 @@ int main() {
     if (fs) device.destroy_shader_module(fs);
     if (vs_rate) device.destroy_shader_module(vs_rate);
     if (vs) device.destroy_shader_module(vs);
+  }
+  // A submit the device leaves running (ICommandBuffer::defer_completion): whatever reads it afterwards waits for it - a query's count, an image's pixels, map() -,
+  // the next submit too, and from several threads at once (through LockedDevice, as the kernel shares the device).
+  {
+    static const char kVs[] = "VERT\nDCL IN[0]\nDCL OUT[0], POSITION\n  0: MOV OUT[0], IN[0]\n  1: END\n";
+    static const char kFs[] = "FRAG\nDCL OUT[0], COLOR\nIMM[0] FLT32 {0.300000000000, 0.000000000000, 0.900000000000, 1.000000000000}\n  0: MOV OUT[0], IMM[0]\n  1: END\n";
+    graphics::LockedDevice locked(device);
+    graphics::ShaderModuleDesc vd, fd;
+    vd.stage = graphics::ShaderStage::Vertex, vd.tgsi = kVs;
+    fd.stage = graphics::ShaderStage::Fragment, fd.tgsi = kFs;
+    graphics::IShaderModule* vs = locked.create_shader_module(vd);
+    graphics::IShaderModule* fs = locked.create_shader_module(fd);
+    graphics::GraphicsPipelineDesc pd;
+    pd.vertex_shader = vs, pd.fragment_shader = fs, pd.vertex_stride = 16, pd.attribute_count = 1;
+    pd.attributes[0] = {0, graphics::VertexFormat::Float4, 0};
+    pd.cull_mode = graphics::CullMode::None;
+    graphics::IPipeline* pipe = vs && fs ? locked.create_graphics_pipeline(pd) : nullptr;
+    const float tri[12] = {-1, -1, 0.5f, 1, 3, -1, 0.5f, 1, -1, 3, 0.5f, 1};
+    graphics::IBuffer* vb = locked.create_buffer(sizeof tri, graphics::kBufferVertex);
+    if (vb) {
+      memcpy(vb->map().data(), tri, sizeof tri);
+      vb->unmap();
+    }
+    // (B8G8R8A8: 0.3 and 0.9 are 76.5 and 229.5, either way)
+    auto right_colour = [](uint32_t px) {
+      const uint32_t r = px >> 16 & 0xFF, g = px >> 8 & 0xFF, b = px & 0xFF;
+      return (px >> 24) == 0xFF && r >= 76 && r <= 77 && g == 0 && b >= 229 && b <= 230;
+    };
+    // draws the triangle (the whole of a w x w target) into `image`, counted by occlusion query `slot` unless it is ~0, and submits it left running
+    auto draw = [&](graphics::ICommandBuffer* cb, graphics::IImage* image, uint32_t slot) {
+      graphics::RenderPassBegin pass;
+      pass.color = image;
+      pass.clear_color = true;
+      cb->defer_completion(true);
+      cb->begin();
+      if (slot != ~0u) cb->begin_query(slot, graphics::QueryKind::Occlusion);
+      cb->begin_render_pass(pass);
+      cb->bind_pipeline(pipe);
+      cb->bind_vertex_buffer(vb);
+      cb->draw(3);
+      cb->end_render_pass();
+      if (slot != ~0u) cb->end_query(slot);
+      return cb->end() && locked.submit(cb);
+    };
+    {
+      graphics::IImage* image = locked.create_image({{4, 4}, graphics::Format::B8G8R8A8Unorm, graphics::kImageColorAttachment | graphics::kImageSampled});
+      graphics::ICommandBuffer* cb = locked.create_command_buffer();
+      graphics::ICommandBuffer* second = locked.create_command_buffer();
+      uint64_t samples = 0, again = 0;
+      uint32_t px[16] = {};
+      const bool drawn = image && cb && second && pipe && vb && draw(cb, image, 3);
+      const bool pending_before = drawn && !cb->query_results_ready();   // (the count comes with the wait)
+      const bool counted = drawn && cb->query_value(3, 0, &samples) && cb->query_results_ready();
+      // (a second submit left running while the first's counts are kept: the next one waits for it, and reading the image waits for the last)
+      const bool drawn2 = drawn && draw(second, image, 5) && draw(second, image, ~0u);
+      const bool read = drawn2 && image->read_pixels(ArrayView<uint32_t>(px, 16));
+      const bool kept = counted && cb->query_value(3, 0, &again) && again == samples;
+      bool all = read;
+      for (uint32_t p : px) all = all && right_colour(p);
+      const bool ok = pending_before && counted && samples == 16 && kept && all;
+      printf("  left running: %s (count %llu, pending first %d, pixel 0x%08x)\n", ok ? "right" : "FAILED", static_cast<unsigned long long>(samples), pending_before ? 1 : 0, px[5]);
+      if (!ok) ++g_failed;
+      // (a command buffer let go of while its counts are still to come)
+      graphics::ICommandBuffer* dropped = locked.create_command_buffer();
+      if (dropped && image && draw(dropped, image, 1)) locked.destroy_command_buffer(dropped);
+      else if (dropped) locked.destroy_command_buffer(dropped), ++g_failed, printf("FAILED left running: drop\n");
+      if (second) locked.destroy_command_buffer(second);
+      if (cb) locked.destroy_command_buffer(cb);
+      if (image) locked.destroy_image(image);
+    }
+    // threads: two draw and count into images of their own, left running; one writes and reads back buffers of its own through map() meanwhile
+    {
+      std::atomic<int> failures{0};
+      auto drawer = [&](uint32_t rounds) {
+        graphics::IImage* image = locked.create_image({{8, 8}, graphics::Format::B8G8R8A8Unorm, graphics::kImageColorAttachment | graphics::kImageSampled});
+        graphics::ICommandBuffer* cb = locked.create_command_buffer();
+        if (!image || !cb) ++failures;
+        for (uint32_t i = 0; image && cb && i < rounds; ++i) {
+          uint64_t samples = 0;
+          uint32_t px[64] = {};
+          if (!draw(cb, image, i % 7) || !cb->query_value(i % 7, 0, &samples) || samples != 64) ++failures;
+          if (i % 8 == 7 && (!image->read_pixels(ArrayView<uint32_t>(px, 64)) || !right_colour(px[27]))) ++failures;
+        }
+        if (cb) locked.destroy_command_buffer(cb);
+        if (image) locked.destroy_image(image);
+      };
+      auto mapper = [&](uint32_t rounds) {
+        for (uint32_t i = 0; i < rounds; ++i) {
+          graphics::IBuffer* b = locked.create_buffer(4096, graphics::kBufferVertex);
+          if (!b) {
+            ++failures;
+            continue;
+          }
+          ByteView m = b->map();
+          for (uint64_t k = 0; k < m.size(); ++k) m[k] = static_cast<uint8_t>(i + k);
+          b->unmap();
+          ConstByteView back = b->map();
+          for (uint64_t k = 0; k < back.size(); ++k)
+            if (back[k] != static_cast<uint8_t>(i + k)) {
+              ++failures;
+              break;
+            }
+          locked.destroy_buffer(b);
+        }
+      };
+      std::thread a(drawer, 120), b(drawer, 120), c(mapper, 200);
+      a.join(), b.join(), c.join();
+      const bool ok = failures.load() == 0 && pipe && vb;
+      printf("  left running, three threads: %s (%d failures)\n", ok ? "right" : "FAILED", failures.load());
+      if (!ok) ++g_failed;
+    }
+    if (vb) locked.destroy_buffer(vb);
+    if (pipe) locked.destroy_pipeline(pipe);
+    if (fs) locked.destroy_shader_module(fs);
+    if (vs) locked.destroy_shader_module(vs);
   }
   // what format_caps says of each format is what create_image does (the kernel hands the caps to user mode as format support)
   for (uint32_t fi = 64; fi < 128; ++fi) {

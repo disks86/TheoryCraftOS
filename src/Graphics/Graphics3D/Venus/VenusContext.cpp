@@ -277,7 +277,20 @@ bool VenusContext::open() {
     close();
     return false;
   }
+  // (every format the device may ask about, once: each question is a round trip to the host, and the answers never change)
+  for (uint32_t f = 0; f < kCachedCoreFormats; ++f) vk_->GetPhysicalDeviceFormatProperties(physical_, static_cast<VkFormat>(f), &core_formats_[f]);
+  for (uint32_t i = 0; i < kCachedExtensionFormats; ++i) vk_->GetPhysicalDeviceFormatProperties(physical_, kExtensionFormats[i], &extension_formats_[i]);
   return true;
+}
+
+VkFormatProperties VenusContext::format_properties(VkFormat format) const {
+  const uint32_t f = static_cast<uint32_t>(format);
+  if (f < kCachedCoreFormats) return core_formats_[f];
+  for (uint32_t i = 0; i < kCachedExtensionFormats; ++i)
+    if (kExtensionFormats[i] == format) return extension_formats_[i];
+  VkFormatProperties p{};
+  vk_->GetPhysicalDeviceFormatProperties(physical_, format, &p);
+  return p;
 }
 
 void VenusContext::close() {

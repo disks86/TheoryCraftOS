@@ -289,6 +289,9 @@ class Adapter::StreamRunner {
     if (cb_) return status::kSuccess;
     cb_ = adapter_.device_.create_command_buffer();
     if (!cb_) return status::kNoMemory;
+    // (the GPU may go on with it after submit: everything here reaches the memory of allocations through VidMm, which maps buffers and reads and writes images
+    // through the device after every flush - ICommandBuffer::defer_completion)
+    cb_->defer_completion(true);
     device_topology_ = graphics::PrimitiveTopology::TriangleList;
     device_patch_points_ = 0;
     cb_->begin();

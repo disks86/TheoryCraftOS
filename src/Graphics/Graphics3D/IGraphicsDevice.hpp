@@ -1348,6 +1348,10 @@ class ICommandBuffer {
   // Before submit(): `defer` lets the device return from submit() before the queries' counts are in - a count asked for afterwards (occlusion_result, query_value)
   // waits for them -, so that a submit is not held for the GPU to finish. A device that waits in submit() anyway ignores it.
   virtual void defer_query_results(bool defer) { (void)defer; }
+  // Before submit(): `defer` says the caller reads and writes the buffers and images this submit uses only through map() (called again after the submit, not a view
+  // kept from before it), read_back(), the images' read and write calls and the device's own calls - so a device may return from submit() once the work is queued,
+  // before the GPU has done it, and have those wait for it. A device that waits in submit() anyway ignores it.
+  virtual void defer_completion(bool defer) { (void)defer; }
   // After submit(): every count is in (query_value does not wait). True for a device that waited in submit().
   virtual bool query_results_ready() const { return true; }
   // After submit(): value `index` of a query's result (index 0 is occlusion_result; a PipelineStatistics query has kPipelineStatisticCount). False for a slot not begun and ended, or past its values.

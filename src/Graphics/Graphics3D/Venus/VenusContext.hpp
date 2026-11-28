@@ -108,6 +108,9 @@ class VenusContext {
 
   // A memory type among `bits` that has all of `need`, preferring one that also has `prefer`; -1 if none.
   int32_t memory_type(uint32_t bits, VkMemoryPropertyFlags need, VkMemoryPropertyFlags prefer = 0) const;
+  // vkGetPhysicalDeviceFormatProperties of the device, from what open() asked once for every core format and the extension formats the device uses (any
+  // other is asked of the host).
+  VkFormatProperties format_properties(VkFormat format) const;
 
  private:
   const TcosKernelVulkan* vk_ = nullptr;
@@ -120,6 +123,11 @@ class VenusContext {
   VkPhysicalDeviceMemoryProperties memory_{};
   VenusCaps caps_;
   char driver_name_[VK_MAX_DRIVER_NAME_SIZE] = {};
+  static constexpr uint32_t kCachedCoreFormats = VK_FORMAT_ASTC_12x12_SRGB_BLOCK + 1;   // (Vulkan 1.0's formats are numbered 0 to this one)
+  static constexpr VkFormat kExtensionFormats[] = {VK_FORMAT_A4R4G4B4_UNORM_PACK16, VK_FORMAT_A4B4G4R4_UNORM_PACK16};
+  static constexpr uint32_t kCachedExtensionFormats = sizeof(kExtensionFormats) / sizeof(kExtensionFormats[0]);
+  VkFormatProperties core_formats_[kCachedCoreFormats] = {};
+  VkFormatProperties extension_formats_[kCachedExtensionFormats] = {};
 };
 
 }  // namespace graphics::venus

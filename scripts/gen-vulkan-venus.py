@@ -195,6 +195,11 @@ def has_output(c):
 def handle_value(t, idexpr):
     return f"VN_HANDLE({t}, {idexpr})"
 
+# Commands that return a VkResult but are sent without waiting for the host's answer, as Mesa's Venus driver sends them: their only failures are running out of
+# memory or a lost device (which the next wait reports), and a round trip each would cost far more than they do (a submission, resets and frees every draw or
+# submit). They answer VK_ERROR_DEVICE_LOST once the host has stopped the ring.
+ASYNC_RESULT = {"vkQueueSubmit", "vkQueueSubmit2", "vkResetFences", "vkFreeDescriptorSets", "vkResetDescriptorPool", "vkSetEvent", "vkResetEvent"}
+
 body = []
 for n in forwarded:
     c = commands[n]
@@ -217,6 +222,13 @@ for n in forwarded:
     use_call = has_output(c) and n in has_call
     if not use_call and n not in has_async:
         use_call = n in has_call
+    if n in ASYNC_RESULT and n in has_async and c["ret"] == "VkResult" and not outs:
+        lines.append(f"  struct vn_ring *ring = {ring};")
+        lines.append(f"  vn_async_{n}(ring, {args});")
+        lines.append("  return __atomic_load_n(&ring->fatal, __ATOMIC_ACQUIRE) ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;")
+        lines.append("}")
+        body.append("\n".join(lines) + "\n")
+        continue
     if use_call:
         if c["ret"] == "void":
             lines.append(f"  vn_call_{n}({ring}, {args});")

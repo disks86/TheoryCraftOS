@@ -1040,8 +1040,9 @@ static VkResult VKAPI_CALL vn_vkFlushMappedMemoryRanges(VkDevice device, uint32_
 }
 
 static VkResult VKAPI_CALL vn_vkFreeDescriptorSets(VkDevice device, VkDescriptorPool descriptorPool, uint32_t descriptorSetCount, const VkDescriptorSet* pDescriptorSets) {
-  const VkResult result = vn_call_vkFreeDescriptorSets(vn_ring_of_device(device), device, descriptorPool, descriptorSetCount, pDescriptorSets);
-  return result;
+  struct vn_ring *ring = vn_ring_of_device(device);
+  vn_async_vkFreeDescriptorSets(ring, device, descriptorPool, descriptorSetCount, pDescriptorSets);
+  return __atomic_load_n(&ring->fatal, __ATOMIC_ACQUIRE) ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
 }
 
 static VkDeviceAddress VKAPI_CALL vn_vkGetBufferDeviceAddress(VkDevice device, const VkBufferDeviceAddressInfo* pInfo) {
@@ -1202,28 +1203,33 @@ static VkResult VKAPI_CALL vn_vkQueueBindSparse(VkQueue queue, uint32_t bindInfo
 }
 
 static VkResult VKAPI_CALL vn_vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits, VkFence fence) {
-  const VkResult result = vn_call_vkQueueSubmit(vn_ring_of_queue(queue), queue, submitCount, pSubmits, fence);
-  return result;
+  struct vn_ring *ring = vn_ring_of_queue(queue);
+  vn_async_vkQueueSubmit(ring, queue, submitCount, pSubmits, fence);
+  return __atomic_load_n(&ring->fatal, __ATOMIC_ACQUIRE) ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
 }
 
 static VkResult VKAPI_CALL vn_vkQueueSubmit2(VkQueue queue, uint32_t submitCount, const VkSubmitInfo2* pSubmits, VkFence fence) {
-  const VkResult result = vn_call_vkQueueSubmit2(vn_ring_of_queue(queue), queue, submitCount, pSubmits, fence);
-  return result;
+  struct vn_ring *ring = vn_ring_of_queue(queue);
+  vn_async_vkQueueSubmit2(ring, queue, submitCount, pSubmits, fence);
+  return __atomic_load_n(&ring->fatal, __ATOMIC_ACQUIRE) ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
 }
 
 static VkResult VKAPI_CALL vn_vkResetDescriptorPool(VkDevice device, VkDescriptorPool descriptorPool, VkDescriptorPoolResetFlags flags) {
-  const VkResult result = vn_call_vkResetDescriptorPool(vn_ring_of_device(device), device, descriptorPool, flags);
-  return result;
+  struct vn_ring *ring = vn_ring_of_device(device);
+  vn_async_vkResetDescriptorPool(ring, device, descriptorPool, flags);
+  return __atomic_load_n(&ring->fatal, __ATOMIC_ACQUIRE) ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
 }
 
 static VkResult VKAPI_CALL vn_vkResetEvent(VkDevice device, VkEvent event) {
-  const VkResult result = vn_call_vkResetEvent(vn_ring_of_device(device), device, event);
-  return result;
+  struct vn_ring *ring = vn_ring_of_device(device);
+  vn_async_vkResetEvent(ring, device, event);
+  return __atomic_load_n(&ring->fatal, __ATOMIC_ACQUIRE) ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
 }
 
 static VkResult VKAPI_CALL vn_vkResetFences(VkDevice device, uint32_t fenceCount, const VkFence* pFences) {
-  const VkResult result = vn_call_vkResetFences(vn_ring_of_device(device), device, fenceCount, pFences);
-  return result;
+  struct vn_ring *ring = vn_ring_of_device(device);
+  vn_async_vkResetFences(ring, device, fenceCount, pFences);
+  return __atomic_load_n(&ring->fatal, __ATOMIC_ACQUIRE) ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
 }
 
 static void VKAPI_CALL vn_vkResetQueryPool(VkDevice device, VkQueryPool queryPool, uint32_t firstQuery, uint32_t queryCount) {
@@ -1231,8 +1237,9 @@ static void VKAPI_CALL vn_vkResetQueryPool(VkDevice device, VkQueryPool queryPoo
 }
 
 static VkResult VKAPI_CALL vn_vkSetEvent(VkDevice device, VkEvent event) {
-  const VkResult result = vn_call_vkSetEvent(vn_ring_of_device(device), device, event);
-  return result;
+  struct vn_ring *ring = vn_ring_of_device(device);
+  vn_async_vkSetEvent(ring, device, event);
+  return __atomic_load_n(&ring->fatal, __ATOMIC_ACQUIRE) ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
 }
 
 static VkResult VKAPI_CALL vn_vkSignalSemaphore(VkDevice device, const VkSemaphoreSignalInfo* pSignalInfo) {

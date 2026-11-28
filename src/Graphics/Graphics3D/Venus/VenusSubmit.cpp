@@ -29,12 +29,13 @@ namespace graphics {
 ICommandBuffer* VenusDevice::create_command_buffer() {
   void* memory = allocator_.allocate_aligned(sizeof(VenusCommands), alignof(VenusCommands));
   if (!memory) return nullptr;
-  return new (memory) VenusCommands(allocator_);
+  return new (memory) VenusCommands(*this, allocator_);
 }
 
 void VenusDevice::destroy_command_buffer(ICommandBuffer* commands) {
   if (!commands) return;
   VenusCommands* c = static_cast<VenusCommands*>(commands);
+  if (c->results_pending()) settle();   // (its counts are still to come from a submit left running)
   c->~VenusCommands();
   allocator_.deallocate(c);
 }
@@ -213,6 +214,36 @@ struct BoundTexel {
   TexelBufferView view;
 };
 
+// Queries. Vulkan, like GL, counts one query of a kind at a time: each query of ours is the sum of the segments of its kind's pool that ran while it was open.
+// A segment ends and the next begins whenever a query of its kind begins or ends, a rendering begins or ends, or the command buffer is split; a timestamp is
+// written where its query ends.
+enum QueryCategory : uint32_t { kQueryCatOcclusion, kQueryCatStatistics, kQueryCatStream0, kQueryCategories = kQueryCatStream0 + kMaxGeometryStreams };
+struct ReplayQuery {
+  bool begun = false, ended = false;
+  QueryKind kind = QueryKind::Occlusion;
+  uint32_t stream = 0;
+  uint32_t timestamp = 0;
+  uint64_t synthetic = 0;
+};
+struct QuerySegment {
+  uint32_t category = 0, index = 0;
+  bool no_fragment = false;   // (a statistics segment around a draw whose pixel shader stands in for none: its fragment shader runs are not counted)
+  uint64_t open[kMaxOcclusionQueries / 64] = {};
+};
+
+}  // namespace
+
+// The queries of a submit left running, counted when the device has waited for it (VenusDevice::finish_readback_locked).
+struct VenusQueryReadback {
+  explicit VenusQueryReadback(allocators::IAllocator& allocator) : segments(allocator) {}
+  VenusCommands* commands = nullptr;   // (whose counts these are; nullptr: none waiting)
+  uint32_t used[VenusDevice::kPoolKinds] = {};
+  ReplayQuery queries[kMaxOcclusionQueries];
+  List<QuerySegment> segments;
+};
+
+namespace {
+
 // One submit's replay.
 class Replay {
  public:
@@ -223,6 +254,7 @@ class Replay {
   }
   bool run();
   void release();   // (after the GPU is done: what the replay made for itself)
+  void retire();   // (for a submit left running: release() when the device has waited for it)
 
  private:
   bool begin_pass(const RenderPassBegin& p);
@@ -263,6 +295,7 @@ class Replay {
   }
   void set_fragment_shading_rate();
   bool read_queries();
+  [[nodiscard]] bool defer_counts();
   bool resolve(const RecordedCommand& c);
   // stream output
   bool bind_stream_output(const RecordedCommand& c);
@@ -327,22 +360,10 @@ class Replay {
   };
   List<MadeView> views_;
   List<VenusPipeline*> pipelines_;   // (their descriptor sets are given back after the submit)
-  // Queries. Vulkan, like GL, counts one query of a kind at a time: each query of ours is the sum of the segments of its kind's pool that ran while it was open.
-  // A segment ends and the next begins whenever a query of its kind begins or ends, a rendering begins or ends, or the command buffer is split; a timestamp is
-  // written where its query ends.
-  enum Category : uint32_t { kCatOcclusion, kCatStatistics, kCatStream0, kCategories = kCatStream0 + kMaxGeometryStreams };
-  struct UserQuery {
-    bool begun = false, ended = false;
-    QueryKind kind = QueryKind::Occlusion;
-    uint32_t stream = 0;
-    uint32_t timestamp = 0;
-    uint64_t synthetic = 0;
-  };
-  struct Segment {
-    uint32_t category = 0, index = 0;
-    bool no_fragment = false;   // (a statistics segment around a draw whose pixel shader stands in for none: its fragment shader runs are not counted)
-    uint64_t open[kMaxOcclusionQueries / 64] = {};
-  };
+  // (queries: see QueryCategory, UserQuery and QuerySegment)
+  enum Category : uint32_t { kCatOcclusion = kQueryCatOcclusion, kCatStatistics = kQueryCatStatistics, kCatStream0 = kQueryCatStream0, kCategories = kQueryCategories };
+  using UserQuery = ReplayQuery;
+  using Segment = QuerySegment;
   UserQuery queries_[kMaxOcclusionQueries];
   uint64_t open_[kMaxOcclusionQueries / 64] = {};
   int32_t order_[kMaxOcclusionQueries];   // (the open queries in the order they began: end_occlusion_query ends the newest)
@@ -427,6 +448,25 @@ void Replay::release() {
   for (const MadeView& v : views_) vk_.DestroyBufferView(d_.device(), v.view, nullptr);
   views_.clear();
   for (VenusPipeline* p : pipelines_) p->reset_sets();
+}
+
+// release() for a submit left running: the device lets go of the same once it has waited for it. (Out of memory for its lists: the submit is waited for at once,
+// what was handed over goes with that wait and the rest here.)
+void Replay::retire() {
+  uint64_t handed = 0;
+  for (const MadeView& v : views_) {
+    if (!d_.retire_view(v.view)) break;
+    ++handed;
+  }
+  bool all = handed == views_.count();
+  for (VenusPipeline* p : pipelines_) all = all && d_.retire_sets(p);
+  if (!all) {
+    d_.settle();
+    for (uint64_t i = handed; i < views_.count(); ++i) vk_.DestroyBufferView(d_.device(), views_[i].view, nullptr);
+    for (VenusPipeline* p : pipelines_) p->reset_sets();
+  }
+  views_.clear();
+  pipelines_.clear();
 }
 
 // The pass's attachments, cleared or kept (VirglDevice's refusals: a colour target is needed, depth is D32F, the extents agree, no gaps in the extra targets).
@@ -992,24 +1032,25 @@ bool Replay::end_query(const RecordedCommand& c) {
   return true;
 }
 
-// After the fence: every segment's counts, added up into the queries that were open while it ran.
-bool Replay::read_queries() {
-  if (!any_queries_) return true;
+// After the fence: every segment's counts, added up into the queries that were open while it ran, for the command buffer's query_value. (Before the next submit
+// resets the pools.)
+bool count_queries(VenusDevice& d, const uint32_t (&used)[VenusDevice::kPoolKinds], const ReplayQuery (&queries)[kMaxOcclusionQueries], const List<QuerySegment>& segments,
+                   CommandRecorder& rec) {
   const uint32_t strides[VenusDevice::kPoolKinds] = {1, kPipelineStatisticCount, 2, 1};
-  List<uint64_t> results[VenusDevice::kPoolKinds] = {List<uint64_t>(d_.allocator()), List<uint64_t>(d_.allocator()), List<uint64_t>(d_.allocator()), List<uint64_t>(d_.allocator())};
+  List<uint64_t> results[VenusDevice::kPoolKinds] = {List<uint64_t>(d.allocator()), List<uint64_t>(d.allocator()), List<uint64_t>(d.allocator()), List<uint64_t>(d.allocator())};
   for (uint32_t k = 0; k < VenusDevice::kPoolKinds; ++k) {
-    if (!used_[k]) continue;
-    const uint64_t words = uint64_t{used_[k]} * strides[k];
+    if (!used[k]) continue;
+    const uint64_t words = uint64_t{used[k]} * strides[k];
     for (uint64_t i = 0; i < words; ++i)
       if (!results[k].push_back(0)) return false;
-    if (vk_.GetQueryPoolResults(d_.device(), d_.query_pool(static_cast<VenusDevice::QueryPoolKind>(k)), 0, used_[k], words * 8, results[k].view().data(), strides[k] * 8,
+    if (d.vk().GetQueryPoolResults(d.device(), d.query_pool(static_cast<VenusDevice::QueryPoolKind>(k)), 0, used[k], words * 8, results[k].view().data(), strides[k] * 8,
                                 VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) != VK_SUCCESS)
       return false;
   }
-  const double period = d_.context().caps().timestamp_period;
-  const uint32_t bits = d_.context().caps().timestamp_valid_bits;
+  const double period = d.context().caps().timestamp_period;
+  const uint32_t bits = d.context().caps().timestamp_valid_bits;
   for (uint32_t slot = 0; slot < kMaxOcclusionQueries; ++slot) {
-    const UserQuery& q = queries_[slot];
+    const ReplayQuery& q = queries[slot];
     if (!q.begun) continue;
     uint64_t values[kMaxQueryValues] = {};
     if (q.kind == QueryKind::TimestampFrequency || q.kind == QueryKind::TimestampDisjoint) {
@@ -1020,11 +1061,11 @@ bool Replay::read_queries() {
       values[0] = static_cast<uint64_t>(static_cast<double>(ticks) * period);   // (nanoseconds)
     } else {
       const uint32_t cat = category_of(q.kind, q.stream);
-      for (const Segment& seg : segments_) {
+      for (const QuerySegment& seg : segments) {
         if (seg.category != cat || !(seg.open[slot / 64] >> (slot % 64) & 1)) continue;
-        if (cat == kCatOcclusion) {
+        if (cat == kQueryCatOcclusion) {
           values[0] += results[VenusDevice::kPoolOcclusion][seg.index];
-        } else if (cat == kCatStatistics) {
+        } else if (cat == kQueryCatStatistics) {
           for (uint32_t k = 0; k < kPipelineStatisticCount; ++k)
             if (!(seg.no_fragment && k == static_cast<uint32_t>(PipelineStatistic::PsInvocations)))
               values[k] += results[VenusDevice::kPoolStatistics][uint64_t{seg.index} * kPipelineStatisticCount + k];
@@ -1043,8 +1084,31 @@ bool Replay::read_queries() {
       if (q.kind != QueryKind::PipelineStatistics)
         for (uint32_t k = 1; k < kMaxQueryValues; ++k) values[k] = 0;
     }
-    rec_.set_query_values(slot, ArrayView<const uint64_t>(values));
+    rec.set_query_values(slot, ArrayView<const uint64_t>(values));
   }
+  return true;
+}
+
+bool Replay::read_queries() {
+  if (!any_queries_) return true;
+  return count_queries(d_, used_, queries_, segments_, rec_);
+}
+
+// For a submit left running: what count_queries needs, handed to the device, which counts once it has waited for the submit (VenusDevice::settle_locked).
+bool Replay::defer_counts() {
+  if (!any_queries_) return true;
+  VenusQueryReadback* r = d_.query_readback();
+  if (!r) return false;
+  r->segments.clear();
+  for (const Segment& seg : segments_)
+    if (!r->segments.push_back(seg)) {
+      r->segments.clear();
+      return false;
+    }
+  for (uint32_t k = 0; k < VenusDevice::kPoolKinds; ++k) r->used[k] = used_[k];
+  for (uint32_t slot = 0; slot < kMaxOcclusionQueries; ++slot) r->queries[slot] = queries_[slot];
+  r->commands = &rec_;
+  rec_.set_results_pending(true);
   return true;
 }
 
@@ -1606,7 +1670,16 @@ bool Replay::run() {
   segments_close();
   if (rendering_) vk_.CmdEndRendering(cb_);
   rendering_ = false;
-  const bool done = d_.finish_main(cb_);
+  // (left running when the caller allows it - ICommandBuffer::defer_completion - and nothing has to be read back from it at once: no stream output's end, no
+  // disjoint clock; its queries are counted when it has been waited for, and what it made for itself goes then)
+  bool disjoint = false;
+  for (const UserQuery& q : queries_) disjoint = disjoint || (q.begun && q.kind == QueryKind::TimestampDisjoint);
+  const bool leave_running = ok && rec_.completion_deferred() && fill_count_ == 0 && !disjoint && defer_counts();
+  const bool done = d_.finish_main(cb_, leave_running);
+  if (leave_running && done) {
+    retire();
+    return true;
+  }
   release();
   if (!(ok && done)) return false;
   stream_output_results();
@@ -1628,7 +1701,7 @@ VkCommandBuffer VenusDevice::begin_main() {
   return main_;
 }
 
-bool VenusDevice::finish_main(VkCommandBuffer cb) {
+bool VenusDevice::finish_main(VkCommandBuffer cb, bool leave_running) {
   VkMemoryBarrier2 mb = vk_struct<VkMemoryBarrier2>(VK_STRUCTURE_TYPE_MEMORY_BARRIER_2);
   mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, mb.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
   mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_2_HOST_BIT;
@@ -1640,8 +1713,17 @@ bool VenusDevice::finish_main(VkCommandBuffer cb) {
   if (ok) {
     VkSubmitInfo si = vk_struct<VkSubmitInfo>(VK_STRUCTURE_TYPE_SUBMIT_INFO);
     si.commandBufferCount = 1, si.pCommandBuffers = &cb;
-    ok = vk().QueueSubmit(ctx_.queue(), 1, &si, fence_) == VK_SUCCESS && wait_fence(fence_);
+    ok = vk().QueueSubmit(ctx_.queue(), 1, &si, fence_) == VK_SUCCESS;
+    if (ok && leave_running) {
+      // (the GPU goes on with it while the caller records the next: whoever takes the queue next waits for it - settle_locked -, as do map(), read_back(), the
+      // destroys and a count asked of its command buffer; it is reset then)
+      pending_ = true;
+      unlock_queue();
+      return true;
+    }
+    ok = ok && wait_fence(fence_);
   }
+  if (leave_running) finish_readback_locked(false);   // (not submitted: no counts)
   vk().ResetCommandBuffer(cb, 0);
   unlock_queue();
   return ok;
@@ -1651,6 +1733,30 @@ bool VenusDevice::submit(ICommandBuffer* commands) {
   if (!commands) return false;
   Replay replay(*this, *static_cast<VenusCommands*>(commands));
   return replay.run();
+}
+
+// ---- counts of a submit left running ----------------------------------------------------------------------------------------------------------------------
+VenusQueryReadback* VenusDevice::query_readback() {
+  if (readback_) return readback_;
+  void* memory = allocator_.allocate_aligned(sizeof(VenusQueryReadback), alignof(VenusQueryReadback));
+  if (!memory) return nullptr;
+  readback_ = new (memory) VenusQueryReadback(allocator_);
+  return readback_;
+}
+
+void VenusDevice::finish_readback_locked(bool counted) {
+  if (!readback_ || !readback_->commands) return;
+  VenusCommands* c = readback_->commands;
+  readback_->commands = nullptr;
+  if (counted) (void)count_queries(*this, readback_->used, readback_->queries, readback_->segments, *c);
+  c->set_results_pending(false);
+}
+
+void VenusDevice::drop_query_readback() {
+  if (!readback_) return;
+  readback_->~VenusQueryReadback();
+  allocator_.deallocate(readback_);
+  readback_ = nullptr;
 }
 
 }  // namespace graphics

@@ -56,8 +56,13 @@ What the backend does:
 * **Transport.** Each instance opens the render node, makes a Venus context (64 rings, as Mesa does), and a ring of 128 KiB in host shared memory (a blob with blob id
   0). Commands are written to the ring; when the host's ring thread has gone idle it is woken with `vkNotifyRingMESA` through `EXECBUFFER`. A command with a reply
   first points the host at the reply stream (`vkSetReplyCommandStreamMESA`, a shared memory blob that grows to the largest reply) and waits until the ring's head has
-  passed it; the ring's lock is held until the reply is decoded. A command stream over 8 KiB (a big command buffer, a shader module) goes in shared memory of its own
-  and the ring carries `vkExecuteCommandStreamsMESA`. Handles go over the wire as ids the guest chooses: the dispatchable objects carry one after the loader's slot,
+  passed it; the ring's lock is held until the reply is decoded. A command stream over 8 KiB (a big command buffer, a shader module) goes in the ring's stream memory
+  (a blob kept from one such command to the next and grown when one does not fit: making and dropping a blob is a round trip through the device each) and the ring
+  carries `vkExecuteCommandStreamsMESA`. The host's ring thread looks for commands for 10 ms before it goes idle (`VN_RING_IDLE_TIMEOUT_NS`): waking it is a virtio
+  kick through QEMU's main thread. Commands whose only failures are running out of memory or a lost device are sent without waiting for an answer, as Mesa sends
+  them (`ASYNC_RESULT` in `scripts/gen-vulkan-venus.py`: `vkQueueSubmit`/`2`, `vkResetFences`, `vkFreeDescriptorSets`, `vkResetDescriptorPool`, `vkSetEvent`,
+  `vkResetEvent`; by hand `vkResetCommandBuffer` and `vkResetCommandPool`); they answer `VK_ERROR_DEVICE_LOST` once the host has stopped the ring, and the next
+  wait reports a lost device. Handles go over the wire as ids the guest chooses: the dispatchable objects carry one after the loader's slot,
   most non-dispatchable handles are the id itself, device memory, command pools and descriptor update templates point at the guest's struct.
 * **Instances and devices.** The host's instance has no extensions (surfaces are the driver's) and at least Vulkan 1.1. The backend offers Vulkan 1.3 at most
   (`VN_API_VERSION`; 1.4's host image copy needs host pointers the guest cannot hand over), the host's device extensions that the protocol carries and that need
@@ -66,7 +71,9 @@ What the backend does:
   `VK_DRIVER_ID_MESA_VENUS`, `driverName` "TheoryCraftOS Venus", `driverInfo` names the host's driver, the conformance version is 0. External memory, fence and
   semaphore queries answer "no handle types".
 * **Waits** are polled (`vkWaitForFences`, `vkWaitSemaphores`, `vkQueueWaitIdle` with an empty submission and a fence, `vkDeviceWaitIdle`, `vkGetQueryPoolResults`
-  with `WAIT`): a blocking call would stop the one ring every thread's commands go through.
+  with `WAIT`): a blocking call would stop the one ring every thread's commands go through. A waiter (`vn_relax`) yields its CPU and looks again for the first 250 µs
+  (`VN_SPIN_NS`), and only then sleeps, 10 µs growing to 1 ms: a reply takes tens of microseconds, and the kernel's shortest sleep lasts most of a millisecond - with
+  sleeps from the start, Unigine Heaven's 1200 calls a second spent 8 of every 10 seconds asleep.
 * **Memory.** Host-visible allocations are rounded up to pages; on the first map the memory becomes a blob of the context (blob id = its id, mappable and shareable:
   the host exports it and QEMU maps it into the window) and is mapped into the process. It stays mapped until it is freed. Memory the host cannot see does not map
   (`VK_ERROR_MEMORY_MAP_FAILED`).
@@ -114,7 +121,12 @@ compositor, the windows of Wayland and X11 clients, and the Vulkan driver's Dire
   CPU transfers go through a staging buffer, 0xAARRGGBB words or WidePixels' Vec4s, rows top first (Vulkan's own order: there are no flips anywhere). R8G8B8A8 images and
   8-bit storage images are RGBA with red and blue turned around on the CPU, as on virgl.
 * **submit()** replays the `CommandRecorder` list (VirglDevice's refusals; nothing outlives a submit; a pass resets the pipeline) into a Vulkan command buffer, submits it
-  and waits for its fence, so it is as synchronous as the interface says. Each pass, dispatch and storing draw is fenced off by a full memory barrier (what GL gives virgl
+  and waits for its fence, so it is as synchronous as the interface says - unless the command buffer allows otherwise (`ICommandBuffer::defer_completion`, which the
+  Direct3D layer's command buffers do: it reaches allocations only through `map()`, `read_back()` and the images' calls). Such a submit without stream output or a
+  disjoint-clock query is left running: the next to take the queue's lock waits for it (`settle_locked`: the next submit, an upload or readback, `map()`,
+  `read_back()`, the destroys, a count asked of its command buffer), then counts its queries into its command buffer (`VenusQueryReadback`, before the next submit
+  resets the pools) and lets go of its buffer views and descriptor sets. The GPU works while the CPU records the next list. The device's format properties are asked
+  for once when it opens (`VenusContext::format_properties`). Each pass, dispatch and storing draw is fenced off by a full memory barrier (what GL gives virgl
   implicitly). Constants go into a per-submit ring bound with a dynamic offset (4096 bytes of push block plus the samplers' comparison rows at 256 are more than any push
   constant range); a submit that fills the ring or the descriptor pool is split. Queries are segmented per kind as on virgl (one query of a kind at a time), timestamps are
   host ticks times `timestampPeriod`; stream output is transform feedback whose counter is seeded with the binding's offset, so appends across draws and pipelines work;
@@ -216,15 +228,18 @@ allocations itself.
   several pending in fences are waited for on the spot; `/sys` attributes are read-only (no synthetic uevents), the PCI path has no bridge levels; a
   `CONTEXT_INIT` that fails part way keeps none of its parameters.
 * No cross-device resource sharing (`RESOURCE_ASSIGN_UUID` is not negotiated: QEMU has no other virtio device to share with).
-* The driver's backend: Vulkan 1.4 and the denied extensions above are not offered; one ring per instance (Mesa has one per thread); creation and submission calls wait
-  for their reply (Mesa sends many of them without waiting); presentation copies each frame through guest memory instead of handing the host's image to the display.
+* The driver's backend: Vulkan 1.4 and the denied extensions above are not offered; one ring per instance (Mesa has one per thread); creation calls and
+  `vkAllocateDescriptorSets` wait for their reply (Mesa sends some of them without waiting, keeping the pools' room itself); a waited-for command reaches the host
+  only after the commands before it, through the one ring; presentation copies each frame through guest memory instead of handing the host's image to the display.
 * The application's allocation callbacks are not used (as in the Direct3D backend).
 * The host's memory window limits host-visible memory that is mapped at once (QEMU's `hostmem`).
 
 Gaps of the kernel's Venus device:
 
-* Every submit waits for its fence, and every creation call (images, pipelines, descriptor sets) is a round trip to the host: correct and simple, not fast. A pipeline's
-  first draw with a new binding shape compiles a variant on the host.
+* Only one submit is left running at a time (one main command buffer): the next submit waits for the last, so the CPU and the GPU overlap but two submits never
+  queue up. A command buffer that does not allow it (`defer_completion`), and one with stream output, is waited for in submit(). `map()` waits for a running submit
+  even for a buffer it does not use. Every creation call (images, pipelines, descriptor sets) is a round trip to the host. A pipeline's first draw with a new binding
+  shape compiles a variant on the host.
 * present() copies the frame through guest memory into the virtio-gpu's 2D screen; the host's image is not scanned out directly (a blob scanout would need the host
   image exported as a dma-buf).
 * Images are always in the GENERAL layout (no compression a driver keeps for attachment layouts); barriers are full memory barriers at every pass, dispatch and storing
