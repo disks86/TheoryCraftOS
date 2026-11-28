@@ -113,8 +113,7 @@ class CommandRecorder : public ICommandBuffer {
     c.type = RecordedCommand::Type::PushConstants;
     c.constants_offset = static_cast<uint32_t>(constants_.count());
     c.constants_size = size;
-    for (uint32_t i = 0; i < size; ++i)
-      if (!constants_.push_back(static_cast<const uint8_t*>(data)[i])) ok_ = false;
+    if (!constants_.append(ConstByteView(static_cast<const uint8_t*>(data), size))) ok_ = false;
     add(c);
   }
   void bind_texture(uint32_t unit, IImage* image, const SamplerDesc& sampler) override {

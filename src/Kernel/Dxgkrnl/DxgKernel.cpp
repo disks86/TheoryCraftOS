@@ -822,6 +822,8 @@ NtStatus Kernel::lock(ProcessId pid, Handle allocation, uint32_t flags, uint32_t
   rec->locked = true;
   rec->read_only = (flags & kLockReadOnly) != 0;
   out->data = data;
+  out->block = a.cpu_block();
+  out->block_offset = a.cpu_block_offset() + offset;
   out->pitch = a.is_image() ? static_cast<uint32_t>(image_row_bytes(a.desc().format, graphics::mip_extent(a.desc().width, subresource))) : 0;   // (a compressed one's: a row of blocks)
   return status::kSuccess;
 }

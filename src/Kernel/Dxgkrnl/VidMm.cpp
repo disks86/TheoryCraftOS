@@ -17,6 +17,7 @@
  */
 
 #include "Kernel/Dxgkrnl/VidMm.hpp"
+#include <new>
 #include "Kernel/Dxgkrnl/D3d12.hpp"
 #include "Kernel/Dxgkrnl/CommandStream.hpp"
 #include "Graphics/Graphics3D/Mipmaps.hpp"
@@ -576,6 +577,11 @@ sized:
     a->heap_offset_ = requested.heap_offset;
     a->cpu_ = heap->cpu_.subview(requested.heap_offset, cpu_bytes);   // (shared, not owned)
     cpu_bytes = 0;                                                    // (and not charged again)
+  } else if (cpu_bytes >= CpuBacking::kPage) {
+    // (a block of pages a process can be shown on a lock: CpuBacking)
+    a->cpu_block_ = CpuBacking::make(allocator_, cpu_bytes);
+    if (!a->cpu_block_) return status::kNoMemory;
+    a->cpu_ = a->cpu_block_->bytes().first(cpu_bytes);
   } else if (cpu_bytes) {
     a->cpu_ = allocate_view<uint8_t>(allocator_, cpu_bytes, 16);
     if (a->cpu_.empty()) return status::kNoMemory;
@@ -618,7 +624,35 @@ void VidMm::forget(Allocation& a) {
     return;   // (the memory is the heap's)
   }
   system_bytes_ -= a.cpu_.size();
-  release_view(allocator_, a.cpu_);
+  if (a.cpu_block_) {
+    a.cpu_block_->release();   // (a process view of it may still hold it)
+    a.cpu_block_ = nullptr;
+    a.cpu_ = ByteView();
+  } else {
+    release_view(allocator_, a.cpu_);
+  }
+}
+
+CpuBacking* CpuBacking::make(allocators::IAllocator& allocator, uint64_t bytes) {
+  if (bytes == 0 || bytes > ~uint64_t{0} - (kPage - 1)) return nullptr;
+  const uint64_t capacity = (bytes + kPage - 1) & ~(kPage - 1);
+  uint8_t* storage = static_cast<uint8_t*>(allocator.allocate_aligned(capacity, kPage));
+  if (!storage) return nullptr;
+  ByteView(storage, capacity).fill(0);
+  void* memory = allocator.allocate_aligned(sizeof(CpuBacking), alignof(CpuBacking));
+  if (!memory) {
+    allocator.deallocate(storage);
+    return nullptr;
+  }
+  return new (memory) CpuBacking(allocator, storage, capacity);
+}
+
+void CpuBacking::release() {
+  if (__atomic_sub_fetch(&references_, 1, __ATOMIC_ACQ_REL) != 0) return;
+  allocators::IAllocator& allocator = allocator_;
+  allocator.deallocate(storage_);
+  this->~CpuBacking();
+  allocator.deallocate(this);
 }
 
 void VidMm::release_device_object(Allocation& a) {

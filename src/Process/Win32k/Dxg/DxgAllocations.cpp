@@ -348,8 +348,13 @@ uint32_t lock_allocation(Session& s, Call& call, uint64_t arg, dxgk::Handle devi
   UniquePointer<LockRecord> lock = UniquePointer<LockRecord>::make(s.allocator());
   uint64_t base = 0;
   const uint64_t size = result.data.size();
-  bool ok = lock && map_user_region(call, size, &base);
+  // (memory that starts on a page of its block: the process is shown the memory itself - no copy in, none back, no pages made and dropped. A read-only lock too,
+  // as on Windows, where it is the memory as well: what a program writes there is undefined, and the kernel does not count it as a CPU write.)
+  const bool show = lock && result.block && result.block_offset % AddressSpace::kPageSize == 0 &&
+                    map_user_view(s.allocator(), call, result.block, result.block_offset, size, &base);
+  bool ok = lock && (show || map_user_region(call, size, &base));
   if (ok) {
+    lock->shown = show;
     lock->allocation = allocation;
     lock->device = device;
     lock->user_base = base;
@@ -357,7 +362,7 @@ uint32_t lock_allocation(Session& s, Call& call, uint64_t arg, dxgk::Handle devi
     lock->read_only = (lock_flags & kLockReadOnly) != 0;
     lock->data = result.data;
     // (a discard lock starts with nothing the caller can rely on: the region is zero)
-    if (!(lock_flags & kLockDiscard)) ok = call.write(base, ConstByteView(result.data));
+    if (!(lock_flags & kLockDiscard) && !show) ok = call.write(base, ConstByteView(result.data));
     ok = ok && put64(call, arg, data_offset, base);
   }
   if (ok && !ps.locks.push_back(util::move(lock))) ok = false;

@@ -35,6 +35,29 @@ namespace dxgk {
 
 class VidMm;
 
+// The CPU memory of an allocation of a page or more (and of a heap): page-aligned, a whole number of pages, zero-filled, with a count of its users - the
+// allocation, and every process view of it (win32k shows it to the process on a lock instead of copying it) - so that a view the CPUs may still see keeps it
+// after the allocation has gone. The last user frees it; that may happen in any thread.
+class CpuBacking {
+ public:
+  static constexpr uint64_t kPage = 4096;
+  // At least `bytes` bytes (rounded up to pages), with one use for the caller; nullptr without memory.
+  static CpuBacking* make(allocators::IAllocator& allocator, uint64_t bytes);
+  void retain() { __atomic_add_fetch(&references_, 1, __ATOMIC_ACQ_REL); }
+  void release();
+  uint8_t* storage() const { return storage_; }
+  uint64_t capacity() const { return capacity_; }
+  ByteView bytes() const { return ByteView(storage_, capacity_); }
+
+ private:
+  CpuBacking(allocators::IAllocator& allocator, uint8_t* storage, uint64_t capacity) : allocator_(allocator), storage_(storage), capacity_(capacity) {}
+  ~CpuBacking() = default;
+  allocators::IAllocator& allocator_;
+  uint8_t* storage_;
+  uint64_t capacity_;
+  uint32_t references_ = 1;
+};
+
 // The tiles of a reserved texture (kAllocReserved), numbered as Direct3D numbers them (what GetResourceTiling reports): each slice of an array or cube - a volume has one - has
 // the tiles of its standard levels, level after level, each level's tiles in x, then y, then z order, and then the tiles of its packed levels; the slices follow one another.
 // A tile holds tile_shape(element_bytes, volume) elements - texels, or 4 x 4 blocks of a block-compressed format - in the heap as rows of `shape.width` elements, the rows of one
@@ -113,6 +136,9 @@ class Allocation {
   // The system-memory backing (empty for depth images). Little-endian words in desc().format's layout; the levels of a mipmapped texture follow each other.
   ConstByteView backing() const { return cpu_; }
   ByteView writable_backing() { return cpu_; }
+  // The block the backing lies in, and where the backing starts in it (placed: the heap's block); nullptr when it has none (a backing under a page).
+  CpuBacking* cpu_block() const { return heap_ ? heap_->cpu_block_ : cpu_block_; }
+  uint64_t cpu_block_offset() const { return heap_ ? heap_offset_ : 0; }
   // Where level `level` starts in the backing and how many bytes it has (all its layers, one after the other); false for a level the allocation does not have.
   // The backing holds the levels one after the other, each level its layers (a volume's level: its slices there) one after the other.
   bool level_range(uint32_t level, uint64_t* offset, uint64_t* bytes) const;
@@ -140,6 +166,7 @@ class Allocation {
   AllocationDesc desc_;
   uint64_t id_;
   ByteView cpu_;
+  CpuBacking* cpu_block_ = nullptr;    // (owned: one use; cpu_ is its first bytes)
   graphics::IImage* image_ = nullptr;
   graphics::IBuffer* buffer_ = nullptr;
   SharedPointer<Allocation> heap_;     // placed: the heap (kept alive by it)

@@ -260,6 +260,8 @@ class Kernel {
   bool video_decode_supported(uint32_t profile, uint32_t surface_format, uint32_t width, uint32_t height) const;
   NtStatus destroy_shader(ProcessId pid, Handle shader);
   NtStatus destroy_pipeline(ProcessId pid, Handle pipeline);
+  // A driver escape: the reply goes into `reply`, *reply_bytes of it. Every byte below *reply_bytes is written by the call - through a ByteWriter from the start of
+  // `reply`, with no reserved holes - so the caller need not clear the buffer first (win32k does not: replies of a stream's size were a twentieth of the cost).
   NtStatus escape(ProcessId pid, Handle device, ConstByteView request, ByteView reply, uint32_t* reply_bytes);
 
   // Runs every adapter's queues. Called by every call that can unblock work; a kernel thread may call it too.

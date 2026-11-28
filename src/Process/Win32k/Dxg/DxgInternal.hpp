@@ -109,6 +109,7 @@ struct LockRecord {
   dxgk::Handle device = 0;
   uint64_t user_base = 0, user_size = 0;
   bool read_only = false;
+  bool shown = false;         // the region shows the allocation's own memory (map_user_view): nothing to copy back at unlock
   ByteView data;              // the kernel's view, valid until the kernel's unlock
 };
 
@@ -265,6 +266,9 @@ uint32_t wait_for_syncs(Session& s, Call& call, ArrayView<const dxgk::Handle> ha
 
 // The memory of the process's address space for buffers made here (null: the process has none attached).
 bool map_user_region(Call& call, uint64_t size, uint64_t* base);
+// Shows `size` bytes of `block` from `offset` (page-aligned; the pages must lie in the block) to the process, read-write: no copy. The mapping holds a use of the
+// block until no CPU can see it any more. False (nothing mapped) if there is no room or memory.
+bool map_user_view(allocators::IAllocator& allocator, Call& call, dxgk::CpuBacking* block, uint64_t offset, uint64_t size, uint64_t* base);
 void unmap_user_region(Call& call, uint64_t base, uint64_t size);
 
 // Drops the layer's records of `device` and unmaps what was mapped for them (before the kernel destroys the device).

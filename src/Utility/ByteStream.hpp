@@ -44,12 +44,12 @@ class ByteReader {
   ConstByteView rest() const { return data_.subview(position_); }
   ConstByteView whole() const { return data_; }
 
-  uint8_t u8() { return static_cast<uint8_t>(read(1)); }
-  uint16_t be16() { return static_cast<uint16_t>(read(2)); }
-  uint32_t be32() { return static_cast<uint32_t>(read(4)); }
-  uint16_t le16() { return static_cast<uint16_t>(read_le(2)); }
-  uint32_t le32() { return static_cast<uint32_t>(read_le(4)); }
-  uint64_t le64() { return read_le(8); }
+  [[gnu::always_inline]] uint8_t u8() { return static_cast<uint8_t>(read(1)); }
+  [[gnu::always_inline]] uint16_t be16() { return static_cast<uint16_t>(read(2)); }
+  [[gnu::always_inline]] uint32_t be32() { return static_cast<uint32_t>(read(4)); }
+  [[gnu::always_inline]] uint16_t le16() { return static_cast<uint16_t>(read_le(2)); }
+  [[gnu::always_inline]] uint32_t le32() { return static_cast<uint32_t>(read_le(4)); }
+  [[gnu::always_inline]] uint64_t le64() { return read_le(8); }
 
   // The next `count` bytes as a view into the same memory (advances). On
   // failure returns an empty view and sets the error.
@@ -85,30 +85,39 @@ class ByteReader {
   bool peek_u8(uint64_t offset, uint8_t* out) const { return data_.try_get(position_ + offset, out); }
 
  private:
-  uint64_t read(uint32_t bytes) {
+  // (always inlined: a parser reads field after field, and a call per field was a tenth of the Direct3D stream's cost)
+  [[gnu::always_inline]] uint64_t read(uint32_t bytes) {
     if (failed_ || bytes > remaining()) {
       failed_ = true;
       return 0;
     }
-    // (checked once above: the bytes are walked as the view's range, which the compiler makes one load of)
     uint64_t value = 0;
-    for (const uint8_t byte : data_.subview(position_, bytes)) value = (value << 8) | byte;
+    for (uint32_t i = 0; i < bytes; ++i) value = (value << 8) | load_le(position_ + i, 1);
     position_ += bytes;
     return value;
   }
-  uint64_t read_le(uint32_t bytes) {
+  [[gnu::always_inline]] uint64_t read_le(uint32_t bytes) {
     if (failed_ || bytes > remaining()) {
       failed_ = true;
       return 0;
     }
-    uint64_t value = 0;
-    uint32_t shift = 0;
-    for (const uint8_t byte : data_.subview(position_, bytes)) {
-      value |= uint64_t{byte} << shift;
-      shift += 8;
-    }
+    const uint64_t value = load_le(position_, bytes);
     position_ += bytes;
     return value;
+  }
+  // `bytes` (1 to 8) little-endian bytes at `at`, which the caller has checked lie in the data: one load where the CPU is little-endian (every target this
+  // builds for), a byte at a time elsewhere.
+  [[gnu::always_inline]] uint64_t load_le(uint64_t at, uint32_t bytes) const {
+    const uint8_t* p = data_.data() + at;
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    uint64_t value = 0;
+    __builtin_memcpy(&value, p, bytes);
+    return value;
+#else
+    uint64_t value = 0;
+    for (uint32_t i = 0; i < bytes; ++i) value |= uint64_t{p[i]} << (8 * i);
+    return value;
+#endif
   }
 
   ConstByteView data_;

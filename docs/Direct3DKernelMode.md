@@ -33,7 +33,10 @@ system calls are thin.
 Every allocation has a system-memory backing, always valid unless the GPU holds newer contents. The device object (`IImage` / `IBuffer`) exists only while the allocation is
 **resident**; the manager keeps resident bytes within the adapter's budget by evicting the least recently used allocation that is not pinned (a colour image is read back
 first). A command stream pins its allocations while it runs, so a stream whose working set exceeds the budget fails with the device in `ErrorOutOfMemory` and the context
-lost. `lock()` reads the GPU's contents back and hands out a view of the backing; `unlock()` marks the device copy stale (uploaded at next use). Depth/stencil images have no
+lost. `lock()` reads the GPU's contents back and hands out a view of the backing; `unlock()` marks the device copy stale (uploaded at next use). The backing of an
+allocation of a page or more is a `CpuBacking` (page-aligned, whole pages, counted users): win32k shows a lock that starts on a page of it to the process as the
+memory itself (`map_user_view`: a shared region holding a use of the block until no CPU can see it), with no copy in, none back and no pages made and dropped - a
+read-only lock too, as on Windows. Smaller allocations, and a level that does not start on a page, are copied into a region of their own and back. Depth/stencil images have no
 backing: their contents are lost on eviction, and they cannot be locked. Formats are A8R8G8B8, X8R8G8B8, A8B8G8R8, X8B8G8R8, D32F, D24S8; textures may have mip levels
 (lockable per level, `GenerateMipmaps` in the stream). Allocations are shared across processes by token (`share_allocation` / `open_shared_allocation`).
 

@@ -19,12 +19,32 @@
 // Host-side tests for Slice, ArrayView and ByteReader/ByteWriter.
 #include <stdio.h>
 #include <stdlib.h>
+#include <initializer_list>
+#include <string.h>
+#include "ObjectContainer/List.hpp"
 #include "Utility/ArrayView.hpp"
+#include "Utility/ByteBuffer.hpp"
 #include "Utility/ByteStream.hpp"
 #include "Utility/Slice.hpp"
 
 struct Violation {};
 void bounds_violation(const char*, uint64_t, uint64_t) { throw Violation{}; }  // this test checks that violations happen
+
+struct HostAllocator final : allocators::IAllocator {
+  void* allocate(uint64_t size) override { return size ? malloc(size) : nullptr; }
+  void* allocate_aligned(uint64_t size, uint64_t alignment) override { return size ? aligned_alloc(alignment < 16 ? 16 : alignment, (size + 63) & ~uint64_t{63}) : nullptr; }
+  void deallocate(void* p) override { free(p); }
+};
+struct Counted {   // (not trivially copyable: List::append copies it one by one)
+  static int live;
+  int v = 0;
+  Counted() { ++live; }
+  Counted(int x) : v(x) { ++live; }
+  Counted(const Counted& o) : v(o.v) { ++live; }
+  Counted& operator=(const Counted& o) { v = o.v; return *this; }
+  ~Counted() { --live; }
+};
+int Counted::live = 0;
 
 static int g_failed = 0;
 #define CHECK(cond) do { if (!(cond)) { printf("FAILED line %d: %s\n", __LINE__, #cond); ++g_failed; } } while (0)
@@ -150,6 +170,54 @@ int main() {
   ByteWriter w4{ByteView(second)};
   ByteView reserved = w4.reserve(3);
   CHECK(reserved.size() == 3 && w4.position() == 3 && w4.reserve(2).empty() && !w4.ok());
+
+  // ---- ByteReader's little-endian reads (one load each): every width at every place near the end, and past it
+  {
+    uint8_t bytes[11];
+    for (uint32_t i = 0; i < 11; ++i) bytes[i] = static_cast<uint8_t>(0x10 + i);
+    for (uint32_t at = 0; at <= 11; ++at) {
+      for (uint32_t width : {1u, 2u, 4u, 8u}) {
+        ByteReader r{ConstByteView(bytes, 11)};
+        CHECK(r.skip(at) || at > 11);
+        uint64_t want = 0;
+        for (uint32_t k = 0; k < width && at + k < 11; ++k) want |= uint64_t{bytes[at + k]} << (8 * k);
+        const uint64_t got = width == 1 ? r.u8() : width == 2 ? r.le16() : width == 4 ? r.le32() : r.le64();
+        if (at + width <= 11) CHECK(r.ok() && got == want && r.position() == at + width);
+        else CHECK(!r.ok() && got == 0 && r.position() == at);   // (truncated: nothing read, and the error sticks)
+      }
+    }
+    ByteReader big{ConstByteView(bytes, 11)};
+    CHECK(big.be16() == 0x1011 && big.be32() == 0x12131415u && big.ok());
+  }
+
+  // ---- List::append: one growth, trivially copyable and not, and never from its own storage
+  {
+    HostAllocator a;
+    List<uint8_t> list(a);
+    uint8_t src[300];
+    for (uint32_t i = 0; i < 300; ++i) src[i] = static_cast<uint8_t>(i * 7);
+    CHECK(list.append(ConstByteView(src, 3)) && list.count() == 3 && list[2] == 14);
+    CHECK(list.append(ConstByteView(src, 300)) && list.count() == 303 && list[3] == 0 && list[302] == static_cast<uint8_t>(299 * 7));
+    CHECK(list.append(ConstByteView()) && list.count() == 303);
+    CHECK(!list.append(ConstByteView(list.view().data() + 10, 5)) && list.count() == 303);   // (its own storage: refused, unchanged)
+    {
+      List<Counted> objects(a);
+      Counted three[3] = {Counted(1), Counted(2), Counted(3)};
+      CHECK(objects.append(ArrayView<const Counted>(three, 3)) && objects.count() == 3 && objects[2].v == 3 && Counted::live == 6);
+    }
+    CHECK(Counted::live == 0);
+  }
+
+  // ---- ByteBuffer::append_filled / append_unwritten
+  {
+    HostAllocator a;
+    ByteBuffer b(a);
+    CHECK(b.put32(0x04030201u));
+    CHECK(b.append_filled(5, [](ByteView into) { into.fill(0xAB); return true; }) && b.size() == 9 && b.view()[4] == 0xAB && b.view()[8] == 0xAB);
+    CHECK(!b.append_filled(5, [](ByteView) { return false; }) && b.size() == 9);   // (a fill that fails appends nothing)
+    CHECK(b.append_unwritten(100) && b.size() == 109 && b.view()[0] == 1);
+    CHECK(!b.append_filled(~0ull, [](ByteView) { return true; }) && !b.append_unwritten(~0ull) && b.size() == 109);
+  }
 
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);

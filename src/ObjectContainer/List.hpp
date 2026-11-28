@@ -69,6 +69,26 @@ class List final : public IObjectContainer<T> {
 
   bool push_back(const T& value) { return insert(size_, value); }
   bool push_back(T&& value) { return insert(size_, container_support::move(value)); }
+  // Appends copies of `values`, growing at most once. False (nothing appended) if memory ran out, or if `values` lies in this list's own storage (growing
+  // would free it).
+  bool append(ArrayView<const T> values) {
+    if (values.empty()) return true;
+    const T* own = storage_.data();
+    if (own && values.data() + values.size() > own && values.data() < own + storage_.size()) return false;
+    if (values.size() > UINT64_MAX / 2 - size_) return false;
+    const uint64_t need = size_ + values.size();
+    if (need > storage_.size() && !reserve(need > storage_.size() * 2 ? need : storage_.size() * 2)) return false;
+    if constexpr (__is_trivially_copyable(T)) {
+      (void)storage_.subview(size_, values.size()).copy_from(values);   // (one copy: room was made above)
+      size_ += values.size();
+    } else {
+      for (const T& v : values) {
+        new (&storage_[size_]) T(v);
+        ++size_;
+      }
+    }
+    return true;
+  }
 
   // Inserts before `index` (index == count() appends), shifting later elements up.
   bool insert(uint64_t index, const T& value) { return emplace_at(index, value); }

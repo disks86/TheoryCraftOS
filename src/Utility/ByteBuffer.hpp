@@ -59,6 +59,22 @@ class ByteBuffer {
     const uint8_t b[4] = {static_cast<uint8_t>(tag[0]), static_cast<uint8_t>(tag[1]), static_cast<uint8_t>(tag[2]), static_cast<uint8_t>(tag[3])};
     return append(ConstByteView(b, 4));
   }
+  // Appends `count` bytes that `fill(ByteView)` writes in place (it must write them all: a read of a packet or of a process's memory, say), without zeroing them
+  // first. False (nothing appended) if memory ran out or fill returned false.
+  template <class F>
+  bool append_filled(uint64_t count, F&& fill) {
+    if (count > UINT64_MAX - size_ || !reserve(size_ + count)) return false;
+    if (count && !fill(storage_.subview(size_, count))) return false;
+    size_ += count;
+    return true;
+  }
+  // Appends `count` bytes left as they are in memory: only for a buffer whose every byte is written before anything reads it, and of which only what was
+  // written leaves (a reply a callee fills from the start, and reports how far). False if memory ran out.
+  bool append_unwritten(uint64_t count) {
+    if (count > UINT64_MAX - size_ || !reserve(size_ + count)) return false;
+    size_ += count;
+    return true;
+  }
   bool put_zeros(uint64_t count) {
     if (count > UINT64_MAX - size_ || !reserve(size_ + count)) return false;
     storage_.subview(size_, count).fill(0);

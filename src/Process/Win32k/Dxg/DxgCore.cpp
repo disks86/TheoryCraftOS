@@ -102,8 +102,8 @@ bool read_blob(Call& call, uint64_t address, uint32_t size, ByteBuffer* out, uin
   if (size > limit) return false;
   out->clear();
   if (size == 0) return true;
-  if (!out->put_zeros(size)) return false;
-  return call.read(address, out->writable_view());
+  // (read straight into the buffer: every byte of it is the process's, so it is not zeroed first)
+  return out->append_filled(size, [&](ByteView into) { return call.read(address, into); });
 }
 
 // --- The process state ------------------------------------------------------------------------------------------------------------------------------------
@@ -406,6 +406,52 @@ bool map_user_region(Call& call, uint64_t size, uint64_t* base) {
   return true;
 }
 
+namespace {
+// The SharedMemory of a process view of an allocation's block: a use of the block for as long as any piece of the view may still be seen (AddressSpace::map_shared
+// retains it once for the mapping and for every piece it is cut into, and lets go of each when no CPU can see it); the last use lets go of the block and of itself.
+class BlockView final : public SharedMemory {
+ public:
+  static BlockView* make(allocators::IAllocator& allocator, dxgk::CpuBacking* block) {
+    void* memory = allocator.allocate_aligned(sizeof(BlockView), alignof(BlockView));
+    if (!memory) return nullptr;
+    block->retain();
+    return new (memory) BlockView(allocator, block);
+  }
+  void retain() override { __atomic_add_fetch(&references_, 1, __ATOMIC_ACQ_REL); }
+  void release() override {
+    if (__atomic_sub_fetch(&references_, 1, __ATOMIC_ACQ_REL) != 0) return;
+    allocators::IAllocator& allocator = allocator_;
+    block_->release();
+    this->~BlockView();
+    allocator.deallocate(this);
+  }
+
+ private:
+  BlockView(allocators::IAllocator& allocator, dxgk::CpuBacking* block) : allocator_(allocator), block_(block) {}
+  ~BlockView() = default;
+  allocators::IAllocator& allocator_;
+  dxgk::CpuBacking* block_;
+  uint32_t references_ = 1;   // (the maker's)
+};
+}  // namespace
+
+bool map_user_view(allocators::IAllocator& allocator, Call& call, dxgk::CpuBacking* block, uint64_t offset, uint64_t size, uint64_t* base) {
+  AddressSpace* space = call.process().address_space();
+  uint64_t rounded = 0;
+  if (!space || !block || size == 0 || offset % AddressSpace::kPageSize || !AddressSpace::round_up(size, &rounded) || offset > block->capacity() ||
+      rounded > block->capacity() - offset)
+    return false;
+  uint64_t at = 0;
+  if (space->is_32bit() ? !space->find_free_windows32(rounded, false, &at) : !space->find_free(rounded, call.process().mmap_cursor(), &at)) return false;
+  BlockView* view = BlockView::make(allocator, block);
+  if (!view) return false;
+  const bool mapped = space->map_shared(at, rounded, kProtRead | kProtWrite, block->storage() + offset, view);
+  view->release();   // (the mapping holds its own use)
+  if (!mapped) return false;
+  *base = at;
+  return true;
+}
+
 void unmap_user_region(Call& call, uint64_t base, uint64_t size) {
   AddressSpace* space = call.process().address_space();
   if (space && base != 0 && size != 0) space->unmap(base, size);
@@ -418,7 +464,7 @@ void release_lock(Session& s, Call& call, dxgk::Handle allocation, bool write_ba
   for (uint64_t i = 0; i < ps.locks.count(); ++i) {
     LockRecord& rec = *ps.locks[i];
     if (rec.allocation != allocation) continue;
-    if (write_back && !rec.read_only) call.read(rec.user_base, rec.data);      // (an unreadable view leaves the old contents)
+    if (write_back && !rec.read_only && !rec.shown) call.read(rec.user_base, rec.data);      // (an unreadable view leaves the old contents; a shown one is the memory)
     s.kernel().unlock(s.pid(), allocation);
     unmap_user_region(call, rec.user_base, rec.user_size);
     ps.locks.remove_at(i);

@@ -308,9 +308,14 @@ enum LockFlags : uint32_t {
   kLockDiscard = 1u << 2,    // the old contents are not needed (nothing is read back from the GPU)
 };
 
+class CpuBacking;
 struct LockResult {
   ByteView data;        // the subresource's memory (a view of the allocation's system-memory backing: valid until unlock)
   uint32_t pitch = 0;   // bytes per row
+  // The block of memory `data` lies in, when it has one (an allocation of a page or more, or placed in a heap that has one), and where `data` starts in it: a
+  // caller may show the block's pages to a process (retaining the block for as long as it does) instead of copying `data`.
+  CpuBacking* block = nullptr;
+  uint64_t block_offset = 0;
 };
 
 // --- Adapters ---------------------------------------------------------------------

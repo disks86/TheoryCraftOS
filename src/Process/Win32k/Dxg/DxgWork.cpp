@@ -274,7 +274,8 @@ uint32_t escape(Session& s, Call& call, uint64_t arg) {
   if (data == 0 || size == 0 || size > kMaxEscapeData) return kStatusInvalidParameter;
   ByteBuffer request(s.allocator()), reply(s.allocator());
   if (!read_blob(call, data, size, &request, kMaxEscapeData)) return kStatusAccessViolation;
-  if (!reply.put_zeros(size)) return status::kNoMemory;
+  // (not cleared: the kernel writes every byte of the reply below reply_bytes, and only those go back - Kernel::escape)
+  if (!reply.append_unwritten(size)) return status::kNoMemory;
   uint32_t reply_bytes = 0;
   const uint32_t st = s.kernel().escape(s.pid(), device, request.view(), reply.writable_view(), &reply_bytes);
   if (st != status::kSuccess) return st;
