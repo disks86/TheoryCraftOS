@@ -675,6 +675,17 @@ bool VenusPipeline::make_graphics(Variant& v, const VkPipelineShaderStageCreateI
       rs.depthBiasConstantFactor = d.depth_bias.constant / static_cast<float>((1u << d.depth_bias.unorm_bits) - 1u);
       rs_next = &bias_rep;
     }
+  } else if (d.depth_bias_modes) {
+    // glPolygonOffset: the polygons drawn in a mode `depth_bias_modes` names (bit 0 filled, 1 as lines, 2 as points - GL_POLYGON_OFFSET_FILL, _LINE, _POINT)
+    // are moved by factor times their depth slope plus units times the depth image's smallest step, unclamped. Vulkan's bias is GL's: it moves polygons whatever
+    // their mode, and lines and points drawn as such not at all, as GL does.
+    const uint32_t mode_bit = rs.polygonMode == VK_POLYGON_MODE_LINE ? 2u : rs.polygonMode == VK_POLYGON_MODE_POINT ? 4u : 1u;
+    if (d.depth_bias_modes & mode_bit) {
+      rs.depthBiasEnable = VK_TRUE;
+      rs.depthBiasConstantFactor = d.depth_bias_units;
+      rs.depthBiasSlopeFactor = d.depth_bias_slope;
+      rs.depthBiasClamp = 0.0f;
+    }
   }
   VkPipelineRasterizationDepthClipStateCreateInfoEXT clip = vk_struct<VkPipelineRasterizationDepthClipStateCreateInfoEXT>(VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT);
   if (!d.depth_clip) {

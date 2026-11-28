@@ -147,12 +147,16 @@ void RenderNode::build_venus(hardware::VirtioGpu& virtio, allocators::IAllocator
     // (what virgl would offer: a virgl device made for the comparison and given back)
     VirglDevice* virgl = new (virgl_storage_) VirglDevice(virtio);
     const DeviceInfo want = virgl->info(), have = device->info();
+    // (the constants a draw may have: the larger of the push block and DeviceLimits::shader_constant_bytes)
+    auto constant_bytes = [](const DeviceInfo& i) { return i.limits.shader_constant_bytes > i.max_push_constant_bytes ? i.limits.shader_constant_bytes : i.max_push_constant_bytes; };
     virgl->~VirglDevice();
     const uint32_t missing = want.features & ~have.features, missing2 = want.features2 & ~have.features2;
     const bool limits = have.limits.texture_units >= want.limits.texture_units && have.limits.vertex_attributes >= want.limits.vertex_attributes &&
                         have.limits.varyings >= want.limits.varyings && have.limits.color_targets >= want.limits.color_targets &&
                         have.limits.vertex_buffers >= want.limits.vertex_buffers && have.limits.control_varyings >= want.limits.control_varyings &&
-                        (want.sample_counts & ~have.sample_counts) == 0 && have.max_push_constant_bytes >= want.max_push_constant_bytes;
+                        (want.sample_counts & ~have.sample_counts) == 0 && have.max_push_constant_bytes >= want.max_push_constant_bytes &&
+                        constant_bytes(have) >= constant_bytes(want) && (have.limits.depth_bias || !want.limits.depth_bias) &&
+                        (have.limits.sampled_depth || !want.limits.sampled_depth) && (have.limits.stencil || !want.limits.stencil);   // (the GL translator's)
     const uint32_t gaps = device->parity_gaps();   // (host extensions the device needs to do those features as virgl does)
     use = !missing && !missing2 && limits && !gaps;
     if (use) e.text(": chosen (it does everything virgl does here)");

@@ -125,7 +125,9 @@ compositor, the windows of Wayland and X11 clients, and the Vulkan driver's Dire
   Direct3D layer's command buffers do: it reaches allocations only through `map()`, `read_back()` and the images' calls). Such a submit without stream output or a
   disjoint-clock query is left running: the next to take the queue's lock waits for it (`settle_locked`: the next submit, an upload or readback, `map()`,
   `read_back()`, the destroys, a count asked of its command buffer), then counts its queries into its command buffer (`VenusQueryReadback`, before the next submit
-  resets the pools) and lets go of its buffer views and descriptor sets. The GPU works while the CPU records the next list. The device's format properties are asked
+  resets the pools) and lets go of its buffer views and descriptor sets. What the GL translator needs is offered as on virgl (`DeviceLimits::depth_bias` - glPolygonOffset as
+  Vulkan's depth bias, for the polygon mode the pipeline draws in -, `sampled_depth`, `stencil` with D32_SFLOAT_S8_UINT), and the kernel's choice of Venus
+  compares those limits too. The GPU works while the CPU records the next list. The device's format properties are asked
   for once when it opens (`VenusContext::format_properties`). Each pass, dispatch and storing draw is fenced off by a full memory barrier (what GL gives virgl
   implicitly). Constants go into a per-submit ring bound with a dynamic offset (4096 bytes of push block plus the samplers' comparison rows at 256 are more than any push
   constant range); a submit that fills the ring or the descriptor pool is split. Queries are segmented per kind as on virgl (one query of a kind at a time), timestamps are
@@ -236,9 +238,6 @@ allocations itself.
 
 Gaps of the kernel's Venus device:
 
-* The GL translator (`WebGlAccelerator`) draws on the CPU on Venus what virgl draws on the GPU: polygon offset, the stencil test on a framebuffer object, and draws
-  whose depth the device has out of date - Unigine Heaven's OpenGL mode draws about 4100 of every 5000 draws on the CPU there (all on the GPU on virgl), and its
-  benchmark does not finish in 25 minutes. The kernel's choice of Venus (`parity_gaps`, the DeviceInfo comparison) does not see these.
 * Only one submit is left running at a time (one main command buffer): the next submit waits for the last, so the CPU and the GPU overlap but two submits never
   queue up. A command buffer that does not allow it (`defer_completion`), and one with stream output, is waited for in submit(). `map()` waits for a running submit
   even for a buffer it does not use. Every creation call (images, pipelines, descriptor sets) is a round trip to the host. A pipeline's first draw with a new binding

@@ -211,6 +211,12 @@ DeviceInfo VenusDevice::info() const {
   i.limits.color_targets = kMaxColorTargets;
   i.limits.vertex_buffers = kMaxVertexBuffers;
   i.limits.control_varyings = c.tessellation_shader ? 30 : 0;
+  // (what the GL translator asks for, as virgl has it: glPolygonOffset - GraphicsPipelineDesc::depth_bias_* -, depth images sampled as textures, and depth images
+  // with a stencil plane - D32_SFLOAT_S8_UINT - and the pipeline's stencil test)
+  i.limits.depth_bias = true;
+  i.limits.sampled_depth = format_supports(VK_FORMAT_D32_SFLOAT, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
+  i.limits.stencil = format_supports(VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+                                                                    VK_FORMAT_FEATURE_TRANSFER_DST_BIT);
   return i;
 }
 
