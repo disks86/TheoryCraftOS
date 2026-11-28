@@ -55,7 +55,7 @@ for a in "${words[@]}"; do
   if [ $skip = 1 ]; then skip=0; elif [ "$a" = -qmp ]; then skip=1; else
     case "$a" in
       gtk,gl=on*) a=egl-headless ;;
-      virtio-gpu-gl-pci) [ "$venus" = off ] || a="virtio-gpu-gl-pci,venus=on,blob=on,hostmem=$hostmem" ;;
+      virtio-gpu-gl-pci*) if [ "$venus" = off ]; then a=virtio-gpu-gl-pci; else a="virtio-gpu-gl-pci,venus=on,blob=on,hostmem=$hostmem"; fi ;;
     esac
     args+=("$a")
   fi

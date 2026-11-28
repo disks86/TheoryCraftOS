@@ -31,16 +31,19 @@ CMAKE=$(sed -n 's/^CMAKE_COMMAND:INTERNAL=//p' "$BUILD/CMakeCache.txt")
 DATA_IMG=${DATA_IMG:-$BUILD/primary.img}
 # The window shows the guest's picture pixel for pixel (zoom-to-fit=off): a tiling window manager or a resized window would otherwise stretch it by a
 # fraction and blur and wobble the text.
-# QEMU_GPU: auto (default: gl when this QEMU has virtio-gpu-gl, else std), std (Bochs VGA with 64 MiB of video memory so the larger resolutions fit; QEMU_VGAMEM changes it), virtio (virtio-gpu, 2D scanout) or gl (virtio-gpu with virgl 3D).
+# QEMU_GPU: auto (default: gl when this QEMU has virtio-gpu-gl, else std), std (Bochs VGA with 64 MiB of video memory so the larger resolutions fit; QEMU_VGAMEM changes it), virtio (virtio-gpu, 2D scanout) gl (virtio-gpu 3D with Venus - the host's Vulkan -
+# when this QEMU has it, else virgl) or virgl (virtio-gpu 3D through the host's OpenGL only; QEMU_HOSTMEM sets Venus's host memory, default 2G).
 GPU_CHOICE=${QEMU_GPU:-auto}
 if [ "$GPU_CHOICE" = auto ]; then
   if qemu-system-x86_64 -device help 2>/dev/null | grep -q 'virtio-gpu-gl-pci'; then GPU_CHOICE=gl; else GPU_CHOICE=std; fi
 fi
 case $GPU_CHOICE in
-  gl) GPU_ARGS="-vga none -device virtio-gpu-gl-pci"; DISPLAY_ARGS="gtk,gl=on,zoom-to-fit=off,show-cursor=off,show-menubar=off" ;;
+  gl) if qemu-system-x86_64 -device virtio-gpu-gl-pci,help 2>/dev/null | grep -q 'venus='; then GPU_ARGS="-vga none -device virtio-gpu-gl-pci,venus=on,blob=on,hostmem=${QEMU_HOSTMEM:-2G}"; else GPU_ARGS="-vga none -device virtio-gpu-gl-pci"; fi
+      DISPLAY_ARGS="gtk,gl=on,zoom-to-fit=off,show-cursor=off,show-menubar=off" ;;
+  virgl) GPU_ARGS="-vga none -device virtio-gpu-gl-pci"; DISPLAY_ARGS="gtk,gl=on,zoom-to-fit=off,show-cursor=off,show-menubar=off" ;;
   virtio) GPU_ARGS="-vga none -device virtio-gpu-pci"; DISPLAY_ARGS="gtk,zoom-to-fit=off,show-cursor=off,show-menubar=off" ;;
   std) GPU_ARGS="-vga none -device VGA,vgamem_mb=${QEMU_VGAMEM:-64}"; DISPLAY_ARGS="gtk,zoom-to-fit=off,show-cursor=off,show-menubar=off" ;;
-  *) echo "unknown QEMU_GPU=$QEMU_GPU (auto, std, virtio, gl)" >&2; exit 2 ;;
+  *) echo "unknown QEMU_GPU=$QEMU_GPU (auto, std, virtio, gl, virgl)" >&2; exit 2 ;;
 esac
 # QEMU_AUDIO: the host sound backend for the guest's HD Audio codec: auto (default: PipeWire, else PulseAudio, ALSA, SDL, whichever this QEMU has first),
 # any QEMU -audiodev driver name (pipewire, pa, alsa, sdl, ...), wav (record to $BUILD/audio.wav, for checking without speakers) or none (discard).

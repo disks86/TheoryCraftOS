@@ -16,11 +16,12 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 # Direct3D 12 on the real kernel under QEMU, on the 3D hardware: tests/windows/d3d12test.c (dxgi.dll and d3d12.dll) is started by the kernel's autorun on a machine whose
-# graphics card is QEMU's virtio-gpu-gl, so the kernel's Direct3D draws through virglrenderer on the host's GPU (no window: egl-headless). tests/emulated_dx.sh runs the same
+# graphics card is QEMU's virtio-gpu-gl, so the kernel's Direct3D draws on the host's GPU (no window: egl-headless). tests/emulated_dx.sh runs the same
 # program on the CPU renderer; this is the run that shows the hardware path gives the same answers.
-# GPU=std uses the standard VGA card instead (the kernel's CPU renderer), to tell a hardware difference from a kernel one. GPU=venus gives the virtio-gpu Venus (venus=on,
-# blob=on, hostmem: the host's Vulkan), and the kernel's 3D device is then the Venus device (docs/Venus.md) unless GPU_BACKEND=VIRGL keeps virgl on it (AUTO: the kernel decides).
-# Passes if the program's checks all pass, it says the device it drew on was not the CPU renderer (GPU=virgl), and the autorun sees it end with exit code 0.
+# GPU=std uses the standard VGA card instead (the kernel's CPU renderer), to tell a hardware difference from a kernel one. GPU=venus (the default) gives the virtio-gpu Venus
+# (venus=on, blob=on, hostmem: the host's Vulkan), and the kernel's 3D device is then the Venus device (docs/Venus.md) unless GPU_BACKEND=VIRGL keeps virgl on it (AUTO: the
+# kernel decides); GPU=virgl leaves Venus off the device (virglrenderer: the host's OpenGL).
+# Passes if the program's checks all pass, it says the device it drew on was not the CPU renderer (GPU=venus or virgl), and the autorun sees it end with exit code 0.
 # Uses its own build folder (build-d3d12-qemu) so the normal build keeps no autorun.
 # Usage: [ARGS="..."] tests/d3d12_qemu.sh [program]      (default d3d12test; the source is tests/windows/<program>.c; d3d11test, d3d9test and d3d8test run Direct3D 11, 9 and 8 there, ddrawtest DirectDraw, d3dimtest Direct3D 1-7
 # too; ARGS="processes" d3dsharetest shares resources and fences with a second process it starts; opengltest runs opengl32.dll's checks)
@@ -28,7 +29,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 build=${BUILD:-build-d3d12-qemu}
 work=${TMPDIR:-/tmp}/tcos-d3d12-qemu
-gpu=${GPU:-virgl}
+gpu=${GPU:-venus}
 program=${1:-d3d12test}
 mkdir -p "$work"
 # (the shaders the program draws with, as C arrays: the kernel's own fixtures)
@@ -57,7 +58,7 @@ for a in "${words[@]}"; do
   if [ $skip = 1 ]; then skip=0; elif [ "$a" = -qmp ]; then skip=1; else
     case "$a" in
       gtk,gl=on*) a=egl-headless ;;
-      virtio-gpu-gl-pci) [ "$gpu" = venus ] && a="virtio-gpu-gl-pci,venus=on,blob=on,hostmem=${HOSTMEM:-1G}" ;;
+      virtio-gpu-gl-pci*) if [ "$gpu" = venus ]; then a="virtio-gpu-gl-pci,venus=on,blob=on,hostmem=${HOSTMEM:-1G}"; else a=virtio-gpu-gl-pci; fi ;;
     esac
     args+=("$a")
   fi

@@ -40,13 +40,17 @@ mingw-w64 is used because it emits PE32+ directly with the UEFI-compatible calli
 ```sh
 cmake -S . -B build -G Ninja
 cmake --build build              # produces build/esp/EFI/BOOT/BOOTX64.EFI
-cmake --build build --target run # boot in QEMU (OS output on your terminal); virgl 3D when this QEMU has virtio-gpu-gl, else standard VGA
-cmake --build build --target run-gl # always with a virtio-gpu 3D device: QEMU renders through the host GPU (virgl)
+cmake --build build --target run # boot in QEMU (OS output on your terminal); the virtio-gpu 3D device when this QEMU has virtio-gpu-gl, else standard VGA
+cmake --build build --target run-gl # always with a virtio-gpu 3D device: Venus (the host's Vulkan) when QEMU has it, else virgl (the host's OpenGL)
+cmake --build build --target run-virgl # the 3D device without Venus: everything drawn through the host's OpenGL (virgl), to compare
 cmake --build build --target run-std # always with the standard VGA card (software rendering)
 ```
 
-`run-gl` needs QEMU built with virglrenderer and a host OpenGL stack. `scripts/qemu-debug.sh` and `scripts/gdb-proxy.py`
-take `QEMU_GPU=gl` (virgl), `virtio` (virtio-gpu, software rendering), `std` (Bochs VGA, software rendering) or the default
+`run-gl` needs QEMU built with virglrenderer and a host OpenGL stack; Venus (`venus=on,blob=on,hostmem=2G`, given whenever QEMU's
+virtio-gpu-gl has the `venus` property; `-DTCOS_QEMU_VENUS=OFF` leaves it out, `-DTCOS_QEMU_HOSTMEM=` sizes it) also needs
+virglrenderer built with Venus and a host Vulkan driver. The kernel's 3D device then draws through the host's Vulkan, with no
+translation to OpenGL on the host. `scripts/qemu-debug.sh` and `scripts/gdb-proxy.py`
+take `QEMU_GPU=gl` (Venus when QEMU has it, else virgl), `virgl` (virgl only), `virtio` (virtio-gpu, software rendering), `std` (Bochs VGA, software rendering) or the default
 `auto`. Without a 3D engine everything falls back to the software renderers.
 
 The VM has an Intel HD Audio card (`ich9-intel-hda` with an `hda-duplex` codec) played through the host's sound server: PipeWire,

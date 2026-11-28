@@ -24,7 +24,7 @@
 # Usage: tests/heaven_qemu.sh [opengl|direct3d9|direct3d11]
 #   MINUTES (default 25) QEMU's time limit; WIDTH x HEIGHT (default 1280x720); TESSELLATION (DISABLED, MODERATE, NORMAL, EXTREME; default NORMAL,
 #   which Direct3D 9 does not have); QUALITY (LOW, MEDIUM, HIGH, ULTRA; default HIGH); GPU_BACKEND (AUTO, VENUS, VIRGL; default AUTO) with
-#   STD=1 for the standard VGA card (no 3D device: the CPU renderer draws); VENUS=on to give the device Venus; BENCHMARK=0 to run the demo without the benchmark (it does not quit; MINUTES ends it); PROFILE=<n>: after the
+#   STD=1 for the standard VGA card (no 3D device: the CPU renderer draws); VENUS=off to leave Venus off the device (virgl: the host's OpenGL; Venus, the host's Vulkan, is the default); BENCHMARK=0 to run the demo without the benchmark (it does not quit; MINUTES ends it); PROFILE=<n>: after the
 #   n-th screenshot a 60-second sampling profile (scripts/qemu-profile.py) into $work/profile.txt.
 # Uses its own build folder (build-heaven-qemu, BUILD= to change); screenshots and logs go in WORK (default $TMPDIR/tcos-heaven-<api>).
 set -euo pipefail
@@ -70,7 +70,7 @@ for a in "${words[@]}"; do
     case "$a" in
       gtk,gl=on*) a=egl-headless ;;
       # (a screen large enough for the window: the device's preferred mode)
-      virtio-gpu-gl-pci) if [ "${VENUS:-off}" = off ]; then a="virtio-gpu-gl-pci,xres=${SCREEN_WIDTH:-1920},yres=${SCREEN_HEIGHT:-1080}"; else a="virtio-gpu-gl-pci,venus=on,blob=on,hostmem=${HOSTMEM:-2G},xres=${SCREEN_WIDTH:-1920},yres=${SCREEN_HEIGHT:-1080}"; fi ;;
+      virtio-gpu-gl-pci*) if [ "${VENUS:-on}" = off ]; then a="virtio-gpu-gl-pci,xres=${SCREEN_WIDTH:-1920},yres=${SCREEN_HEIGHT:-1080}"; else a="virtio-gpu-gl-pci,venus=on,blob=on,hostmem=${HOSTMEM:-2G},xres=${SCREEN_WIDTH:-1920},yres=${SCREEN_HEIGHT:-1080}"; fi ;;
     esac
     args+=("$a")
   fi

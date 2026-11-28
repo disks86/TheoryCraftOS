@@ -19,7 +19,8 @@
 #   scripts/winetest.sh <dll> [test ...]     e.g. scripts/winetest.sh ntdll large_int rtl
 # Builds the tests into build/winetests, boots the OS headless with tests/windows/winerun.exe as the program (TCOS_WINE_TEST_PROGRAM) and the tests next to it, and writes
 # the output to build/winetests/<dll>.log and a summary (checks failed per test) to the terminal. Do not run two at once: they share the build directory.
-# WINETEST_GPU=virgl boots with QEMU's virtio-gpu-gl (virgl 3D, headless) instead of the standard VGA card.
+# WINETEST_GPU=venus boots with QEMU's virtio-gpu-gl 3D device (headless) with Venus, the host's Vulkan (the run-gl target), and WINETEST_GPU=virgl with virgl only
+# (the host's OpenGL; run-virgl), instead of the standard VGA card.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 dll=$1; shift
@@ -61,13 +62,15 @@ while [ ${#pending[@]} -gt 0 ] && [ $round -lt 40 ]; do
   cp "$out/winerun.exe" "$out/iexplore.exe"; files+=("$PWD/$out/iexplore.exe")      # (C:\Program Files\Internet Explorer\iexplore.exe: a program the process tests start)
   cat > "$out/qemu.sh" <<'QEMU'
 #!/bin/sh
+# (CMake's questions - which devices, which properties of virtio-gpu-gl - go to QEMU as they are)
+case "$*" in *help*) exec /usr/bin/qemu-system-x86_64 "$@" ;; esac
 # Runs QEMU without a display until the program prints WINERUN DONE, the debug console is silent for ${WINETEST_QUIET:-90} s, or 40 minutes pass; then stops it.
 log=$(dirname "$0")/../debugcon.log
 mon=/tmp/tcos-qemu-mon-$$.sock
 rm -f "$mon"
 # (the QMP socket of the run target is left out: its path is too long for QEMU when the checkout is deep, and nothing here uses it)
 args=(); skip=0
-# (with WINETEST_GPU=virgl the run-gl target's window becomes egl-headless: virgl 3D with no display)
+# (with WINETEST_GPU=venus or virgl the 3D target's window becomes egl-headless: virgl 3D with no display)
 for a in "$@"; do if [ $skip = 1 ]; then skip=0; elif [ "$a" = -qmp ]; then skip=1; else case "$a" in gtk,gl=on*) a=egl-headless;; esac; args+=("$a"); fi; done
 /usr/bin/qemu-system-x86_64 -display none -enable-kvm -monitor unix:"$mon",server,nowait "${args[@]}" >/dev/null 2>"$(dirname "$0")/qemu-err.txt" &
 pid=$!
@@ -96,7 +99,7 @@ QEMU
   : > build/debugcon.log
   cmake -S . -B build -DTCOS_USERMODE_DEMO=OFF -DTCOS_WINE_TEST_PROGRAM="$PWD/$out/winerun.exe" "-DTCOS_WINE_TEST_FILES=$(IFS=';'; echo "${files[*]}")" -DQEMU="$PWD/$out/qemu.sh" >/dev/null
   ninja -C build esp primary vars >"$out/build.log" 2>&1 || { tail -20 "$out/build.log"; exit 1; }
-  if [ "${WINETEST_GPU:-}" = virgl ]; then ninja -C build run-gl >/dev/null 2>&1 || true; else ninja -C build run-std >/dev/null 2>&1 || true; fi
+  if [ "${WINETEST_GPU:-}" = venus ]; then ninja -C build run-gl >/dev/null 2>&1 || true; elif [ "${WINETEST_GPU:-}" = virgl ]; then ninja -C build run-virgl >/dev/null 2>&1 || true; else ninja -C build run-std >/dev/null 2>&1 || true; fi
   [ -s "$out/hang-dump.txt" ] && { cat "$out/hang-dump.txt" >> "$out/$dll.hang"; rm -f "$out/hang-dump.txt"; }
   sed -n '/Windows test program/,$p' build/debugcon.log | { grep -av "^\[" || true; } | { grep -av "^  \(test program\|Windows test program\)" || true; } >> "$out/$dll.log"      # (-a: a console test writes control characters)
   # the tests that did not start in this round are the next round's; the one that started and never ended is recorded as hung

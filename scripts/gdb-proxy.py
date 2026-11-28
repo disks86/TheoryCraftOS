@@ -50,18 +50,25 @@ def cache(build, key):
 
 def gpu_arguments():
     """The display adapter and display backend, from QEMU_GPU like scripts/qemu-debug.sh: auto (the default: gl when this QEMU has
-    virtio-gpu-gl-pci, else std), gl (virgl 3D), virtio (virtio-gpu, 2D) or std (Bochs VGA with 64 MiB of video memory)."""
+    virtio-gpu-gl-pci, else std), gl (3D with Venus - the host's Vulkan - when
+    this QEMU has it, else virgl), virgl (3D through the host's OpenGL only), virtio (virtio-gpu, 2D) or std (Bochs VGA with 64 MiB of video memory)."""
     choice = os.environ.get("QEMU_GPU", "auto")
     if choice == "auto":
         devices = subprocess.run(["qemu-system-x86_64", "-device", "help"], capture_output=True, text=True).stdout
         choice = "gl" if "virtio-gpu-gl-pci" in devices else "std"
     if choice == "gl":
+        properties = subprocess.run(["qemu-system-x86_64", "-device", "virtio-gpu-gl-pci,help"], capture_output=True, text=True).stdout
+        if "venus=" in properties:
+            device = "virtio-gpu-gl-pci,venus=on,blob=on,hostmem=" + os.environ.get("QEMU_HOSTMEM", "2G")
+            return ["-vga", "none", "-device", device], "gtk,gl=on,show-cursor=off,show-menubar=off"
+        choice = "virgl"
+    if choice == "virgl":
         return ["-vga", "none", "-device", "virtio-gpu-gl-pci"], "gtk,gl=on,show-cursor=off,show-menubar=off"
     if choice == "virtio":
         return ["-vga", "none", "-device", "virtio-gpu-pci"], "gtk,show-cursor=off,show-menubar=off"
     if choice == "std":
         return ["-vga", "none", "-device", "VGA,vgamem_mb=" + os.environ.get("QEMU_VGAMEM", "64")], "gtk,show-cursor=off,show-menubar=off"
-    sys.exit("unknown QEMU_GPU=%s (auto, std, virtio, gl)" % choice)
+    sys.exit("unknown QEMU_GPU=%s (auto, std, virtio, gl, virgl)" % choice)
 
 
 def audio_arguments(build):
