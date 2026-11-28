@@ -100,10 +100,14 @@ class VirglDevice final : public IGraphicsDevice {
   uint32_t last_submit_failure() const override { return __atomic_load_n(&submit_failure_line_, __ATOMIC_RELAXED); }
   bool present(IImage* image) override;
 
+  // The queries of one submit and their counts (VirglDevice.cpp): waited for in submit(), or by the command buffer when a count is asked for (ICommandBuffer::defer_query_results).
+  struct SubmitQueries;
+
   // Used by the resource classes (not part of IGraphicsDevice).
   hardware::VirtioGpu& gpu() { return gpu_; }
   // SUBMIT_3D. Without a fence (the default) the host takes the commands and the GPU runs them while we go on; `fence`: the answer waits for the GPU (and has the host poll).
-  bool send_commands(const uint32_t* dwords, uint32_t count, bool fence = false);
+  // `answered`: wait for the host to have taken it in even without a fence (else such a stream goes without waiting: VirtioGpu::submit_virgl_unanswered).
+  bool send_commands(const uint32_t* dwords, uint32_t count, bool fence = false, bool answered = false);
   uint32_t new_handle() { return next_handle_++; }      // (one thread at a time: every user reaches the device through RenderNode's LockedDevice)
   // Whether the host's GPU may still be running work numbered `work` (VirtioGpu::work_sent; 0 is no work), or work of a submit that used more buffers than it
   // kept track of (all buffers count as used by it).
@@ -126,10 +130,15 @@ class VirglDevice final : public IGraphicsDevice {
   // (VirglPipeline::blend_reset), because the host's OpenGL refuses draws into several targets while they do.
   bool host_dual_source_factors_ = false;
   kernel::Mutex submit_lock_{true};   // (held through a submit: see submit(); fair, as LockedDevice's)
-  // Result buffers of host queries (16 bytes each) that the host has finished writing, kept for the next queries: making one is three fenced commands and letting it go
-  // two more, for every query of every submit. Touched only with submit_lock_ held; past kSpareQueryBuffers they are let go.
-  static constexpr uint32_t kSpareQueryBuffers = 512;
-  IBuffer* spare_query_buffers_[kSpareQueryBuffers] = {};   // (VirglBuffers)
+  // Host queries the host has finished with, kept for the next queries of their type: their query object and its result buffer (16 bytes). Making one is three fenced commands
+  // for the buffer and letting it go two more and a command for the object, for every query of every submit. Touched only with submit_lock_ held; past kSpareQueries they go.
+  static constexpr uint32_t kSpareQueries = 512;
+  struct SpareQuery {
+    IBuffer* buffer = nullptr;   // (a VirglBuffer)
+    uint32_t object = 0;
+    uint32_t type = 0;
+  };
+  SpareQuery spare_queries_[kSpareQueries] = {};
   uint32_t spare_query_count_ = 0;
   uint32_t submit_failure_line_ = 0;
   bool query_timeout_said_ = false;   // (the log has said once that a host query timed out)

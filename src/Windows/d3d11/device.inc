@@ -535,6 +535,7 @@ static void dev_destroy(DxObj *o) {
   if (d->measure_heap) ID3D12QueryHeap_Release(d->measure_heap);
   if (d->measure_stats_heap) ID3D12QueryHeap_Release(d->measure_stats_heap);
   if (d->measure_so_heap) ID3D12QueryHeap_Release(d->measure_so_heap);
+  measures_release(d);
   if (d->measure_readback) ID3D12Resource_Release(d->measure_readback);
   mem_free(d->measures);
   if (d->root) ID3D12RootSignature_Release(d->root);

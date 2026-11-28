@@ -1844,7 +1844,11 @@ class SpyDevice final : public graphics::IGraphicsDevice {
   void destroy_pipeline(graphics::IPipeline* pipeline) override { inner_.destroy_pipeline(pipeline); }
   graphics::ICommandBuffer* create_command_buffer() override { return inner_.create_command_buffer(); }
   void destroy_command_buffer(graphics::ICommandBuffer* commands) override { inner_.destroy_command_buffer(commands); }
-  bool submit(graphics::ICommandBuffer* commands) override { return inner_.submit(commands); }
+  uint32_t submits = 0;   // command buffers the kernel sent
+  bool submit(graphics::ICommandBuffer* commands) override {
+    ++submits;
+    return inner_.submit(commands);
+  }
   bool present(graphics::IImage* image) override { return inner_.present(image); }
 
  private:
@@ -3436,6 +3440,110 @@ void test_occlusion_queries() {
   w2.end_pass();
   CHECK(w2.ok() && e.render(w2, {rt, rt2, ds, vb, far_vb, results}) == status::kSuccess);
   CHECK(query_count(e, results, 4) == 256 && query_count(e, results, 5) == 64 && query_count(e, results, 6) == 0);
+
+  // Results copied out of the query buffer (Direct3D 12's ResolveQueryData, which Direct3D 11's GetData uses): those of a query of the same stream are counted first,
+  // those an earlier stream wrote are already there - copied where the copy stands, without sending what was recorded before it (the device is not made to wait).
+  {
+    Handle readback = e.buffer(kAllocVertexBuffer, 64);
+    CommandWriter c(e.allocator);
+    c.begin_pass(0, 2, kPassClearColor | kPassClearDepth, {0, 0, 0, 1}, 1, 0);
+    c.bind_pipeline(pipe);
+    c.push_constants(floats(identity, 16));
+    c.bind_vertex_buffer(3);
+    c.begin_query(5, 48);
+    c.draw(3);
+    c.end_query();
+    c.end_pass();
+    c.copy_buffer(6, 0, 5, 48, 8);    // (this stream's query)
+    c.copy_buffer(6, 8, 5, 40, 8);    // (the last stream's: 64)
+    CHECK(c.ok() && e.render(c, {rt, rt2, ds, vb, far_vb, results, readback}) == status::kSuccess);
+    CHECK(query_count(e, readback, 0) == 256 && query_count(e, readback, 1) == 64);
+  }
+  // Streams whose results are counted when something needs them (the stream's last command buffer is not waited for): they land in the order the streams ran, a copy
+  // reads the latest, and a query that adds to what is there adds to that.
+  {
+    auto query_stream = [&](bool draw, uint32_t word) {
+      CommandWriter c(e.allocator);
+      c.begin_pass(0, 2, kPassClearColor | kPassClearDepth, {0, 0, 0, 1}, 1, 0);
+      c.bind_pipeline(pipe);
+      c.push_constants(floats(identity, 16));
+      c.bind_vertex_buffer(3);
+      c.begin_query(5, 56, word);
+      if (draw) c.draw(3);
+      c.end_query();
+      c.end_pass();
+      return c.ok() && e.render(c, {rt, rt2, ds, vb, far_vb, results}) == status::kSuccess;
+    };
+    Handle copy_out = e.buffer(kAllocVertexBuffer, 16);
+    CHECK(query_stream(true, 0) && query_stream(false, 0));      // (256, then 0, into the same place)
+    CommandWriter c(e.allocator);
+    c.copy_buffer(6, 0, 5, 56, 8);
+    CHECK(c.ok() && e.render(c, {rt, rt2, ds, vb, far_vb, results, copy_out}) == status::kSuccess);
+    CHECK(query_count(e, copy_out, 0) == 0 && query_count(e, results, 7) == 0);
+    CHECK(query_stream(true, kQueryAccumulate) && query_stream(true, kQueryAccumulate));
+    CHECK(query_count(e, results, 7) == 512);
+  }
+
+  {
+    FakeScreen screen(8, 6);
+    graphics::SoftwareDevice inner(e.allocator, &screen);
+    SpyDevice spy(inner);
+    Kernel k(e.allocator);
+    AdapterConfig config;
+    config.display = &screen;
+    CHECK(k.add_adapter(spy, config) == 0);
+    Handle a = 0, d = 0, c = 0, target = 0, counts = 0, out = 0;
+    CHECK(k.open_process(kPid) == status::kSuccess && k.open_adapter_from_index(kPid, 0, &a) == status::kSuccess && k.create_device(kPid, a, &d) == status::kSuccess &&
+          k.create_context(kPid, d, ContextPriority::Normal, &c) == status::kSuccess);
+    AllocationDesc td;
+    td.flags = kTarget, td.format = Format::A8R8G8B8, td.width = td.height = 8;
+    AllocationDesc qd;
+    qd.flags = kAllocQueryResult, qd.size = 16;
+    AllocationDesc bd;
+    bd.flags = kAllocVertexBuffer, bd.size = 16;
+    CHECK(k.create_allocation(kPid, d, td, &target) == status::kSuccess && k.create_allocation(kPid, d, qd, &counts) == status::kSuccess &&
+          k.create_allocation(kPid, d, bd, &out) == status::kSuccess);
+    LockResult lr;
+    if (k.lock(kPid, counts, kLockDiscard, 0, &lr) == status::kSuccess) {      // (results an earlier stream wrote)
+      ByteWriter w(lr.data);
+      w.le64(77);
+      w.le64(5);
+      k.unlock(kPid, counts);
+    }
+    CommandWriter cw(e.allocator);
+    cw.begin_pass(0, kNoAllocation, kPassClearColor, {1, 0, 0, 1}, 1, 0);
+    cw.end_pass();
+    cw.copy_buffer(2, 0, 1, 0, 16);
+    cw.begin_pass(0, kNoAllocation, kPassClearColor, {0, 1, 0, 1}, 1, 0);
+    cw.end_pass();
+    const Handle list[3] = {target, counts, out};
+    CHECK(cw.ok() && k.render(kPid, c, cw.view(), ArrayView<const Handle>(list, 3)) == status::kSuccess);
+    CHECK(spy.submits == 1);      // (one command buffer: the copy did not cut it in two)
+    if (k.lock(kPid, out, kLockReadOnly, 0, &lr) == status::kSuccess) {
+      ByteReader r(lr.data);
+      const uint64_t first = r.le64(), second = r.le64();
+      CHECK(first == 77 && second == 5);
+      k.unlock(kPid, out);
+    }
+    // A query of the stream resolved right after it ends (Direct3D 11's End, then GetData's copy) and work after it: the copy waits for the results the end of the stream
+    // stores, still one command buffer, and has the new count (0: an empty query), not what was there.
+    CommandWriter q(e.allocator);
+    q.begin_pass(0, kNoAllocation, kPassClearColor, {1, 0, 0, 1}, 1, 0);
+    q.begin_query(1, 0);
+    q.end_query();
+    q.end_pass();
+    q.copy_buffer(2, 0, 1, 0, 8);
+    q.begin_pass(0, kNoAllocation, kPassClearColor, {0, 1, 0, 1}, 1, 0);
+    q.end_pass();
+    CHECK(q.ok() && k.render(kPid, c, q.view(), ArrayView<const Handle>(list, 3)) == status::kSuccess);
+    CHECK(spy.submits == 2);
+    if (k.lock(kPid, out, kLockReadOnly, 0, &lr) == status::kSuccess) {
+      ByteReader r(lr.data);
+      const uint64_t first = r.le64(), second = r.le64();
+      CHECK(first == 0 && second == 5);
+      k.unlock(kPid, out);
+    }
+  }
 
   // What the kernel refuses (nothing runs, and the results stay as they were).
   auto refused = [&](auto build) {

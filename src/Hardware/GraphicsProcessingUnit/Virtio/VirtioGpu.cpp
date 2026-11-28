@@ -198,6 +198,51 @@ uint64_t VirtioGpu::submit_async(uint32_t context, ConstByteView commands, uint3
   return s.fence;
 }
 
+bool VirtioGpu::submit_virgl_unanswered(ConstByteView commands) {
+  if (!ready_ || alone_ || (commands.size() & 3) || commands.size() > max_submit_bytes()) return false;
+  if (control_.size() < 2 + 2 * kAsyncSlots) return false;
+  if (!lock_for_command()) return false;
+  struct Release {
+    kernel::Mutex& mutex;
+    ~Release() { mutex.unlock(); }
+  } guard{lock_};
+  reap_locked(nullptr);
+  if (in_flight_) return false;   // (an earlier command never got its answer: the host is not taking commands)
+  uint32_t slot = kAsyncSlots;
+  for (uint32_t i = 0; i < kAsyncSlots; ++i)
+    if (!__atomic_load_n(&async_[i].busy, __ATOMIC_ACQUIRE)) {
+      slot = i;
+      break;
+    }
+  if (slot == kAsyncSlots) return false;
+  AsyncSlot& s = async_[slot];
+  const uint64_t needed = sizeof(CmdSubmit) + commands.size() + sizeof(ControlHeader);
+  if (s.buffer.size() < needed) {
+    if (!s.buffer.empty()) release_view(*allocator_, s.buffer);
+    s.buffer = allocate_dma_view<uint8_t>(*allocator_, needed > kAsyncBufferBytes ? needed : kAsyncBufferBytes, 4096);
+    if (s.buffer.empty()) return false;
+  }
+  CmdSubmit head{};
+  head.header = header(kCmdSubmit3d);
+  head.header.context_id = kContextId;
+  head.size = static_cast<uint32_t>(commands.size());
+  const uint64_t request_bytes = sizeof(CmdSubmit) + commands.size();
+  ByteWriter out(s.buffer.first(request_bytes));
+  out.bytes(as_bytes(head));
+  out.bytes(commands);
+  if (!out.ok()) return false;
+  s.fence = 0;   // (no fence: fence_signaled never looks for it)
+  s.request_bytes = static_cast<uint32_t>(request_bytes);
+  __atomic_store_n(&work_sent_, work_sent_ + 1, __ATOMIC_RELEASE);   // (a 3D command of the virgl context: see execute())
+  __atomic_store_n(&s.busy, true, __ATOMIC_RELEASE);
+  ByteView answer = s.buffer.subview(request_bytes, sizeof(ControlHeader));
+  const Virtqueue::Segment segments[2] = {{s.buffer.data(), static_cast<uint32_t>(request_bytes), false},
+                                          {answer.data(), static_cast<uint32_t>(answer.size()), true}};
+  control_.post_chain(static_cast<uint16_t>(2 + 2 * slot), segments, 2);
+  transport_->notify(0);
+  return true;
+}
+
 bool VirtioGpu::fence_signaled(uint64_t fence) {
   if (fence == 0 || fence > __atomic_load_n(&fence_, __ATOMIC_ACQUIRE)) return false;
   if (lock_.try_lock()) {   // (collect answers that came in; a holder of the lock does that itself)

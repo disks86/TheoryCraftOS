@@ -105,6 +105,9 @@ class Adapter {
   // Is the allocation named by a submission waiting in some queue?
   bool allocation_in_use(const Allocation& a) const;
   bool context_idle(const ContextObject& context) const { return context.queue.count() == 0; }
+  // Query results a stream left to be counted later (its last command buffer's, which the device did not wait for): those that write `a` - and every one before them,
+  // in order - are counted and written now. Before the CPU or a later stream touches `a` (Allocation::results_pending).
+  void complete_pending_results(const Allocation& a, uint64_t offset = 0, uint64_t bytes = ~uint64_t{0});   // (only the records that write those bytes of it, and those before)
   // (Kernel::set_present_tap)
   void set_present_tap(IPresentTap* tap) { __atomic_store_n(&present_tap_, tap, __ATOMIC_RELEASE); }
 
@@ -117,6 +120,18 @@ class Adapter {
   void fault(ContextObject& context, NtStatus why);
   NtStatus execute_render(Submission& s);
   NtStatus execute_present(Submission& s);
+  // A query of a stream (StreamRunner), the copies out of query results that wait for the results (StreamRunner::copy_buffer), and the results of a stream's last command
+  // buffer that are counted when something needs them (complete_pending_results).
+  struct StreamQuery;
+  struct DeferredCopy;
+  struct PendingResults;
+  static bool collect_segments(graphics::ICommandBuffer& cb, ArrayView<StreamQuery> queries);
+  static bool store_query_results(VidMm& mm, ArrayView<StreamQuery> queries);
+  static bool apply_deferred_copies(VidMm& mm, ArrayView<const DeferredCopy> copies);
+  void complete_pending(uint64_t count);   // (the first `count` records)
+  void finish_pending(PendingResults& record);
+  static constexpr uint64_t kMaxPendingResults = 32;
+  void keep_pending(UniquePointer<PendingResults> record);
 
   allocators::IAllocator& allocator_;
   graphics::IGraphicsDevice& device_;
@@ -128,6 +143,7 @@ class Adapter {
   List<SharedPointer<ContextObject>> contexts_;
   uint32_t next_[3] = {0, 0, 0};                     // per priority: where the round robin goes on
   IPresentTap* present_tap_ = nullptr;
+  List<UniquePointer<PendingResults>> pending_results_;   // (in the order their streams ran)
 };
 
 }  // namespace dxgk

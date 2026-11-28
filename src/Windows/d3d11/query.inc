@@ -150,13 +150,13 @@ static void measures_resolve(Dev *d) {
                                                     MEASURE_STREAM_AT(i, n));
     }
 }
-/* After the list ran: each measurement added to its queries. */
-static void measures_collect(Dev *d) {
-  if (!d->measure_count) return;
+/* After a list ran: each of its measurements added to its queries (`b`: the list's batch). */
+static void measures_collect_batch(struct MeasureBatch *b) {
+  if (!b->count) return;
   const BYTE *values = NULL;
-  if (FAILED(ID3D12Resource_Map(d->measure_readback, 0, NULL, (void **)&values))) values = NULL;
-  for (UINT i = 0; i < d->measure_count; ++i) {
-    Measure *m = &d->measures[i];
+  if (FAILED(ID3D12Resource_Map(b->readback, 0, NULL, (void **)&values))) values = NULL;
+  for (UINT i = 0; i < b->count; ++i) {
+    Measure *m = &b->measures[i];
     UINT64 samples = 0;
     D3D11_QUERY_DATA_PIPELINE_STATISTICS stats;
     D3D12_QUERY_DATA_SO_STATISTICS so[4];
@@ -180,12 +180,86 @@ static void measures_collect(Dev *d) {
       }
       for (UINT n = 0; n < 4; ++n)
         if (wants & MEASURE_STREAM(n)) { q->so_written[n] += so[n].NumPrimitivesWritten; q->so_needed[n] += so[n].PrimitivesStorageNeeded; }
+      if (q->outstanding) --q->outstanding;
       unhold(q);
     }
     m->count = 0;
   }
-  if (values) ID3D12Resource_Unmap(d->measure_readback, 0, NULL);
+  if (values) ID3D12Resource_Unmap(b->readback, 0, NULL);
+  b->count = 0;
+}
+
+/* Reads the oldest list's measurements (waiting for it if the device has not counted them yet) and frees its buffer for another list. */
+static void measures_collect_oldest(Dev *d) {
+  if (!d->batch_count) return;
+  struct MeasureBatch *b = &d->batches[d->batch_first];
+  measures_collect_batch(b);
+  d->free_sets[d->free_set_count].readback = b->readback;
+  d->free_sets[d->free_set_count].measures = b->measures;
+  ++d->free_set_count;
+  b->readback = NULL;
+  b->measures = NULL;
+  d->batch_first = (d->batch_first + 1) % MEASURE_BATCHES;
+  --d->batch_count;
+}
+/* After a list was sent: its measurements wait in a batch, read when one of their queries is asked for (GetData), not now - asking the device for its counts right
+ * after every list would have it finish its work each time (Direct3D 11's End does not wait either). The next list measures into a free buffer. */
+static void measures_send(Dev *d) {
+  if (!d->measure_count) return;
+  if (d->batch_count == MEASURE_BATCHES) measures_collect_oldest(d);
+  ID3D12Resource *readback = NULL;
+  Measure *measures = NULL;
+  if (d->free_set_count) {
+    --d->free_set_count;
+    readback = d->free_sets[d->free_set_count].readback;
+    measures = d->free_sets[d->free_set_count].measures;
+  } else {
+    readback = make_buffer(d, D3D12_HEAP_TYPE_READBACK, MEASURE_READBACK_BYTES);
+    measures = mem_alloc(sizeof(Measure) * MEASURES);
+    if (measures) memset(measures, 0, sizeof(Measure) * MEASURES);
+  }
+  if (!readback || !measures) {      /* (no room for another: this list's are read now) */
+    if (readback) ID3D12Resource_Release(readback);
+    mem_free(measures);
+    struct MeasureBatch now = {d->measure_readback, d->measures, d->measure_count};
+    measures_collect_batch(&now);
+    d->measure_count = 0;
+    return;
+  }
+  struct MeasureBatch *b = &d->batches[(d->batch_first + d->batch_count) % MEASURE_BATCHES];
+  b->readback = d->measure_readback;
+  b->measures = d->measures;
+  b->count = d->measure_count;
+  ++d->batch_count;
+  d->measure_readback = readback;
+  d->measures = measures;
   d->measure_count = 0;
+}
+/* Whether a measurement of the list being recorded is for `q`. */
+static BOOL measured_in_list(const Dev *d, const Query *q) {
+  for (UINT i = 0; i < d->measure_count; ++i)
+    for (UINT k = 0; k < d->measures[i].count; ++k)
+      if (d->measures[i].queries[k] == q) return TRUE;
+  return FALSE;
+}
+/* The counts of `q` are all in: the list it was measured in sent (unless `no_flush`: then FALSE), the batches up to its last read. */
+static BOOL query_settle(Dev *d, Query *q, BOOL no_flush) {
+  if (!q->outstanding) return TRUE;
+  if (measured_in_list(d, q)) {
+    if (no_flush) return FALSE;
+    flush(d);
+  }
+  while (q->outstanding && d->batch_count) measures_collect_oldest(d);
+  return TRUE;
+}
+/* At the device's end: every batch read (its queries let go) and the buffers freed. */
+static void measures_release(Dev *d) {
+  while (d->batch_count) measures_collect_oldest(d);
+  for (UINT i = 0; i < d->free_set_count; ++i) {
+    if (d->free_sets[i].readback) ID3D12Resource_Release(d->free_sets[i].readback);
+    mem_free(d->free_sets[i].measures);
+  }
+  d->free_set_count = 0;
 }
 
 /* Ends the measurement that is open (Begin and End of a query change what one is for; the list's end ends it too). */
@@ -214,7 +288,7 @@ static void measure_draw(Dev *d) {
   m->what = what;
   m->count = 0;
   for (UINT k = 0; k < d->active_count; ++k)
-    if (query_measures(d->active[k]->desc.Query)) { hold(d->active[k]); m->queries[m->count++] = d->active[k]; }
+    if (query_measures(d->active[k]->desc.Query)) { hold(d->active[k]); ++d->active[k]->outstanding; m->queries[m->count++] = d->active[k]; }
   if (what & MEASURE_SAMPLES) ID3D12GraphicsCommandList_BeginQuery(d->list, d->measure_heap, D3D12_QUERY_TYPE_OCCLUSION, i);
   if (what & MEASURE_STATS) ID3D12GraphicsCommandList_BeginQuery(d->list, d->measure_stats_heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, i);
   for (UINT n = 0; n < 4; ++n)
@@ -255,7 +329,16 @@ static void STDMETHODCALLTYPE ctx_Begin(Ctx *c, ID3D11Asynchronous *async) {
     for (UINT i = 0; i < d->measure_count; ++i) {
       Measure *m = &d->measures[i];
       for (UINT k = 0; k < m->count; ++k)
-        if (m->queries[k] == q) { m->queries[k] = m->queries[--m->count]; unhold(q); --k; }
+        if (m->queries[k] == q) { m->queries[k] = m->queries[--m->count]; --q->outstanding; unhold(q); --k; }
+    }
+    /* (... and so are those of lists sent before whose counts have not been read: they no longer go to it) */
+    for (UINT j = 0; j < d->batch_count; ++j) {
+      struct MeasureBatch *b = &d->batches[(d->batch_first + j) % MEASURE_BATCHES];
+      for (UINT i = 0; i < b->count; ++i) {
+        Measure *m = &b->measures[i];
+        for (UINT k = 0; k < m->count; ++k)
+          if (m->queries[k] == q) { m->queries[k] = m->queries[--m->count]; --q->outstanding; unhold(q); --k; }
+      }
     }
   }
   if (!q->active) { hold(q); d->active[d->active_count++] = q; q->active = TRUE; }
@@ -278,7 +361,9 @@ static void STDMETHODCALLTYPE ctx_End(Ctx *c, ID3D11Asynchronous *async) {
   hold(q);
   if (query_measures(q->desc.Query)) measure_close(d);      /* (the draws after this are not its) */
   query_deactivate(d, q);
-  flush(d);      /* (what came before is done, and what the kernel measured for it is in) */
+  /* (an event is done when what came before it is: that goes now. The counts of the others are read when they are asked for - GetData -, as Windows' End does not wait
+   * for the device either) */
+  if (q->desc.Query == D3D11_QUERY_EVENT) flush(d);
   q->stop = query_now();
   q->begun = FALSE;
   q->ended = TRUE;
@@ -301,6 +386,12 @@ static HRESULT STDMETHODCALLTYPE ctx_GetData(Ctx *c, ID3D11Asynchronous *async, 
   if ((data && size != need && size != 0) || (!data && size)) return E_INVALIDARG;
   if (q->begun && !q->ended) return DXGI_ERROR_INVALID_CALL;      /* (begun and not ended: being built, nothing to ask yet - as Windows answers) */
   if (!q->ended) return DXGI_ERROR_INVALID_CALL;  /* (never issued) */
+  /* (its counts: the list it was measured in is sent unless DONOTFLUSH - then the result is not there yet, S_FALSE, as Windows answers -, and read back) */
+  Dev *d = c->dev;
+  EnterCriticalSection(&d->lock);
+  const BOOL settled = query_settle(d, q, (flags & D3D11_ASYNC_GETDATA_DONOTFLUSH) != 0);
+  LeaveCriticalSection(&d->lock);
+  if (!settled) return S_FALSE;
   if (!data || size == 0) return S_OK;
   const UINT stream = query_stream(q->desc.Query);
   switch (q->desc.Query) {
@@ -345,7 +436,8 @@ static void STDMETHODCALLTYPE ctx_GetPredication(Ctx *c, ID3D11Predicate **predi
   if (value) *value = c->predicate_value;
 }
 /* Whether the next predicated command of the immediate context is left out. */
-static BOOL predicated_out(const Dev *d) {
-  const Query *p = d->ctx->predicate;
+static BOOL predicated_out(Dev *d) {
+  Query *p = d->ctx->predicate;
+  if (p && p->ended) (void)query_settle(d, p, FALSE);      /* (its result is needed now) */
   return p && p->ended && query_predicate_value(p) == d->ctx->predicate_value;
 }

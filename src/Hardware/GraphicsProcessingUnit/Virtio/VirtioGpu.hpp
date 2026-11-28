@@ -188,6 +188,10 @@ class VirtioGpu : public FramebufferGpu, public IMonitorSource {
   // be sent: no slot free, the host not answering, ...). fence_signaled() / wait_fence() tell when the host has finished the work. Up to kAsyncSlots
   // such commands may be out at once.
   uint64_t submit_async(uint32_t context, ConstByteView commands, uint32_t ring = kNoRing);
+  // A command stream for the virgl context, without a fence and without waiting for the host's answer: it goes to the host and the call returns at once, using a
+  // slot of submit_async's. The host takes the control queue's commands in order, so what is sent after it (synchronous or not) comes after it. False if it could not
+  // be sent that way (no slot free, a queue too small): the caller sends it as a synchronous command.
+  bool submit_virgl_unanswered(ConstByteView commands);
   // Whether the host has answered the fenced command numbered `fence` (any number up to the last handed out that is no longer outstanding).
   bool fence_signaled(uint64_t fence);
   // Waits until it has, at most `timeout_us` (~0: for ever, as long as the host answers). False on a timeout.

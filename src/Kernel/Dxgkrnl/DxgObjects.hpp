@@ -221,8 +221,15 @@ class VideoDecoderObject {
 // What waits in a context's queue (WDDM's per-context DMA buffer queue).
 enum class SubmissionKind : uint8_t { Render, Signal, Wait, Present };
 
+// The last command of a stream that uses an allocation (its index from 0), as its check found it: what the stream does with it afterwards (StreamRunner's deferred copies).
+struct AllocationUse {
+  const Allocation* allocation = nullptr;
+  uint32_t last_command = 0;
+};
+
 struct Submission {
-  explicit Submission(allocators::IAllocator& allocator) : commands(allocator), allocations(allocator), pipelines(allocator), signatures(allocator), heaps(allocator), decoders(allocator) {}
+  explicit Submission(allocators::IAllocator& allocator)
+      : commands(allocator), allocations(allocator), pipelines(allocator), signatures(allocator), heaps(allocator), decoders(allocator), last_uses(allocator) {}
   SubmissionKind kind = SubmissionKind::Render;
   // Render: a copy of the command stream (what the process wrote afterwards does not matter), the allocation list and the pipelines it binds, in the order it binds them.
   ByteBuffer commands;
@@ -231,6 +238,7 @@ struct Submission {
   List<SharedPointer<RootSignatureObject>> signatures;   // (Direct3D 12: the root signatures and descriptor heaps it sets, in order)
   List<SharedPointer<DescriptorHeapObject>> heaps;
   List<SharedPointer<VideoDecoderObject>> decoders;   // (the video decoders its DecodeFrames name, in order)
+  List<AllocationUse> last_uses;   // (each allocation the stream uses, with the last command that does)
   // Signal / Wait
   SharedPointer<SyncObject> sync;
   uint64_t value = 0;

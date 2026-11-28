@@ -812,6 +812,7 @@ NtStatus Kernel::lock(ProcessId pid, Handle allocation, uint32_t flags, uint32_t
   if (adapter) {
     adapter->pump();
     if (adapter->allocation_in_use(a)) return status::kGraphicsAllocationBusy;
+    adapter->complete_pending_results(a);   // (query results a stream left to be counted, and copied, into it)
   }
   if (flags & kLockDiscard) a.manager().discard_gpu_contents(a);
   else if (!a.manager().read_back(a)) return status::kInvalidDeviceState;

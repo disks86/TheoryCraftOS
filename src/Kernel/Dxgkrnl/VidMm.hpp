@@ -97,6 +97,11 @@ class Allocation {
   bool is_staging() const { return (desc_.flags & kAllocStaging) != 0; }
   bool can_be_resident() const { return !is_staging() && !is_query_result() && !is_constant_buffer() && !is_heap(); }
   bool resident() const { return image_ != nullptr || buffer_ != nullptr; }
+  bool gpu_newer() const { return gpu_newer_; }   // the device holds contents the backing lacks (or will: a GPU write recorded and not yet run)
+  // Query results that a stream's last command buffer has yet to write into it, or copy into it (Adapter::complete_pending_results).
+  bool results_pending() const { return pending_results_ != 0; }
+  void add_pending_results() { ++pending_results_; }
+  void remove_pending_results() { if (pending_results_) --pending_results_; }
   uint32_t mip_levels() const { return desc_.mip_levels; }
   // The 2D images of level 0 of the allocation (1 for a plain texture, 6 a cube); they follow each other in the backing, each width * height pixels.
   uint32_t layers() const { return graphics::image_layer_count(desc_.kind, desc_.layers); }
@@ -154,6 +159,7 @@ class Allocation {
   uint64_t device_bytes_ = 0;    // what residency costs
   bool device_stale_ = true;     // the device object (if any) lacks the backing's current contents
   bool cpu_written_ = false;     // something other than the GPU wrote the backing since creation (a device that cannot take pixels may skip the upload of an allocation nobody wrote)
+  uint32_t pending_results_ = 0;   // (the Adapter's pending query records that write it)
   bool gpu_newer_ = false;       // the device object holds contents the backing lacks
   uint32_t lock_count_ = 0;
   uint32_t pin_count_ = 0;

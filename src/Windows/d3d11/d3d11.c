@@ -95,6 +95,7 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 #define VERTEX_SLOTS 8u
 #define VB_BIND_SLOTS 32u             /* the vertex buffer slots a program binds (D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT): kept and given back; draws read the first VERTEX_SLOTS (a layout of an element past them is not drawn) */
 #define ACTIVE_QUERIES 32u            /* queries begun and not ended at once */
+#define MEASURE_BATCHES 4u            /* lists sent whose measurements wait to be read (query.inc): when one more is sent, the oldest is read */
 #define MEASURES 2048u                /* the kernel's measurements one list holds (query.inc: one a run of draws for the same active queries) */
 #define UAV_SLOTS 64u                 /* u0 .. u63: of the compute shader, and of the graphics stages beside the render targets (D3D11_1_UAV_SLOT_COUNT; at feature level 11_0 u0 .. u7,
                                        * D3D11_PS_CS_UAV_REGISTER_COUNT: dev_uav_slots) */
@@ -300,6 +301,7 @@ typedef struct Query {
   UINT64 samples;
   D3D11_QUERY_DATA_PIPELINE_STATISTICS stats;
   UINT64 so_written[4], so_needed[4];
+  UINT outstanding;                           /* measurements made for it whose counts have not been read back yet (query.inc) */
 } Query;
 
 typedef struct Pipeline {
@@ -461,6 +463,12 @@ struct Dev {
   ID3D12Resource *measure_readback;
   struct Measure *measures;                /* MEASURES of them */
   UINT measure_count;
+  /* The lists sent whose measurements have not been read back (query.inc: read when a query of theirs is asked for - GetData -, or when MEASURE_BATCHES wait), oldest
+   * first, each with its read-back buffer and measurements; and the buffers and measurement arrays free for the next list. */
+  struct MeasureBatch { ID3D12Resource *readback; struct Measure *measures; UINT count; } batches[MEASURE_BATCHES];
+  UINT batch_first, batch_count;
+  struct MeasureSet { ID3D12Resource *readback; struct Measure *measures; } free_sets[MEASURE_BATCHES];
+  UINT free_set_count;
   BOOL measure_open;                       /* the last of them is open (its queries begun on the list) */
   Buf *so_written[16];                     /* the stream output buffers the list has bound (references): where their records end is read when it has run */
   UINT so_written_count;
@@ -651,7 +659,7 @@ static void retire(Dev *d, ID3D12Resource *res, BYTE *data, UINT64 bytes) { reti
 
 /* Sends what was recorded (the queue runs it before it returns) and begins a new list. */
 static void measures_resolve(Dev *d);
-static void measures_collect(Dev *d);
+static void measures_send(Dev *d);
 static void so_collect(Dev *d);
 static void flush(Dev *d) {
   if (!d->recorded) return;
@@ -660,7 +668,7 @@ static void flush(Dev *d) {
   ID3D12GraphicsCommandList_Close(d->list);
   ID3D12CommandList *lists[1] = {(ID3D12CommandList *)d->list};
   ID3D12CommandQueue_ExecuteCommandLists(d->queue, 1, lists);
-  measures_collect(d);
+  measures_send(d);      /* (its measurements are read back when a query of theirs is asked for) */
   so_collect(d);
   ID3D12CommandAllocator_Reset(d->allocator);
   ID3D12GraphicsCommandList_Reset(d->list, d->allocator, NULL);

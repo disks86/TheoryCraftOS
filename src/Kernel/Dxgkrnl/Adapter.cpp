@@ -156,13 +156,46 @@ PipelineObject::~PipelineObject() {
 
 // --- Running a command stream ---------------------------------------------------------------------------------------------------------------------------------------
 
+struct Adapter::StreamQuery {
+  Allocation* allocation = nullptr;
+  uint64_t offset = 0;
+  uint32_t kind = 0;        // (a graphics::QueryKind, kQueryKindPipelineStatistics1 or kQueryKindSoStatistics)
+  uint32_t stream = 0;
+  bool accumulate = false;
+  bool open = true;
+  bool written = false;
+  bool segment = false;     // (it has device queries in the command buffer being recorded, from first_slot on)
+  uint32_t first_slot = 0;
+  uint64_t sums[graphics::kPipelineStatisticCount + 3] = {};   // what its segments counted so far (StreamRunner::kMaxStreamQueryValues)
+  int64_t vertex_adjust = 0;   // what the strips and fans drawn as lists while it was open take from (or add to) the vertices and vertex shader runs the device counted
+};
+
+// Copies out of query result buffers waiting for the results the next flush stores (copy_buffer): made right after, in order.
+struct Adapter::DeferredCopy {
+  Allocation* dst;
+  Allocation* src;
+  uint32_t doff, soff, bytes;
+};
+
+// The query results of a stream's last command buffer, which the device was not made to wait for: counted and written - with the copies that wait for them - when the
+// CPU or a later stream needs an allocation they write (Adapter::complete_pending_results), or when the device has them anyway. Holds what it writes.
+struct Adapter::PendingResults {
+  explicit PendingResults(allocators::IAllocator& a) : queries(a), copies(a), keep(a) {}
+  graphics::ICommandBuffer* cb = nullptr;
+  List<StreamQuery> queries;
+  List<DeferredCopy> copies;
+  List<SharedPointer<Allocation>> keep;   // (the allocations written, alive until then; each marked results_pending)
+};
+
 // Walks a command stream once, either only to check it (against the allocation list and the pipelines the process owns) or to replay it on the device. Checking and replaying
 // share the walk so that they cannot disagree about what is valid; replaying additionally checks what can change between the two (the contents of an index buffer) and does
 // what the checks promised: puts the allocations on the GPU, records the device commands and submits them.
 class Adapter::StreamRunner {
+  friend class Adapter;   // (the pending query results: query_values)
+
  public:
   StreamRunner(Adapter& adapter, ConstByteView commands, ArrayView<const SharedPointer<Allocation>> allocations)
-      : adapter_(adapter), mm_(adapter.vidmm_), commands_(commands), allocations_(allocations), queries_(adapter.allocator_), transient_(adapter.allocator_) {}
+      : adapter_(adapter), mm_(adapter.vidmm_), commands_(commands), allocations_(allocations), queries_(adapter.allocator_), deferred_copies_(adapter.allocator_), transient_(adapter.allocator_) {}
   
   ~StreamRunner() { release_transient(); }
 
@@ -182,6 +215,9 @@ class Adapter::StreamRunner {
   // The video decoders the stream's DecodeFrames name: collected while it is checked, given back in the same order when it runs.
   void collect_decoders(List<SharedPointer<VideoDecoderObject>>* decoders) { collected_decoders_ = decoders; }
   void replay_decoders(ArrayView<const SharedPointer<VideoDecoderObject>> decoders) { replay_decoders_ = decoders; }
+  // The last command that uses each allocation: noted while the stream is checked, looked at when it runs (deferred copies).
+  void collect_last_uses(List<AllocationUse>* uses) { collected_uses_ = uses; }
+  void replay_last_uses(ArrayView<const AllocationUse> uses) { replay_uses_ = uses; }
 
   NtStatus execute(ArrayView<const SharedPointer<PipelineObject>> pipelines, ArrayView<const SharedPointer<RootSignatureObject>> signatures, ArrayView<const SharedPointer<DescriptorHeapObject>> heaps) {
     exec_ = true;
@@ -205,19 +241,7 @@ class Adapter::StreamRunner {
   bool skip_draw_ = false;   // (fit_textures: the draw or dispatch being checked is left out)
   static constexpr uint32_t kPipelineStatistics1Values = graphics::kPipelineStatisticCount + 3;   // (and the amplification and mesh shader invocations and mesh primitives: none)
   static constexpr uint32_t kMaxStreamQueryValues = kPipelineStatistics1Values;
-  struct StreamQuery {
-    Allocation* allocation = nullptr;
-    uint64_t offset = 0;
-    uint32_t kind = 0;        // (a graphics::QueryKind, kQueryKindPipelineStatistics1 or kQueryKindSoStatistics)
-    uint32_t stream = 0;
-    bool accumulate = false;
-    bool open = true;
-    bool written = false;
-    bool segment = false;     // (it has device queries in the command buffer being recorded, from first_slot on)
-    uint32_t first_slot = 0;
-    uint64_t sums[kMaxStreamQueryValues] = {};   // what its segments counted so far
-    int64_t vertex_adjust = 0;   // what the strips and fans drawn as lists while it was open take from (or add to) the vertices and vertex shader runs the device counted
-  };
+  static_assert(kMaxStreamQueryValues == sizeof(StreamQuery::sums) / sizeof(StreamQuery::sums[0]), "StreamQuery::sums holds every value");
 
   Allocation* alloc(uint32_t index) const { return index < allocations_.size() ? allocations_[index].get() : nullptr; }
   static bool exact(const ByteReader& p) { return p.ok() && p.at_end(); }
@@ -236,6 +260,7 @@ class Adapter::StreamRunner {
     ByteReader in(commands_);
     uint32_t commands = 0;
     while (!in.at_end()) {
+      command_index_ = commands;
       const uint32_t header = in.le32();
       const uint32_t words = header >> 16;
       if (!in.ok() || words < 1 || words > kMaxPacketWords) return kBad;
@@ -252,7 +277,9 @@ class Adapter::StreamRunner {
     if (in_pass_) return kBad;   // a pass left open
     for (const StreamQuery& q : queries_.view())
       if (q.open) return kBad;   // a query left open
+    final_flush_ = true;
     const NtStatus s = exec_ ? flush() : status::kSuccess;
+    final_flush_ = false;
     if (s != status::kSuccess && g_stream_trace) g_stream_trace(0xFFFF, s, commands, refused_line_);   // (the run of the commands failed at the end)
     return s;
   }
@@ -273,16 +300,30 @@ class Adapter::StreamRunner {
   }
   // Runs what has been recorded so far. Needed before the CPU touches an allocation the recorded commands use.
   NtStatus flush() {
-    if (!cb_) return store_query_results() ? status::kSuccess : status::kInvalidDeviceState;
+    if (!cb_) return store_query_results() && apply_deferred_copies() ? status::kSuccess : status::kInvalidDeviceState;
     // (the open queries' segments end with the command buffer; the next one begins new ones)
     for (StreamQuery& q : queries_.view())
       if (q.open && q.segment) end_segment(q);
     const bool ended = cb_->end();
+    // (the stream's last command buffer: its queries' counts are not waited for - the device is not made to finish its work for each stream, which a program that ends a
+    // query and resolves it at once makes it do for every query -; they are counted and written, with the copies that wait for them, when something needs them)
+    bool segments = false;
+    for (const StreamQuery& q : queries_.view()) segments = segments || q.segment;
+    const bool defer = final_flush_ && segments;
+    if (defer) cb_->defer_query_results(true);
     bool done = ended && adapter_.device_.submit(cb_);
     if (!done) refused_line_ = ended ? kDeviceLineBase + adapter_.device_.last_submit_failure() : __LINE__;   // (the device's own reason, or: the command buffer refused a command)
-    if (done) done = collect_segments();
-    if (done) done = store_query_results();
-    adapter_.device_.destroy_command_buffer(cb_);
+    if (done && defer) {
+      if (!keep_results()) {
+        refused_line_ = __LINE__;
+        done = false;
+      }
+    } else {
+      if (done) done = collect_segments();
+      if (done) done = store_query_results();
+      if (done) done = apply_deferred_copies();
+      adapter_.device_.destroy_command_buffer(cb_);
+    }
     cb_ = nullptr;
     for (StreamQuery& q : queries_.view()) q.segment = false;
     next_slot_ = 0;
@@ -332,61 +373,52 @@ class Adapter::StreamRunner {
   void end_segment(StreamQuery& q) {
     for (uint32_t k = 0; k < query_device_slots(q.kind); ++k) cb_->end_query(q.first_slot + k);
   }
-  // After the device ran a command buffer: what each segment in it counted, added to its query.
-  bool collect_segments() {
-    for (StreamQuery& q : queries_.view()) {
-      if (!q.segment) continue;
-      using graphics::QueryKind;
-      if (q.kind == kQueryKindSoStatistics) {
-        uint64_t written = 0, needed = 0;
-        if (!cb_->query_value(q.first_slot, 0, &written) || !cb_->query_value(q.first_slot + 1, 0, &needed)) return (refused_line_ = __LINE__, false);
-        q.sums[0] += written;
-        q.sums[1] += needed;
-        continue;
-      }
-      const uint32_t values = q.kind == kQueryKindPipelineStatistics1 ? graphics::kPipelineStatisticCount : query_values(q.kind);
-      for (uint32_t k = 0; k < values; ++k) {
-        uint64_t v = 0;
-        if (!cb_->query_value(q.first_slot, k, &v)) return (refused_line_ = __LINE__, false);
-        // (a time is the last segment's - the time the query ended -, a frequency the same in every one; counts, predicates and the disjoint flag add up)
-        if (q.kind == static_cast<uint32_t>(QueryKind::Timestamp) || q.kind == static_cast<uint32_t>(QueryKind::TimestampFrequency)) q.sums[k] = v;
-        else q.sums[k] += v;
-      }
-    }
+  bool collect_segments() { return Adapter::collect_segments(*cb_, queries_.view()) || (refused_line_ = __LINE__, false); }
+  bool store_query_results() {
+    // (results an earlier stream left pending in the same bytes go first: older results must not land on newer ones)
+    for (const StreamQuery& q : queries_.view())
+      if (!q.open && !q.written && q.allocation->results_pending()) adapter_.complete_pending_results(*q.allocation, q.offset, uint64_t{query_values(q.kind)} * 8);
+    return Adapter::store_query_results(mm_, queries_.view()) || (refused_line_ = __LINE__, false);
+  }
+  bool apply_deferred_copies() {
+    if (!Adapter::apply_deferred_copies(mm_, deferred_copies_.view())) return (refused_line_ = __LINE__, false);
+    deferred_copies_.clear();
     return true;
   }
-  // Writes the results of the queries that ended into the allocations they name (the CPU's copy: these allocations never go to the GPU). A query begun with kQueryAccumulate adds
-  // its counts to what is there (a predicate: 1 if either is not 0).
-  bool store_query_results() {
+  // The stream's last command buffer, its queries that are still to be written and the copies that wait for them, to the adapter: counted when something needs them.
+  bool keep_results() {
+    UniquePointer<PendingResults> r = UniquePointer<PendingResults>::make(adapter_.allocator_, adapter_.allocator_);
+    if (!r) return false;
+    r->cb = cb_;
+    const auto keep = [&](const Allocation* a) {
+      const uint64_t slot = slot_of(a);
+      if (slot == ~uint64_t{0}) return false;
+      for (const SharedPointer<Allocation>& k : r->keep.view())
+        if (k.get() == a) return true;
+      return r->keep.push_back(allocations_[slot]);
+    };
+    bool ok = true;
     for (StreamQuery& q : queries_.view()) {
       if (q.open || q.written) continue;
-      q.written = true;
-      const uint32_t values = query_values(q.kind);
-      ByteView where;
-      if (!q.allocation->writable_backing().try_subview(q.offset, uint64_t{values} * 8, &where)) return (refused_line_ = __LINE__, false);
-      const bool predicate = q.kind == static_cast<uint32_t>(graphics::QueryKind::OcclusionPredicate) || q.kind == static_cast<uint32_t>(graphics::QueryKind::TimestampDisjoint);
-      // (the vertices and vertex shader runs of strips and fans, as Direct3D counts them)
-      auto adjust = [&](uint32_t k) {
-        const int64_t v = static_cast<int64_t>(q.sums[k]) + q.vertex_adjust;
-        q.sums[k] = v > 0 ? static_cast<uint64_t>(v) : 0;
-      };
-      if (q.kind == static_cast<uint32_t>(graphics::QueryKind::IaVertices) || q.kind == static_cast<uint32_t>(graphics::QueryKind::VsInvocations)) adjust(0);
-      if (q.kind == static_cast<uint32_t>(graphics::QueryKind::PipelineStatistics) || q.kind == kQueryKindPipelineStatistics1) {
-        adjust(static_cast<uint32_t>(graphics::PipelineStatistic::IaVertices));
-        adjust(static_cast<uint32_t>(graphics::PipelineStatistic::VsInvocations));
-      }
-      uint64_t out[kMaxStreamQueryValues] = {};
-      ByteReader before(where);
-      for (uint32_t k = 0; k < values; ++k) {
-        const uint64_t there = before.le64();
-        const uint64_t value = predicate ? (q.sums[k] ? 1 : 0) : q.sums[k];
-        out[k] = !q.accumulate ? value : predicate ? ((there || value) ? 1 : 0) : there + value;
-      }
-      ByteWriter w(where);
-      for (uint32_t k = 0; k < values; ++k) w.le64(out[k]);
-      mm_.note_cpu_write(*q.allocation);
+      ok = ok && r->queries.push_back(q) && keep(q.allocation);
+      q.written = true;   // (the record writes it)
     }
+    for (const DeferredCopy& c : deferred_copies_.view()) ok = ok && r->copies.push_back(c) && keep(c.dst) && keep(c.src);
+    deferred_copies_.clear();
+    if (!ok) {   // (no room: counted now)
+      const bool counted = Adapter::collect_segments(*cb_, r->queries.view()) && Adapter::store_query_results(mm_, r->queries.view()) && Adapter::apply_deferred_copies(mm_, r->copies.view());
+      adapter_.device_.destroy_command_buffer(cb_);
+      return counted;
+    }
+    adapter_.keep_pending(static_cast<UniquePointer<PendingResults>&&>(r));
     return true;
+  }
+
+  // Whether a query of this stream still has to write its results into `a` (open, or ended and not yet stored: the next flush stores them).
+  bool query_results_pending(const Allocation* a) const {
+    for (const StreamQuery& q : queries_.view())
+      if (q.allocation == a && !q.written) return true;
+    return false;
   }
 
   NtStatus resident(Allocation& a) { return mm_.make_resident(a); }
@@ -565,6 +597,8 @@ class Adapter::StreamRunner {
     Allocation* a = alloc(index);
     const uint64_t bytes = uint64_t{query_values(kind)} * 8;
     if (!a || !a->is_query_result() || offset % 8 || bytes > a->desc().size || offset > a->desc().size - bytes) return kBad;
+    if (!exec_ && collected_uses_ && !note_use(a)) return status::kNoMemory;   // (a query writes it: a use, for the deferred copies)
+    if (exec_ && accumulate && a->results_pending()) adapter_.complete_pending_results(*a, offset, bytes);   // (it adds to what is there: that has to be there)
     // (no two open queries write the same bytes)
     for (const StreamQuery& q : queries_.view())
       if (q.open && q.allocation == a && offset < q.offset + uint64_t{query_values(q.kind)} * 8 && q.offset < offset + bytes) return kBad;
@@ -1588,6 +1622,28 @@ class Adapter::StreamRunner {
     if (uint64_t{doff} + bytes > dst->desc().size || uint64_t{soff} + bytes > src->desc().size) return kBad;
     if (dst == src && doff < soff + uint64_t{bytes} && soff < doff + uint64_t{bytes}) return kBad;
     if (!exec_) return status::kSuccess;
+    if (src->results_pending()) adapter_.complete_pending_results(*src, soff, bytes);   // (an earlier stream's results that the copy reads)
+    // A copy the CPU makes where it stands in the stream, with nothing sent first, when the backings already have what the device would: the destination has no device
+    // copy (nothing recorded reads it on the device; a draw recorded later that does makes it resident from the backing, the copy included) and the source's backing has
+    // its contents - no GPU write recorded or run that the backing lacks, not tiles, and for a query result buffer no query of this stream that has yet to write its
+    // results there (those of queries that ended in an earlier stream are written: Direct3D 11's GetData resolves them a frame or so later). Anything else runs what was
+    // recorded first (flush), which for a query waits for the device to count.
+    const bool dst_backing_only = !dst->resident() && !dst->placed() && !dst->gpu_newer() && !dst->reserved();      // (placed: other resources share its memory)
+    const bool src_backing_current = !src->gpu_newer() && !src->reserved() && !(src->is_query_result() && query_results_pending(src));
+    // A copy of results a query of this stream has yet to write - Direct3D 11 resolves each query right after it ends - waits for them: it is made when the next flush
+    // stores them (in order with the other copies that waited), so that the device is not made to finish its work and count for each one. Only when no later command
+    // of the stream uses either buffer (a query that writes the source again, a draw or copy that reads the destination): those would see it made too late.
+    if (dst_backing_only && src->is_query_result() && !src->gpu_newer() && !src->reserved() && query_results_pending(src) && !used_later(dst) && !used_later(src)) {
+      return deferred_copies_.push_back(DeferredCopy{dst, src, doff, soff, bytes}) ? status::kSuccess : status::kNoMemory;
+    }
+    if (dst_backing_only && src_backing_current) {
+      ByteView to;
+      ConstByteView from;
+      if (!dst->writable_backing().try_subview(doff, bytes, &to) || !src->backing().try_subview(soff, bytes, &from)) return device_state_failure(__LINE__);
+      to.copy_from(from);
+      mm_.note_cpu_write(*dst);
+      return status::kSuccess;
+    }
     NtStatus s = flush();
     if (s != status::kSuccess) return s;   // (flush gives its own reason)
     if (!mm_.read_back(*src) || !mm_.read_back(*dst)) return device_state_failure(__LINE__);
@@ -2407,7 +2463,27 @@ class Adapter::StreamRunner {
   // Whether `a` may be used for `needed` (any one of the bits) in the state the stream has left it in; an allocation that does not track states always may.
   // (Replaying a stream that was checked does not check again: the states are those it left.)
   bool use(const Allocation* a, uint32_t needed) {
+    if (!exec_ && collected_uses_ && !note_use(a)) return false;
+    // (results an earlier stream left to be counted later, into what this command uses: written first. A query buffer's are looked at by the bytes read or written -
+    // copy_buffer, begin_query, store_query_results -: the next query of a heap does not wait for the one before)
+    if (exec_ && a->results_pending() && !a->is_query_result()) adapter_.complete_pending_results(*a);
     return exec_ || !a->state_tracked() || state_allows(state_of(a), needed);
+  }
+  // (the check: `a` is used by the command being checked - its last use so far)
+  bool note_use(const Allocation* a) {
+    for (AllocationUse& u : collected_uses_->view())
+      if (u.allocation == a) {
+        u.last_command = command_index_;
+        return true;
+      }
+    return collected_uses_->push_back(AllocationUse{a, command_index_});
+  }
+  // (the run: whether a command after the one running uses `a`; with nothing noted, as if one did)
+  bool used_later(const Allocation* a) const {
+    if (!replay_uses_.data()) return true;
+    for (const AllocationUse& u : replay_uses_)
+      if (u.allocation == a) return u.last_command > command_index_;
+    return false;
   }
   // The index of an allocation in the list (what the lowered bindings are called with).
   bool index_of(const Allocation* a, uint32_t* index) const {
@@ -3000,6 +3076,11 @@ class Adapter::StreamRunner {
   uint32_t query_slots_in_stream_ = 0;   // the device queries the stream's queries take (at most kMaxOcclusionQueries: a command buffer holds no more)
   uint32_t next_slot_ = 0;               // the slot of the next device query in the command buffer being recorded
   List<StreamQuery> queries_;            // the queries of the stream, in the order they began
+  List<DeferredCopy> deferred_copies_;   // (copies out of query result buffers waiting for the results the next flush stores: copy_buffer)
+  uint32_t command_index_ = 0;           // (the command being checked or run: its index in the stream)
+  bool final_flush_ = false;             // (the flush at the end of the stream)
+  List<AllocationUse>* collected_uses_ = nullptr;
+  ArrayView<const AllocationUse> replay_uses_;
   const Allocation* pass_color_ = nullptr;
   const Allocation* pass_extra_[graphics::kMaxColorTargets - 1] = {};
   uint32_t pass_target_count_ = 1;
@@ -3052,7 +3133,7 @@ class Adapter::StreamRunner {
 // --- The adapter ----------------------------------------------------------------------------------------------------------------------------------------------------
 
 Adapter::Adapter(allocators::IAllocator& allocator, graphics::IGraphicsDevice& device, const AdapterConfig& config, uint32_t index, Luid luid)
-    : allocator_(allocator), device_(device), display_(config.display), index_(index), luid_(luid), vidmm_(allocator, device, config.local_memory_budget, config.system_memory_limit), contexts_(allocator) {
+    : allocator_(allocator), device_(device), display_(config.display), index_(index), luid_(luid), vidmm_(allocator, device, config.local_memory_budget, config.system_memory_limit), contexts_(allocator), pending_results_(allocator) {
   const graphics::DeviceInfo info = device.info();
   caps_.max_texture_dimension = vidmm_.max_image_dimension();
   // What the device takes (DeviceInfo::limits, never more than the capacity of the structures).
@@ -3131,8 +3212,118 @@ Adapter::Adapter(allocators::IAllocator& allocator, graphics::IGraphicsDevice& d
   }
 }
 
+bool Adapter::collect_segments(graphics::ICommandBuffer& cb, ArrayView<StreamQuery> queries) {
+  for (StreamQuery& q : queries) {
+    if (!q.segment) continue;
+    using graphics::QueryKind;
+    if (q.kind == kQueryKindSoStatistics) {
+      uint64_t written = 0, needed = 0;
+      if (!cb.query_value(q.first_slot, 0, &written) || !cb.query_value(q.first_slot + 1, 0, &needed)) return false;
+      q.sums[0] += written;
+      q.sums[1] += needed;
+      continue;
+    }
+    const uint32_t values = q.kind == kQueryKindPipelineStatistics1 ? graphics::kPipelineStatisticCount : StreamRunner::query_values(q.kind);
+    for (uint32_t k = 0; k < values; ++k) {
+      uint64_t v = 0;
+      if (!cb.query_value(q.first_slot, k, &v)) return false;
+      // (a time is the last segment's - the time the query ended -, a frequency the same in every one; counts, predicates and the disjoint flag add up)
+      if (q.kind == static_cast<uint32_t>(QueryKind::Timestamp) || q.kind == static_cast<uint32_t>(QueryKind::TimestampFrequency)) q.sums[k] = v;
+      else q.sums[k] += v;
+    }
+  }
+  return true;
+}
+// Writes the results of the queries that ended into the allocations they name (the CPU's copy: these allocations never go to the GPU). A query begun with kQueryAccumulate adds
+// its counts to what is there (a predicate: 1 if either is not 0).
+bool Adapter::store_query_results(VidMm& mm, ArrayView<StreamQuery> queries) {
+  for (StreamQuery& q : queries) {
+    if (q.open || q.written) continue;
+    q.written = true;
+    const uint32_t values = StreamRunner::query_values(q.kind);
+    ByteView where;
+    if (!q.allocation->writable_backing().try_subview(q.offset, uint64_t{values} * 8, &where)) return false;
+    const bool predicate = q.kind == static_cast<uint32_t>(graphics::QueryKind::OcclusionPredicate) || q.kind == static_cast<uint32_t>(graphics::QueryKind::TimestampDisjoint);
+    // (the vertices and vertex shader runs of strips and fans, as Direct3D counts them)
+    auto adjust = [&](uint32_t k) {
+      const int64_t v = static_cast<int64_t>(q.sums[k]) + q.vertex_adjust;
+      q.sums[k] = v > 0 ? static_cast<uint64_t>(v) : 0;
+    };
+    if (q.kind == static_cast<uint32_t>(graphics::QueryKind::IaVertices) || q.kind == static_cast<uint32_t>(graphics::QueryKind::VsInvocations)) adjust(0);
+    if (q.kind == static_cast<uint32_t>(graphics::QueryKind::PipelineStatistics) || q.kind == kQueryKindPipelineStatistics1) {
+      adjust(static_cast<uint32_t>(graphics::PipelineStatistic::IaVertices));
+      adjust(static_cast<uint32_t>(graphics::PipelineStatistic::VsInvocations));
+    }
+    uint64_t out[StreamRunner::kMaxStreamQueryValues] = {};
+    ByteReader before(where);
+    for (uint32_t k = 0; k < values; ++k) {
+      const uint64_t there = before.le64();
+      const uint64_t value = predicate ? (q.sums[k] ? 1 : 0) : q.sums[k];
+      out[k] = !q.accumulate ? value : predicate ? ((there || value) ? 1 : 0) : there + value;
+    }
+    ByteWriter w(where);
+    for (uint32_t k = 0; k < values; ++k) w.le64(out[k]);
+    mm.note_cpu_write(*q.allocation);
+  }
+  return true;
+}
+
+// The copies out of query result buffers that waited for the results store_query_results has just written, in the order the stream made them.
+bool Adapter::apply_deferred_copies(VidMm& mm, ArrayView<const DeferredCopy> copies) {
+  for (const DeferredCopy& c : copies) {
+    ByteView to;
+    ConstByteView from;
+    if (!c.dst->writable_backing().try_subview(c.doff, c.bytes, &to) || !c.src->backing().try_subview(c.soff, c.bytes, &from)) return false;
+    to.copy_from(from);
+    mm.note_cpu_write(*c.dst);
+  }
+  return true;
+}
+
+// Counts a record's queries (waiting for the device if it has not counted them yet), writes the results and the copies that wait for them, and lets go of its command buffer.
+void Adapter::finish_pending(PendingResults& r) {
+  // (a device that cannot give the counts - lost - leaves what was there: the stream itself ran)
+  if (r.cb && collect_segments(*r.cb, r.queries.view()) && store_query_results(vidmm_, r.queries.view())) (void)apply_deferred_copies(vidmm_, r.copies.view());
+  if (r.cb) device_.destroy_command_buffer(r.cb);
+  r.cb = nullptr;
+  for (const SharedPointer<Allocation>& a : r.keep.view()) a->remove_pending_results();
+  r.keep.clear();
+}
+
+void Adapter::keep_pending(UniquePointer<PendingResults> record) {
+  // (the records the device has counted already go first - nobody waits for those -, and no more than kMaxPendingResults are kept)
+  uint64_t ready = 0;
+  while (ready < pending_results_.count() && pending_results_[ready]->cb->query_results_ready()) ++ready;
+  if (pending_results_.count() - ready >= kMaxPendingResults) ready = pending_results_.count() - kMaxPendingResults + 1;
+  complete_pending(ready);
+  for (const SharedPointer<Allocation>& a : record->keep.view()) a->add_pending_results();
+  PendingResults* raw = record.get();
+  if (!pending_results_.push_back(static_cast<UniquePointer<PendingResults>&&>(record))) finish_pending(*raw);   // (no room to keep it: counted now)
+}
+
+void Adapter::complete_pending(uint64_t count) {
+  if (count > pending_results_.count()) count = pending_results_.count();
+  for (uint64_t i = 0; i < count; ++i) finish_pending(*pending_results_[i]);
+  for (uint64_t i = 0; i < count; ++i) pending_results_.remove_at(0);
+}
+
+void Adapter::complete_pending_results(const Allocation& a, uint64_t offset, uint64_t bytes) {
+  if (!a.results_pending()) return;
+  const auto overlaps = [&](uint64_t at, uint64_t size) { return at < offset + (bytes > ~offset ? ~offset : bytes) && offset < at + size; };
+  uint64_t last = 0;
+  for (uint64_t i = 0; i < pending_results_.count(); ++i) {
+    const PendingResults& r = *pending_results_[i];
+    bool touches = false;
+    for (const StreamQuery& q : r.queries.view()) touches = touches || (q.allocation == &a && overlaps(q.offset, uint64_t{StreamRunner::query_values(q.kind)} * 8));
+    for (const DeferredCopy& c : r.copies.view()) touches = touches || (c.dst == &a && overlaps(c.doff, c.bytes)) || (c.src == &a && overlaps(c.soff, c.bytes));
+    if (touches) last = i + 1;
+  }
+  complete_pending(last);
+}
+
 Adapter::~Adapter() {
   for (uint64_t i = 0; i < contexts_.count(); ++i) contexts_[i]->queue.clear();
+  complete_pending(pending_results_.count());
 }
 
 NtStatus Adapter::create_shader(const ShaderDesc& desc, SharedPointer<ShaderObject>* out) {
@@ -3559,6 +3750,7 @@ NtStatus Adapter::queue_render(ContextObject& context, ConstByteView commands, A
     if (!s->allocations.push_back(a)) return status::kNoMemory;
   StreamRunner runner(*this, s->commands.view(), ArrayView<const SharedPointer<Allocation>>(s->allocations.view().data(), s->allocations.count()));
   runner.collect_decoders(&s->decoders);
+  runner.collect_last_uses(&s->last_uses);
   const NtStatus v = runner.validate(pipelines, s->pipelines, s->signatures, s->heaps);
   if (v != status::kSuccess) return v;
   return queue(context, util::move(s));
@@ -3611,6 +3803,7 @@ NtStatus Adapter::queue_present(ContextObject& context, const PresentArgs& args,
 NtStatus Adapter::execute_render(Submission& s) {
   StreamRunner runner(*this, s.commands.view(), ArrayView<const SharedPointer<Allocation>>(s.allocations.view().data(), s.allocations.count()));
   runner.replay_decoders(ArrayView<const SharedPointer<VideoDecoderObject>>(s.decoders.view().data(), s.decoders.count()));
+  runner.replay_last_uses(ArrayView<const AllocationUse>(s.last_uses.view().data(), s.last_uses.count()));
   return runner.execute(ArrayView<const SharedPointer<PipelineObject>>(s.pipelines.view().data(), s.pipelines.count()), ArrayView<const SharedPointer<RootSignatureObject>>(s.signatures.view().data(), s.signatures.count()),
                         ArrayView<const SharedPointer<DescriptorHeapObject>>(s.heaps.view().data(), s.heaps.count()));
 }
