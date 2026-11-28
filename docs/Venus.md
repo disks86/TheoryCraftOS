@@ -236,6 +236,9 @@ allocations itself.
 
 Gaps of the kernel's Venus device:
 
+* The GL translator (`WebGlAccelerator`) draws on the CPU on Venus what virgl draws on the GPU: polygon offset, the stencil test on a framebuffer object, and draws
+  whose depth the device has out of date - Unigine Heaven's OpenGL mode draws about 4100 of every 5000 draws on the CPU there (all on the GPU on virgl), and its
+  benchmark does not finish in 25 minutes. The kernel's choice of Venus (`parity_gaps`, the DeviceInfo comparison) does not see these.
 * Only one submit is left running at a time (one main command buffer): the next submit waits for the last, so the CPU and the GPU overlap but two submits never
   queue up. A command buffer that does not allow it (`defer_completion`), and one with stream output, is waited for in submit(). `map()` waits for a running submit
   even for a buffer it does not use. Every creation call (images, pipelines, descriptor sets) is a round trip to the host. A pipeline's first draw with a new binding
